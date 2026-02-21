@@ -1,60 +1,99 @@
 ---
 name: gitee-pr
-description: Automate Gitee pull request creation from local Git changes, including optional auto-commit and branch push. Use when the user asks to create/submit a Gitee PR, open a PR from current branch to a target base branch, or complete a "commit + push + PR" workflow on gitee.com repositories.
+description: Create and submit Gitee pull requests with team convention enforcement. Use when the user asks to open/submit a Gitee PR on gitee.com and needs an automated flow that validates branch naming, commit prefixes, clean working tree, optional auto-commit, branch push, and PR creation.
 ---
 
 # Gitee PR
 
-## Overview
+Use `scripts/create_gitee_pr.py` to execute a rules-first PR workflow.
+Apply team rules from `gitee-pr-rules.md` before creating PR.
 
-Create a Gitee pull request from the current repository with one command.
-Use `scripts/create_gitee_pr.py` to auto-commit (optional), push branch, and call Gitee API.
+## Rule Files
+
+- Main rules: `gitee-pr-rules.md`
 
 ## Required Inputs
 
-- Provide Gitee token by env var `GITEE_TOKEN` or CLI argument `--token`.
-- Ensure Git remote URL points to `gitee.com` or pass `--repo owner/repo`.
-- Run inside a Git repository.
+- Set Gitee token: `GITEE_TOKEN` or `--token`.
+- Ensure remote is a Gitee repo or provide `--repo owner/repo`.
+- Run command inside a Git repository.
 
 ## Workflow
 
-1. Inspect current branch and working tree.
-2. If working tree is dirty, run with `--auto-commit --commit-message "<msg>"`.
-3. Resolve base branch:
-   - Prefer explicit `--base`.
-   - Otherwise use remote default branch.
-4. Push branch to remote unless `--no-push` is set.
-5. Create Gitee PR via API and return PR URL.
+1. Resolve `head` and `base` branches.
+2. Enforce branch naming format: `member/verb-description`.
+3. Ensure working tree is clean before PR (or auto-commit when `--auto-commit` is enabled).
+4. Validate all commit subjects in `remote/base..head` with allowed prefixes:
+   - `feat:`
+   - `fix:`
+   - `docs:`
+   - `refactor:`
+   - `style:`
+   - `test:`
+   - `chore:`
+5. Warn (non-blocking) when multiple core files are changed.
+6. Enforce Chinese PR content: title and body must include Chinese text.
+7. Enforce PR body template sections and order:
+   - `## 改动了什么？`
+   - `## 为什么改动？`
+   - `## 测试结果？`
+   - `## 注意事项`
+8. Push branch unless `--no-push`.
+9. Create PR via Gitee API and print PR URL.
 
-## Commands
+## Recommended Commands
 
 ```bash
-# Recommended: auto-commit + push + create PR
 export GITEE_TOKEN="<token>"
 python3 scripts/create_gitee_pr.py \
+  --base main \
+  --title "修复：优化过滤逻辑"
+```
+
+```bash
+# Auto-commit local changes before PR checks
+python3 scripts/create_gitee_pr.py \
   --auto-commit \
-  --commit-message "feat: add xxx" \
-  --base master \
-  --title "feat: add xxx" \
-  --body "Summary of this change"
+  --commit-message "chore: prepare gitee pr changes" \
+  --base main
 ```
 
 ```bash
-# Dry-run: validate params and inspect generated title/body without API call
-python3 scripts/create_gitee_pr.py --base master --dry-run
+# Validate checks and preview generated PR body without API call
+python3 scripts/create_gitee_pr.py --base main --dry-run --no-push
 ```
 
 ```bash
-# Skip push (assume branch already pushed)
-python3 scripts/create_gitee_pr.py --base master --no-push
+# Keep custom body (must follow required template sections)
+python3 scripts/create_gitee_pr.py \
+  --base main \
+  --body "$(cat pr-body.md)"
 ```
 
-## Output Expectations
+## Default PR Body Template
 
-- Print PR URL when successful.
-- Print explicit error with actionable next step when failed (missing token, dirty tree without `--auto-commit`, missing base branch, API error).
+When `--body` is not provided, script generates:
 
-## Script
+```markdown
+## 改动了什么？
+- <commit summaries>
 
-- Main script: `scripts/create_gitee_pr.py`
-- Run `python3 scripts/create_gitee_pr.py --help` for full options.
+## 为什么改动？
+- 请补充本次改动的业务背景和目标。
+
+## 测试结果？
+- 已检查提交前工作区为干净状态。
+- 请补充本地测试命令与结果。
+
+## 注意事项
+- 无
+```
+
+## Merge Cleanup
+
+After PR merge, clean branch:
+
+```bash
+git branch -d <branch-name>
+git push origin --delete <branch-name>
+```

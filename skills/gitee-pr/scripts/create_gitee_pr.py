@@ -9,10 +9,24 @@ import os
 import re
 import subprocess
 import sys
+from pathlib import PurePosixPath
 from typing import Optional
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+
+BRANCH_NAME_PATTERN = re.compile(r"^[^/\s]+/[a-z0-9]+-[a-z0-9-]+$")
+COMMIT_SUBJECT_PATTERN = re.compile(
+    r"^(feat|fix|docs|refactor|style|test|chore):\s+\S.+$"
+)
+CHINESE_TEXT_PATTERN = re.compile(r"[\u4e00-\u9fff]")
+CONFIG_EXTENSIONS = {".yml", ".yaml", ".json", ".toml", ".ini", ".cfg", ".conf", ".lock"}
+REQUIRED_BODY_HEADINGS = [
+    "## 改动了什么？",
+    "## 为什么改动？",
+    "## 测试结果？",
+    "## 注意事项",
+]
 
 
 def fail(message: str, exit_code: int = 1) -> None:
@@ -108,10 +122,96 @@ def range_ref(remote: str, base: str, head: str) -> str:
     return f"{remote}/{base}..{head}"
 
 
-def generate_title(explicit_title: Optional[str], remote: str, base: str, head: str) -> str:
+def diff_range_ref(remote: str, base: str, head: str) -> str:
+    return f"{remote}/{base}...{head}"
+
+
+def validate_branch_name(branch: str) -> None:
+    if BRANCH_NAME_PATTERN.match(branch):
+        return
+    fail(
+        "Invalid branch name. Expected format 'member/verb-description', "
+        f"for example 'zhangsan/fix-bam-filter'. Received: '{branch}'"
+    )
+
+
+def collect_commit_subjects(remote: str, base: str, head: str) -> list[str]:
+    result = git("log", "--pretty=%s", range_ref(remote, base, head), check=False)
+    if result.returncode != 0:
+        stderr = result.stderr.strip() or result.stdout.strip()
+        fail(
+            "Unable to read commit range for PR validation. "
+            f"Range: {range_ref(remote, base, head)}\n{stderr}"
+        )
+    commits = [line.strip() for line in result.stdout.strip().splitlines() if line.strip()]
+    if not commits:
+        fail(
+            "No new commits detected against base branch. "
+            f"Range '{range_ref(remote, base, head)}' is empty."
+        )
+    return commits
+
+
+def validate_commit_subjects(commits: list[str]) -> None:
+    invalid = [message for message in commits if not COMMIT_SUBJECT_PATTERN.match(message)]
+    if not invalid:
+        return
+    formatted = "\n".join(f"- {message}" for message in invalid)
+    fail(
+        "Commit message prefix validation failed. "
+        "Use one of: feat|fix|docs|refactor|style|test|chore.\n"
+        f"{formatted}"
+    )
+
+
+def list_changed_files(remote: str, base: str, head: str) -> list[str]:
+    result = git("diff", "--name-only", diff_range_ref(remote, base, head), check=False)
+    if result.returncode != 0:
+        stderr = result.stderr.strip() or result.stdout.strip()
+        fail(
+            "Unable to list changed files for single-file rule check. "
+            f"Range: {diff_range_ref(remote, base, head)}\n{stderr}"
+        )
+    return [line.strip() for line in result.stdout.strip().splitlines() if line.strip()]
+
+
+def is_non_core_file(path: str) -> bool:
+    normalized = str(PurePosixPath(path)).lower()
+    file_name = PurePosixPath(path).name.lower()
+    extension = PurePosixPath(path).suffix.lower()
+
+    if normalized.startswith("docs/"):
+        return True
+    if normalized.startswith(".github/"):
+        return True
+    if normalized.startswith("config/") or normalized.startswith("configs/"):
+        return True
+    if file_name.startswith("readme"):
+        return True
+    if extension == ".md":
+        return True
+    if extension in CONFIG_EXTENSIONS:
+        return True
+    return False
+
+
+def warn_single_file_principle(remote: str, base: str, head: str) -> None:
+    changed_files = list_changed_files(remote, base, head)
+    core_files = [path for path in changed_files if not is_non_core_file(path)]
+    if len(core_files) <= 1:
+        return
+    print(
+        "[WARN] Single-file principle warning: multiple core files changed "
+        f"({len(core_files)} files).",
+        file=sys.stderr,
+    )
+    for path in core_files:
+        print(f"[WARN] core file: {path}", file=sys.stderr)
+
+
+def generate_title(explicit_title: Optional[str], commits: list[str], head: str) -> str:
     if explicit_title:
         return explicit_title
-    commits = git("log", "--pretty=%s", range_ref(remote, base, head), check=False).stdout.strip().splitlines()
     if commits:
         return commits[0]
     latest = git("log", "-1", "--pretty=%s", check=False).stdout.strip()
@@ -120,20 +220,60 @@ def generate_title(explicit_title: Optional[str], remote: str, base: str, head: 
     return f"Update {head}"
 
 
-def generate_body(explicit_body: Optional[str], remote: str, base: str, head: str) -> str:
+def generate_body(explicit_body: Optional[str], commits: list[str]) -> str:
     if explicit_body:
         return explicit_body
-    commits = git("log", "--pretty=- %s", range_ref(remote, base, head), check=False).stdout.strip().splitlines()
-    commits = [line for line in commits if line.strip()]
-    if not commits:
-        commits = ["- No new commit detected against base branch."]
+    commit_lines = [f"- {message}" for message in commits[:20]]
     lines = [
-        "Auto-generated by gitee-pr skill.",
+        "## 改动了什么？",
+        *commit_lines,
         "",
-        "## Commit Summary",
-        *commits[:20],
+        "## 为什么改动？",
+        "- 请补充本次改动的业务背景和目标。",
+        "",
+        "## 测试结果？",
+        "- 已检查提交前工作区为干净状态。",
+        "- 请补充本地测试命令与结果。",
+        "",
+        "## 注意事项",
+        "- 无",
     ]
     return "\n".join(lines)
+
+
+def validate_pr_language(title: str, body: str) -> None:
+    if not CHINESE_TEXT_PATTERN.search(title):
+        fail("PR title must include Chinese text. Please provide a Chinese title.")
+    if not CHINESE_TEXT_PATTERN.search(body):
+        fail("PR body must include Chinese text. Please provide a Chinese PR description.")
+
+
+def validate_pr_body_format(body: str) -> None:
+    lines = [line.rstrip() for line in body.splitlines()]
+    heading_indexes: dict[str, int] = {}
+    for heading in REQUIRED_BODY_HEADINGS:
+        for index, line in enumerate(lines):
+            if line.strip() == heading:
+                heading_indexes[heading] = index
+                break
+
+    missing = [heading for heading in REQUIRED_BODY_HEADINGS if heading not in heading_indexes]
+    if missing:
+        formatted = ", ".join(missing)
+        fail(f"PR body is missing required sections: {formatted}")
+
+    indexes = [heading_indexes[heading] for heading in REQUIRED_BODY_HEADINGS]
+    if indexes != sorted(indexes):
+        fail("PR body sections must follow this order: 改动了什么 -> 为什么改动 -> 测试结果 -> 注意事项")
+
+    for i, heading in enumerate(REQUIRED_BODY_HEADINGS):
+        start = heading_indexes[heading] + 1
+        end = len(lines)
+        if i + 1 < len(REQUIRED_BODY_HEADINGS):
+            end = heading_indexes[REQUIRED_BODY_HEADINGS[i + 1]]
+        section_lines = [line.strip() for line in lines[start:end] if line.strip()]
+        if not section_lines:
+            fail(f"PR body section '{heading}' cannot be empty.")
 
 
 def push_branch(remote: str, head: str) -> None:
@@ -234,21 +374,31 @@ def main() -> None:
             auto_commit(args.commit_message)
         else:
             fail("Working tree has uncommitted changes. Use --auto-commit or commit manually.")
+    if working_tree_dirty():
+        fail("Working tree must be clean before creating PR.")
+
+    validate_branch_name(head)
 
     repo = resolve_repo(args.remote, args.repo)
     validate_repo(repo)
+    commits = collect_commit_subjects(args.remote, base, head)
+    validate_commit_subjects(commits)
+    warn_single_file_principle(args.remote, base, head)
 
     if not args.no_push:
         push_branch(args.remote, head)
 
-    title = generate_title(args.title, args.remote, base, head)
-    body = generate_body(args.body, args.remote, base, head)
+    title = generate_title(args.title, commits, head)
+    body = generate_body(args.body, commits)
+    validate_pr_language(title, body)
+    validate_pr_body_format(body)
     token = args.token or os.environ.get("GITEE_TOKEN", "")
 
     print(f"[INFO] repo={repo}")
     print(f"[INFO] remote={args.remote}")
     print(f"[INFO] head={head}")
     print(f"[INFO] base={base}")
+    print(f"[INFO] commit_count={len(commits)}")
     print(f"[INFO] title={title}")
 
     if args.dry_run:

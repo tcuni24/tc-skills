@@ -1,4 +1,4 @@
 interface:
   display_name: "Gitee PR"
-  short_description: "Create and submit Gitee pull requests automatically"
-  default_prompt: "Create a Gitee pull request from current branch changes"
+  short_description: "Create Chinese Gitee pull requests with branch/commit/body-template checks"
+  default_prompt: "Create a Gitee pull request from current branch, enforce team branch/commit conventions, and use Chinese title/body with required PR template sections"
