@@ -1,0 +1,1367 @@
+#!/usr/bin/env python3
+"""Persistent round and background-job state for herdr-pair."""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import datetime as dt
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+import time
+from typing import Any, Iterator
+
+
+class PendingDispatchError(ValueError):
+    def __init__(self, pending: dict[str, Any]) -> None:
+        self.pending = pending
+        super().__init__("unresolved pending_dispatch")
+
+
+VERSION = 1
+ROLLOVER_EXIT = 20
+MAX_ARG_BYTES = 131071
+FILE_MODE = 0o600
+DIR_MODE = 0o700
+TERMINAL_JOBS = {"succeeded", "failed", "cancelled"}
+ROUND_STATES = {"accepted", "blocked", "failed", "cancelled"}
+JOB_STATES = {"submitted", "running", "succeeded", "failed", "cancelled", "unknown"}
+ROUND_HEADER = re.compile(r"^\[轮次\][ \t]+round_id=\S+[ \t]*\r?$", re.MULTILINE)
+PAIRCTL_SCRIPT = str(Path(__file__).resolve())
+PENDING_GUIDANCE = (
+    "A previous send-round left an unresolved dispatch. Inspect the recorded "
+    "target pane and round_id and confirm whether that pane received the handoff. "
+    "pairctl will not resend. Resolve it explicitly with `resolve-pending "
+    "--outcome delivered` or `resolve-pending --outcome not-delivered` only after "
+    "that inspection. Do not edit state.json by hand."
+)
+ROLLOVER_GUIDANCE = (
+    "Phase limit reached. If planner_compact.queued is true, pairctl already queued the "
+    "planner pane's own compaction command via herdr; it executes when the current turn "
+    "ends. After the planner pane is idle again, pairctl prompts it to rollover and continue "
+    "the pairing so the user does not have to send a resume message. Disable with "
+    "PAIRCTL_CONTINUE_AFTER_COMPACT=0. A Claude Code planner also records the rollover from "
+    "its SessionStart hook. If compact was not queued, send it with "
+    f"`python3 {PAIRCTL_SCRIPT} compact-self` (cursor `/summarize`; claude/pi `/compact`; "
+    "droid `/compress`). pairctl never switches sessions, never starts a Droid session, never "
+    "calls the Factory Sessions API, and never reads credentials."
+)
+FRESH_GUIDANCE = (
+    "The executor pane was not cleared, so the handoff was not sent and no round was "
+    "consumed. Inspect the pane (`herdr agent get` / `herdr agent read`), wait for idle, "
+    "then retry. Pass --fresh-command '/…' and --fresh-marker '…' for an agent kind pairctl "
+    "does not know, or --no-fresh to send into the existing context on purpose."
+)
+# Slash command that starts a fresh session (empties the context) per herdr agent kind.
+# Verified on this box 2026-09-07: pi /new, claude /clear, kimi /clear (all via
+# `herdr agent prompt`). codex/opencode/droid entries are documented, not yet observed.
+FRESH_COMMANDS = {
+    "pi": "/new",
+    "claude": "/clear",
+    "kimi": "/clear",
+    "droid": "/clear",
+    "codex": "/new",
+    "opencode": "/new",
+}
+# Text that appears on the visible screen once the fresh command took effect.
+FRESH_MARKERS = {
+    "pi": ("New session started",),
+    "claude": ("Claude Code v",),
+    "kimi": ("Started a new session",),
+}
+# Slash command that compacts the current session in place, per agent kind.
+# Cursor's analogue of Claude/pi `/compact` is `/summarize` (user-stated 2026-09-07;
+# finish-round previously failed closed with "no compact command known for agent kind 'cursor'").
+COMPACT_COMMANDS = {
+    "claude": "/compact",
+    "pi": "/compact",
+    "kimi": "/compact",
+    "codex": "/compact",
+    "opencode": "/compact",
+    "droid": "/compress",
+    "cursor": "/summarize",
+}
+# Kinds whose compact command takes free-text focus instructions after the command.
+COMPACT_ACCEPTS_INSTRUCTIONS = {"claude", "pi"}
+FRESH_OK_STATUS = {"idle", "done"}
+FRESH_MAX_LINES = 12
+HERDR_CALL_TIMEOUT = 30.0
+
+
+class FreshError(ValueError):
+    """The executor pane could not be verified as freshly cleared."""
+
+
+def now() -> str:
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
+
+
+def canonical_cwd(value: str) -> str:
+    return str(Path(value).expanduser().resolve())
+
+
+def default_root(cwd: str) -> Path:
+    base = Path(os.environ.get("XDG_STATE_HOME", "~/.local/state")).expanduser()
+    key = hashlib.sha256(cwd.encode()).hexdigest()[:20]
+    return base / "herdr-pair" / key
+
+
+def paths(args: argparse.Namespace) -> dict[str, Path]:
+    cwd = canonical_cwd(args.cwd)
+    root = Path(args.state_dir).expanduser().resolve() if args.state_dir else default_root(cwd)
+    return {
+        "root": root,
+        "state": root / "state.json",
+        "lock": root / "state.lock",
+        "ledger": root / "jobs.tsv",
+        "checkpoint": root / "CHECKPOINT.md",
+    }
+
+
+def chmod_private(path: Path, mode: int) -> None:
+    os.chmod(path, mode)
+
+
+@contextlib.contextmanager
+def locked(root: Path, lock_path: Path, create: bool = False) -> Iterator[None]:
+    if create:
+        root.mkdir(parents=True, exist_ok=True)
+        chmod_private(root, DIR_MODE)
+    if not root.is_dir():
+        raise ValueError("pair state is not initialized")
+    with lock_path.open("a+", encoding="utf-8") as handle:
+        chmod_private(lock_path, FILE_MODE)
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def atomic_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    chmod_private(path.parent, DIR_MODE)
+    fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        chmod_private(Path(tmp_name), FILE_MODE)
+        os.replace(tmp_name, path)
+        chmod_private(path, FILE_MODE)
+    finally:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+
+
+def load(path: Path, cwd: str) -> dict[str, Any]:
+    if not path.is_file():
+        raise ValueError("pair state is not initialized; run init")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if data.get("version") != VERSION:
+        raise ValueError(f"unsupported state version: {data.get('version')!r}")
+    if data.get("cwd") != cwd:
+        raise ValueError(f"state cwd mismatch: {data.get('cwd')!r} != {cwd!r}")
+    return data
+
+
+def save(path: Path, data: dict[str, Any]) -> None:
+    data["updated_at"] = now()
+    atomic_text(path, json.dumps(data, indent=2, sort_keys=True) + "\n")
+
+
+def persist(pp: dict[str, Path], data: dict[str, Any]) -> None:
+    save(pp["state"], data)
+    write_ledger(pp["ledger"], data)
+
+
+def load_ready(pp: dict[str, Path], cwd: str) -> dict[str, Any]:
+    data = load(pp["state"], cwd)
+    # jobs.tsv is a derived view of state.json, never a second source of truth.
+    write_ledger(pp["ledger"], data)
+    pending = data.get("pending_dispatch")
+    if pending:
+        raise PendingDispatchError(pending)
+    return data
+
+
+def pending_payload(pending: dict[str, Any]) -> dict[str, Any]:
+    round_id = str(pending.get("round_id") or "")
+    target = str(pending.get("target") or "")
+    return {
+        "status": "PENDING_DISPATCH_UNRESOLVED",
+        "round_consumed": False,
+        "resent": False,
+        "counted": False,
+        "round_id": round_id,
+        "target": target,
+        "session_switched": False,
+        "guidance": (
+            f"{PENDING_GUIDANCE} target={target} round_id={round_id}."
+        ),
+    }
+
+
+def validate_new_session_id(value: str, current: str) -> str:
+    text = (value or "").strip()
+    if not text:
+        raise ValueError("new-session-id is empty")
+    if text.startswith("<") and text.endswith(">"):
+        raise ValueError(f"new-session-id is a placeholder: {text}")
+    if current and text == current:
+        raise ValueError("new-session-id must differ from the current session_id")
+    return text
+
+
+def output(payload: dict[str, Any]) -> None:
+    print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+
+
+def tsv(value: Any) -> str:
+    return str(value or "").replace("\t", "\\t").replace("\r", "\\r").replace("\n", "\\n")
+
+
+def write_ledger(path: Path, data: dict[str, Any]) -> None:
+    fields = [
+        "round_id", "phase", "queue", "job_id", "label", "submitter",
+        "command", "log", "expected_artifacts", "completion_assertion",
+        "state", "cancel_retry_owner", "created_at", "updated_at",
+    ]
+    lines = ["\t".join(fields)]
+    for job in data["jobs"]:
+        lines.append("\t".join(tsv(job.get(field)) for field in fields))
+    atomic_text(path, "\n".join(lines) + "\n")
+
+
+def table_cell(value: Any) -> str:
+    return str(value or "").replace("|", "\\|").replace("\n", " ")
+
+
+def write_checkpoint(path: Path, data: dict[str, Any], reason: str) -> None:
+    current = [r for r in data["rounds"] if r["phase"] == data["phase"]]
+    active_jobs = [j for j in data["jobs"] if j["state"] not in TERMINAL_JOBS]
+    lines = [
+        "# Herdr Pair Checkpoint",
+        "",
+        f"- Generated: `{now()}`",
+        f"- Reason: `{reason}`",
+        f"- Working directory: `{data['cwd']}`",
+        f"- Phase: `{data['phase']}`",
+        f"- Rounds in phase: `{data['phase_round_count']}`",
+        f"- Rollover required: `{str(data['rollover_required']).lower()}`",
+        f"- Session ID: `{data.get('session_id') or 'unknown'}`",
+        "",
+        "## Current phase rounds",
+        "",
+        "| Round | Executor | Status | Scope | Acceptance |",
+        "|---|---|---|---|---|",
+    ]
+    for item in current:
+        lines.append(
+            "| {round_id} | {executor} | {status} | {scope} | {acceptance} |".format(
+                **{key: table_cell(item.get(key)) for key in (
+                    "round_id", "executor", "status", "scope", "acceptance"
+                )}
+            )
+        )
+    if not current:
+        lines.append("| none |  |  |  |  |")
+    lines += ["", "## Nonterminal background jobs", ""]
+    if active_jobs:
+        lines += ["```json", json.dumps(active_jobs, indent=2, ensure_ascii=False), "```"]
+    else:
+        lines.append("None.")
+    compact_queued = data.get("compact_queued") or {}
+    lines += [
+        "",
+        "## Resume",
+        "",
+        "1. Read this checkpoint and `jobs.tsv`.",
+        "2. Verify every nonterminal job from its scheduler and log.",
+        "3. Planner compaction: "
+        + (
+            f"`{compact_queued.get('command')}` was queued on planner pane "
+            f"`{compact_queued.get('pane')}` at `{compact_queued.get('queued_at')}`; it runs "
+            "when that turn ends."
+            if compact_queued.get("phase") == data["phase"]
+            else f"not queued yet; run `python3 {PAIRCTL_SCRIPT} compact-self` or ask the user "
+            "to run that kind's compact command (cursor `/summarize`) or clear."
+        ),
+        "4. Record the rollover once the context is fresh: a Claude Code planner does this from "
+        f"its SessionStart hook; otherwise run `python3 {PAIRCTL_SCRIPT} rollover --reason "
+        "compact --new-session-id <id>` (use `--reason new` when the session id changed).",
+        "5. Do not cancel, retry, or replace jobs without the recorded owner's authorization.",
+        "",
+    ]
+    atomic_text(path, "\n".join(lines))
+    data["last_checkpoint"] = {
+        "path": str(path),
+        "reason": reason,
+        "created_at": now(),
+    }
+
+
+def find_round(data: dict[str, Any], round_id: str) -> dict[str, Any]:
+    found = [item for item in data["rounds"] if item["round_id"] == round_id]
+    if len(found) != 1:
+        raise ValueError(f"unknown round_id: {round_id}")
+    return found[0]
+
+
+def active_round_ids(data: dict[str, Any]) -> list[str]:
+    return [r["round_id"] for r in data["rounds"] if r["status"] == "active"]
+
+
+def allocate_round_id(data: dict[str, Any]) -> str:
+    return f"p{data['phase']:02d}-r{data['round_seq'] + 1:03d}"
+
+
+def inject_round_id(text: str, round_id: str) -> str:
+    header = f"[轮次] round_id={round_id}"
+    match = ROUND_HEADER.search(text)
+    if match:
+        return text[:match.start()] + header + text[match.end():]
+    return header + "\n" + text
+
+
+def commit_round(
+    data: dict[str, Any],
+    *,
+    round_id: str,
+    executor: str,
+    scope: str,
+    acceptance: str,
+    fresh: dict[str, Any] | None = None,
+) -> None:
+    expected = allocate_round_id(data)
+    if round_id != expected:
+        raise ValueError(f"round_id mismatch: {round_id} != {expected}")
+    data["round_seq"] += 1
+    data["phase_round_count"] += 1
+    data["rounds"].append({
+        "round_id": round_id,
+        "phase": data["phase"],
+        "executor": executor,
+        "scope": scope,
+        "acceptance": acceptance,
+        "status": "active",
+        "started_at": now(),
+        "finished_at": "",
+        "artifacts": "",
+        "notes": "",
+        "fresh": fresh,
+    })
+    if data["phase_round_count"] >= 5:
+        data["rollover_required"] = True
+
+
+def after_round_checkpoint(pp: dict[str, Path], data: dict[str, Any]) -> None:
+    if data["phase_round_count"] == 3:
+        write_checkpoint(pp["checkpoint"], data, "automatic three-round checkpoint")
+
+
+def rollover_payload(
+    pp: dict[str, Path], data: dict[str, Any], reason: str, args: argparse.Namespace
+) -> dict[str, Any]:
+    planner_compact = queue_planner_compact(args, pp, data)
+    write_checkpoint(pp["checkpoint"], data, reason)
+    return {
+        "status": "SESSION_ROLLOVER_REQUIRED",
+        "trigger": "SESSION_ROLLOVER_REQUIRED",
+        "checkpoint": str(pp["checkpoint"]),
+        "session_switched": False,
+        "planner_compact": planner_compact,
+        "guidance": ROLLOVER_GUIDANCE,
+        "next": ROLLOVER_GUIDANCE,
+    }
+
+
+def emit_rollover_block(
+    pp: dict[str, Path], data: dict[str, Any], reason: str, args: argparse.Namespace
+) -> int:
+    payload = rollover_payload(pp, data, reason, args)
+    persist(pp, data)
+    payload["continue_after_compact"] = spawn_compact_continue_watcher(
+        args, pp, data, payload.get("planner_compact")
+        if isinstance(payload.get("planner_compact"), dict) else None,
+    )
+    output(payload)
+    return ROLLOVER_EXIT
+
+
+def herdr_bin(args: argparse.Namespace) -> str:
+    return getattr(args, "herdr", None) or os.environ.get("PAIRCTL_HERDR") or "herdr"
+
+
+def run_herdr(
+    args: argparse.Namespace, tail: list[str], timeout: float = HERDR_CALL_TIMEOUT
+) -> tuple[int, str, str, Any]:
+    """Run one herdr subcommand with an argv list (no shell). Never raises on herdr errors."""
+    argv = [herdr_bin(args), *tail]
+    try:
+        proc = subprocess.run(
+            argv, check=False, capture_output=True, text=True, shell=False, timeout=timeout,
+        )
+    except OSError as exc:
+        raise ValueError(f"cannot run herdr ({argv[0]}): {exc}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise ValueError(f"herdr timed out after {timeout}s: {' '.join(tail[:3])}") from exc
+    return proc.returncode, proc.stdout, proc.stderr, parse_json_payload(proc.stdout)
+
+
+def agent_info(args: argparse.Namespace, target: str) -> dict[str, Any]:
+    code, out, err, payload = run_herdr(args, ["agent", "get", target])
+    result = payload.get("result") if isinstance(payload, dict) else None
+    agent = result.get("agent") if isinstance(result, dict) else None
+    if code != 0 or not isinstance(agent, dict) or (isinstance(payload, dict) and payload.get("error")):
+        raise ValueError(
+            f"herdr agent get {target} failed: {herdr_error_code(payload) or clip(err or out, 300)}"
+        )
+    return agent
+
+
+def agent_screen(args: argparse.Namespace, target: str, lines: int) -> str:
+    """Visible screen text of the target pane. `herdr agent read` prints raw text, not JSON."""
+    code, out, err, _ = run_herdr(
+        args, ["agent", "read", target, "--source", "visible", "--lines", str(lines)],
+    )
+    if code != 0:
+        raise ValueError(f"herdr agent read {target} failed: {clip(err or out, 300)}")
+    return out
+
+
+def verify_fresh(screen: str, markers: tuple[str, ...]) -> str:
+    """Return how the screen proved fresh ('marker' or 'heuristic'), or '' if it did not."""
+    if markers:
+        return "marker" if any(m in screen for m in markers) else ""
+    nonblank = [line for line in screen.splitlines() if line.strip()]
+    return "heuristic" if len(nonblank) <= FRESH_MAX_LINES else ""
+
+
+def freshen_executor(args: argparse.Namespace, target: str) -> dict[str, Any]:
+    """Send the executor's fresh-session command and verify on screen that it took effect.
+
+    Fails closed: any doubt raises FreshError and the handoff is not sent.
+    """
+    info = agent_info(args, target)
+    kind = str(info.get("agent") or "")
+    status = str(info.get("agent_status") or "")
+    if status not in FRESH_OK_STATUS:
+        raise FreshError(
+            f"refusing to clear executor {target} ({kind}): agent_status={status!r}; "
+            "only idle/done panes are cleared"
+        )
+    command = args.fresh_command or FRESH_COMMANDS.get(kind)
+    if not command:
+        raise FreshError(f"no fresh-session command known for agent kind {kind!r}")
+    code, out, err, payload = run_herdr(args, ["agent", "prompt", target, command])
+    if code != 0 or not is_agent_prompted(payload):
+        raise FreshError(
+            f"{command} was not accepted by {target}: "
+            f"{herdr_error_code(payload) or 'unknown_response'} {clip(err or out, 300)}"
+        )
+    markers = tuple(args.fresh_marker or ()) + FRESH_MARKERS.get(kind, ())
+    deadline = time.monotonic() + args.fresh_timeout
+    started = time.monotonic()
+    screen = ""
+    while True:
+        try:
+            screen = agent_screen(args, target, args.fresh_lines)
+        except ValueError:
+            screen = ""
+        verified = verify_fresh(screen, markers)
+        if verified:
+            return {
+                "kind": kind,
+                "command": command,
+                "verified": verified,
+                "markers": list(markers),
+                "elapsed_s": round(time.monotonic() - started, 2),
+                "at": now(),
+            }
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.5)
+    tail = "\n".join(line for line in screen.splitlines() if line.strip())[-600:]
+    raise FreshError(
+        f"{command} was sent to {target} ({kind}) but the screen did not confirm a fresh "
+        f"session within {args.fresh_timeout}s (markers={list(markers)!r}); screen tail: {tail!r}"
+    )
+
+
+def auto_compact_enabled(data: dict[str, Any]) -> bool:
+    if os.environ.get("PAIRCTL_AUTO_COMPACT", "").strip() in {"0", "off", "false", "no"}:
+        return False
+    return bool(data.get("auto_compact", True))
+
+
+def env_flag(name: str, default: bool = True) -> bool:
+    raw = (os.environ.get(name) or "").strip().lower()
+    if not raw:
+        return default
+    return raw not in {"0", "off", "false", "no"}
+
+
+def env_float(name: str, default: float) -> float:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def continue_after_compact_enabled() -> bool:
+    return env_flag("PAIRCTL_CONTINUE_AFTER_COMPACT", True)
+
+
+def pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def compact_continue_prompt(pp: dict[str, Path], data: dict[str, Any]) -> str:
+    session = str(data.get("session_id") or "").strip() or "<session id from status>"
+    return (
+        "herdr-pair auto-continue after compaction. Do not wait for the user to say 继续.\n"
+        f"Working directory: {data['cwd']}\n"
+        f"Checkpoint: {pp['checkpoint']}\n"
+        f"PAIRCTL={PAIRCTL_SCRIPT}\n"
+        "1. python3 \"$PAIRCTL\" status\n"
+        "2. If rollover_required or status is SESSION_ROLLOVER_REQUIRED, run:\n"
+        f"   python3 \"$PAIRCTL\" rollover --reason compact --new-session-id {session}\n"
+        "3. Read the checkpoint. Re-resolve the executor with herdr agent list "
+        "(one writer per cwd).\n"
+        "4. Continue the pairing immediately: independently verify any outstanding "
+        "executor report, or dispatch the next prepared handoff. Do not ask the user "
+        "to confirm."
+    )
+
+
+def spawn_compact_continue_watcher(
+    args: argparse.Namespace,
+    pp: dict[str, Path],
+    data: dict[str, Any],
+    planner_compact: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Detached waiter: after compact settles, prompt the planner to resume.
+
+    Must not be queued through herdr behind `/compact`/`/summarize`: a follow-up
+    prompt in that queue was observed to run before the summary existed.
+    """
+    if not continue_after_compact_enabled():
+        return {"spawned": False, "reason": "disabled"}
+    if not planner_compact or not planner_compact.get("queued"):
+        return {"spawned": False, "reason": "compact not queued"}
+    pid_path = pp["root"] / "compact-continue.pid"
+    try:
+        existing = int(pid_path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        existing = 0
+    if existing and pid_alive(existing):
+        return {"spawned": False, "reason": "watcher already running", "pid": existing}
+    log = pp["root"] / "compact-continue.log"
+    cmd = [sys.executable, PAIRCTL_SCRIPT, "watch-compact-continue", "--cwd", data["cwd"]]
+    state_dir = getattr(args, "state_dir", None)
+    if state_dir:
+        cmd += ["--state-dir", str(state_dir)]
+    herdr = herdr_bin(args)
+    cmd += ["--herdr", herdr]
+    env = os.environ.copy()
+    env["PAIRCTL_HERDR"] = herdr
+    env["PAIRCTL_CONTINUE_AFTER_COMPACT"] = "0"
+    try:
+        handle = log.open("ab")
+        proc = subprocess.Popen(
+            cmd,
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            cwd=str(pp["root"]),
+            env=env,
+        )
+        handle.close()
+        pid_path.write_text(str(proc.pid), encoding="utf-8")
+        os.chmod(pid_path, FILE_MODE)
+    except OSError as exc:
+        return {"spawned": False, "reason": str(exc)}
+    return {"spawned": True, "pid": proc.pid, "log": str(log)}
+
+
+def cmd_watch_compact_continue(args: argparse.Namespace) -> int:
+    """Poll until the planner pane is idle after compaction, then prompt it to resume."""
+    pp = paths(args)
+    cwd = canonical_cwd(args.cwd)
+    min_delay = env_float("PAIRCTL_CONTINUE_MIN_DELAY_S", 20.0)
+    idle_needed = env_float("PAIRCTL_CONTINUE_IDLE_S", 8.0)
+    timeout = env_float("PAIRCTL_CONTINUE_TIMEOUT_S", 600.0)
+    poll = max(env_float("PAIRCTL_CONTINUE_POLL_S", 1.0), 0.05)
+    with locked(pp["root"], pp["lock"]):
+        data = load(pp["state"], cwd)
+        queued = data.get("compact_queued") or {}
+        pane = str(queued.get("pane") or data.get("planner_pane") or "")
+    if not pane:
+        output({"status": "continue_skipped", "reason": "planner pane unknown"})
+        return 0
+    started = time.monotonic()
+    deadline = started + timeout
+    idle_for = 0.0
+    while time.monotonic() < deadline:
+        try:
+            status = str(agent_info(args, pane).get("agent_status") or "")
+        except ValueError:
+            idle_for = 0.0
+            time.sleep(poll)
+            continue
+        if status in FRESH_OK_STATUS:
+            idle_for += poll
+        else:
+            idle_for = 0.0
+        elapsed = time.monotonic() - started
+        if idle_for >= idle_needed and elapsed >= min_delay:
+            break
+        time.sleep(poll)
+    else:
+        output({"status": "continue_timeout", "pane": pane, "timeout_s": timeout})
+        return 2
+    with locked(pp["root"], pp["lock"]):
+        data = load(pp["state"], cwd)
+        write_ledger(pp["ledger"], data)
+    text = compact_continue_prompt(pp, data)
+    try:
+        code, out, err, payload = run_herdr(args, ["agent", "prompt", pane, text])
+    except ValueError as exc:
+        output({"status": "continue_failed", "pane": pane, "reason": str(exc)})
+        return 2
+    ok = code == 0 and is_agent_prompted(payload)
+    result = {
+        "status": "continue_prompted" if ok else "continue_failed",
+        "pane": pane,
+        "herdr_exit": code,
+    }
+    if not ok:
+        result["reason"] = herdr_error_code(payload) or clip(err or out, 300)
+    output(result)
+    return 0 if ok else 2
+
+
+def compact_instructions(pp: dict[str, Path], data: dict[str, Any], kind: str) -> str:
+    rollover = (
+        "The SessionStart hook records the pairctl rollover automatically."
+        if kind == "claude"
+        else f"then run python3 {PAIRCTL_SCRIPT} rollover --reason compact --new-session-id <your session id>"
+    )
+    return (
+        "herdr-pair phase boundary. Keep verbatim: the checkpoint file "
+        f"{pp['checkpoint']}, planner pane {data.get('planner_pane') or 'unknown'}, working "
+        f"directory {data['cwd']}, every round_id with its executor pane and status, all "
+        "nonterminal background jobs, open blockers, and the user's original task statement. "
+        f"After compaction read the checkpoint file before doing anything else. {rollover}"
+    )
+
+
+def queue_planner_compact(
+    args: argparse.Namespace,
+    pp: dict[str, Path],
+    data: dict[str, Any],
+    *,
+    mode: str = "compact",
+    force: bool = False,
+) -> dict[str, Any]:
+    """Queue the planner pane's own compact/clear command through herdr.
+
+    The command lands in the planner's input queue and executes when its current turn
+    ends (observed on Claude Code 2026-09-07). Never raises: the result says whether it
+    was queued and why not. Mutates data['compact_queued'] on success.
+    """
+    pane = str(data.get("planner_pane") or "")
+    already = data.get("compact_queued") or {}
+    if not force and already.get("phase") == data["phase"]:
+        return {"queued": False, "reason": "already queued for this phase", "previous": already}
+    if not pane:
+        return {"queued": False, "reason": "planner_pane unknown; run init --planner-pane"}
+    if not force and not auto_compact_enabled(data):
+        return {
+            "queued": False,
+            "reason": "auto compact disabled (init --no-auto-compact or PAIRCTL_AUTO_COMPACT=0)",
+        }
+    try:
+        info = agent_info(args, pane)
+    except ValueError as exc:
+        return {"queued": False, "reason": f"cannot inspect planner pane {pane}: {exc}"}
+    kind = str(info.get("agent") or "")
+    table = FRESH_COMMANDS if mode == "clear" else COMPACT_COMMANDS
+    command = table.get(kind)
+    if not command:
+        return {"queued": False, "reason": f"no {mode} command known for agent kind {kind!r}", "pane": pane}
+    text = command
+    if mode == "compact" and kind in COMPACT_ACCEPTS_INSTRUCTIONS:
+        text = f"{command} {compact_instructions(pp, data, kind)}"
+    try:
+        code, out, err, payload = run_herdr(args, ["agent", "prompt", pane, text])
+    except ValueError as exc:
+        return {"queued": False, "reason": str(exc), "pane": pane}
+    if code != 0 or not is_agent_prompted(payload):
+        return {
+            "queued": False,
+            "reason": herdr_error_code(payload) or "unknown_response",
+            "pane": pane,
+            "herdr_exit": code,
+            "herdr_stdout": clip(out, 500),
+            "herdr_stderr": clip(err, 500),
+        }
+    record = {
+        "phase": data["phase"],
+        "pane": pane,
+        "kind": kind,
+        "mode": mode,
+        "command": command,
+        "queued_at": now(),
+    }
+    data["compact_queued"] = record
+    return {
+        "queued": True,
+        **record,
+        "note": "queued in the planner pane; it executes when the current turn ends",
+    }
+
+
+def parse_json_payload(text: str) -> Any:
+    stripped = text.strip()
+    if not stripped:
+        return None
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        pass
+    for line in reversed(stripped.splitlines()):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            return json.loads(line)
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+def is_agent_prompted(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("error"):
+        return False
+    if payload.get("type") == "agent_prompted":
+        return True
+    result = payload.get("result")
+    if isinstance(result, dict) and not result.get("error"):
+        return result.get("type") == "agent_prompted"
+    return False
+
+
+def herdr_error_code(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    error = payload.get("error")
+    if isinstance(error, dict):
+        return str(error.get("code") or "")
+    result = payload.get("result")
+    if isinstance(result, dict):
+        error = result.get("error")
+        if isinstance(error, dict):
+            return str(error.get("code") or "")
+        if result.get("type") == "agent_prompt_stalled":
+            return "agent_prompt_stalled"
+    if payload.get("type") == "agent_prompt_stalled":
+        return "agent_prompt_stalled"
+    return ""
+
+
+def clip(text: str, limit: int = 2000) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "…"
+
+
+def cmd_init(args: argparse.Namespace) -> int:
+    pp = paths(args)
+    cwd = canonical_cwd(args.cwd)
+    with locked(pp["root"], pp["lock"], create=True):
+        if pp["state"].exists():
+            data = load_ready(pp, cwd)
+            # Existing rounds and jobs are never discarded. There is no --reset.
+            if args.planner_pane:
+                data["planner_pane"] = args.planner_pane
+            if args.session_id:
+                data["session_id"] = args.session_id
+            if args.no_auto_compact:
+                data["auto_compact"] = False
+        else:
+            data = {
+                "version": VERSION,
+                "cwd": cwd,
+                "planner_pane": args.planner_pane or "",
+                "session_id": args.session_id or "",
+                "auto_compact": not args.no_auto_compact,
+                "phase": 1,
+                "round_seq": 0,
+                "phase_round_count": 0,
+                "rollover_required": False,
+                "compaction_epoch": 0,
+                "compact_queued": None,
+                "rounds": [],
+                "jobs": [],
+                "pending_dispatch": None,
+                "created_at": now(),
+            }
+        persist(pp, data)
+    output({
+        "status": "initialized",
+        "state": str(pp["state"]),
+        "ledger": str(pp["ledger"]),
+        "state_root": str(pp["root"]),
+    })
+    return 0
+
+
+def cmd_start_round(args: argparse.Namespace) -> int:
+    pp = paths(args)
+    cwd = canonical_cwd(args.cwd)
+    with locked(pp["root"], pp["lock"]):
+        data = load_ready(pp, cwd)
+        if data["rollover_required"]:
+            return emit_rollover_block(pp, data, "round limit reached", args)
+        active = active_round_ids(data)
+        if active:
+            raise ValueError(f"active round already exists: {active[0]}")
+        round_id = allocate_round_id(data)
+        commit_round(
+            data,
+            round_id=round_id,
+            executor=args.executor,
+            scope=args.scope,
+            acceptance=args.acceptance,
+        )
+        after_round_checkpoint(pp, data)
+        persist(pp, data)
+    payload = {"status": "round_started", "round_id": round_id}
+    if data["rollover_required"]:
+        payload["after_round"] = "SESSION_ROLLOVER_REQUIRED"
+    output(payload)
+    return 0
+
+
+def cmd_send_round(args: argparse.Namespace) -> int:
+    pp = paths(args)
+    cwd = canonical_cwd(args.cwd)
+    handoff = Path(args.file).expanduser()
+    if not handoff.is_file():
+        raise ValueError(f"handoff file not found: {handoff}")
+    text = handoff.read_text(encoding="utf-8")
+    with locked(pp["root"], pp["lock"]):
+        data = load_ready(pp, cwd)
+        if data["rollover_required"]:
+            return emit_rollover_block(pp, data, "round limit reached", args)
+        active = active_round_ids(data)
+        if active:
+            raise ValueError(f"active round already exists: {active[0]}")
+        round_id = allocate_round_id(data)
+        message = inject_round_id(text, round_id)
+        encoded = message.encode("utf-8")
+        if len(encoded) > MAX_ARG_BYTES:
+            raise ValueError(
+                f"handoff is {len(encoded)} bytes; argv limit is {MAX_ARG_BYTES}. "
+                "Send a file pointer instead of inlining the payload."
+            )
+        fresh: dict[str, Any] | None = None
+        if args.fresh:
+            # Clear the executor's context before the handoff lands. This happens before
+            # pending_dispatch exists, so a failure here consumes nothing and resends nothing.
+            try:
+                fresh = freshen_executor(args, args.target)
+            except ValueError as exc:
+                output({
+                    "status": "fresh_failed",
+                    "round_consumed": False,
+                    "round_id": round_id,
+                    "target": args.target,
+                    "error": str(exc),
+                    "guidance": FRESH_GUIDANCE,
+                })
+                return 2
+        argv = [herdr_bin(args), "agent", "prompt", args.target, message]
+        data["pending_dispatch"] = {
+            "status": "uncertain",
+            "counted": False,
+            "round_id": round_id,
+            "target": args.target,
+            "executor": args.executor or args.target,
+            "scope": args.scope,
+            "acceptance": args.acceptance,
+            "handoff": str(handoff),
+            "fresh": fresh,
+            "phase_round_count": data["phase_round_count"],
+            "created_at": now(),
+        }
+        persist(pp, data)
+        try:
+            proc = subprocess.run(
+                argv,
+                check=False,
+                capture_output=True,
+                text=True,
+                shell=False,
+                timeout=args.send_timeout,
+            )
+        except OSError as exc:
+            data["pending_dispatch"] = None
+            persist(pp, data)
+            output({
+                "status": "send_failed",
+                "round_consumed": False,
+                "round_id": round_id,
+                "error": str(exc),
+            })
+            return 2
+        except subprocess.TimeoutExpired as exc:
+            result = pending_payload(data["pending_dispatch"])
+            result.update({
+                "error": "herdr_timeout",
+                "send_timeout": args.send_timeout,
+                "herdr_stdout": clip(exc.stdout or ""),
+                "herdr_stderr": clip(exc.stderr or ""),
+            })
+            output(result)
+            return 2
+        payload = parse_json_payload(proc.stdout)
+        prompted = proc.returncode == 0 and is_agent_prompted(payload)
+        if not prompted:
+            code = herdr_error_code(payload)
+            # agent_not_found is a definitive pre-delivery failure. A stalled,
+            # malformed or unknown response is ambiguous and must not be resent.
+            if code == "agent_not_found":
+                data["pending_dispatch"] = None
+                persist(pp, data)
+                output({
+                    "status": "send_failed",
+                    "round_consumed": False,
+                    "round_id": round_id,
+                    "herdr_error": code,
+                    "herdr_exit": proc.returncode,
+                    "herdr_stdout": clip(proc.stdout),
+                    "herdr_stderr": clip(proc.stderr),
+                })
+            else:
+                result = pending_payload(data["pending_dispatch"])
+                result.update({
+                    "herdr_error": code or "unknown_response",
+                    "herdr_exit": proc.returncode,
+                    "herdr_stdout": clip(proc.stdout),
+                    "herdr_stderr": clip(proc.stderr),
+                })
+                output(result)
+            return 2
+        data["pending_dispatch"] = None
+        commit_round(
+            data,
+            round_id=round_id,
+            executor=args.executor or args.target,
+            scope=args.scope,
+            acceptance=args.acceptance,
+            fresh=fresh,
+        )
+        after_round_checkpoint(pp, data)
+        persist(pp, data)
+    result = {
+        "status": "round_sent",
+        "round_id": round_id,
+        "round_consumed": True,
+        "target": args.target,
+        "agent_prompted": True,
+        "fresh": fresh,
+    }
+    if data["phase_round_count"] == 3:
+        result["checkpoint"] = str(pp["checkpoint"])
+        result["checkpoint_reason"] = "automatic three-round checkpoint"
+    if data["rollover_required"]:
+        result["after_round"] = "SESSION_ROLLOVER_REQUIRED"
+    output(result)
+    return 0
+
+
+def cmd_resolve_pending(args: argparse.Namespace) -> int:
+    pp = paths(args)
+    cwd = canonical_cwd(args.cwd)
+    with locked(pp["root"], pp["lock"]):
+        data = load(pp["state"], cwd)
+        # Repair the derived ledger, but intentionally bypass load_ready because
+        # this command exists to resolve pending_dispatch.
+        write_ledger(pp["ledger"], data)
+        pending = data.get("pending_dispatch")
+        if not pending:
+            raise ValueError("no pending_dispatch to resolve")
+        round_id = str(pending.get("round_id") or "")
+        target = str(pending.get("target") or "")
+        if args.outcome == "delivered":
+            active = active_round_ids(data)
+            if active:
+                raise ValueError(f"active round already exists: {active[0]}")
+            commit_round(
+                data,
+                round_id=round_id,
+                executor=str(pending.get("executor") or target),
+                scope=str(pending.get("scope") or ""),
+                acceptance=str(pending.get("acceptance") or ""),
+                fresh=pending.get("fresh"),
+            )
+            data["pending_dispatch"] = None
+            after_round_checkpoint(pp, data)
+            persist(pp, data)
+            output({
+                "status": "pending_resolved_delivered",
+                "round_id": round_id,
+                "target": target,
+                "round_consumed": True,
+            })
+            return 0
+        data["pending_dispatch"] = None
+        persist(pp, data)
+        output({
+            "status": "pending_resolved_not_delivered",
+            "round_id": round_id,
+            "target": target,
+            "round_consumed": False,
+        })
+        return 0
+
+
+def cmd_finish_round(args: argparse.Namespace) -> int:
+    pp = paths(args)
+    cwd = canonical_cwd(args.cwd)
+    with locked(pp["root"], pp["lock"]):
+        data = load_ready(pp, cwd)
+        item = find_round(data, args.round_id)
+        if item["status"] != "active":
+            raise ValueError(f"round is not active: {args.round_id} ({item['status']})")
+        item.update({
+            "status": args.status,
+            "finished_at": now(),
+            "artifacts": args.artifacts,
+            "notes": args.notes,
+        })
+        if data["phase_round_count"] >= 5:
+            data["rollover_required"] = True
+        planner_compact = None
+        if data["rollover_required"]:
+            # The phase is over and no round is active: queue the planner's own compaction
+            # now, so it runs as soon as the planner's current turn ends.
+            planner_compact = queue_planner_compact(args, pp, data)
+        if data["phase_round_count"] >= 3:
+            reason = "round completed"
+            if data["rollover_required"]:
+                reason = "five-round limit reached"
+            write_checkpoint(pp["checkpoint"], data, reason)
+        persist(pp, data)
+    if data["rollover_required"]:
+        continue_after = spawn_compact_continue_watcher(args, pp, data, planner_compact)
+        output({
+            "status": "round_finished",
+            "round_id": args.round_id,
+            "trigger": "SESSION_ROLLOVER_REQUIRED",
+            "checkpoint": str(pp["checkpoint"]),
+            "session_switched": False,
+            "planner_compact": planner_compact,
+            "continue_after_compact": continue_after,
+            "guidance": ROLLOVER_GUIDANCE,
+            "next": ROLLOVER_GUIDANCE,
+        })
+        return ROLLOVER_EXIT
+    output({"status": "round_finished", "round_id": args.round_id})
+    return 0
+
+
+def cmd_job_add(args: argparse.Namespace) -> int:
+    pp = paths(args)
+    cwd = canonical_cwd(args.cwd)
+    with locked(pp["root"], pp["lock"]):
+        data = load_ready(pp, cwd)
+        item = find_round(data, args.round_id)
+        if any(j["queue"] == args.queue and j["job_id"] == args.job_id for j in data["jobs"]):
+            raise ValueError(f"job already exists: {args.queue}/{args.job_id}")
+        job = {
+            "round_id": args.round_id,
+            "phase": item["phase"],
+            "queue": args.queue,
+            "job_id": args.job_id,
+            "label": args.label,
+            "submitter": args.submitter,
+            "command": args.command,
+            "log": args.log,
+            "expected_artifacts": args.expected_artifacts,
+            "completion_assertion": args.completion_assertion,
+            "state": args.state,
+            "cancel_retry_owner": args.owner,
+            "created_at": now(),
+            "updated_at": now(),
+        }
+        data["jobs"].append(job)
+        if data["phase_round_count"] >= 3:
+            write_checkpoint(pp["checkpoint"], data, "background job added")
+        persist(pp, data)
+    output({"status": "job_added", "job": f"{args.queue}/{args.job_id}", "ledger": str(pp["ledger"])})
+    return 0
+
+
+def cmd_job_update(args: argparse.Namespace) -> int:
+    pp = paths(args)
+    cwd = canonical_cwd(args.cwd)
+    with locked(pp["root"], pp["lock"]):
+        data = load_ready(pp, cwd)
+        found = [j for j in data["jobs"] if j["queue"] == args.queue and j["job_id"] == args.job_id]
+        if len(found) != 1:
+            raise ValueError(f"unknown job: {args.queue}/{args.job_id}")
+        job = found[0]
+        job["state"] = args.state
+        job["updated_at"] = now()
+        if args.log:
+            job["log"] = args.log
+        if args.notes:
+            job["notes"] = args.notes
+        if data["phase_round_count"] >= 3 or data["rollover_required"]:
+            write_checkpoint(pp["checkpoint"], data, "background job updated")
+        persist(pp, data)
+    output({"status": "job_updated", "job": f"{args.queue}/{args.job_id}", "state": args.state})
+    return 0
+
+
+def cmd_checkpoint(args: argparse.Namespace) -> int:
+    pp = paths(args)
+    cwd = canonical_cwd(args.cwd)
+    with locked(pp["root"], pp["lock"]):
+        data = load_ready(pp, cwd)
+        write_checkpoint(pp["checkpoint"], data, args.reason)
+        persist(pp, data)
+    output({"status": "checkpoint_written", "checkpoint": str(pp["checkpoint"])})
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    pp = paths(args)
+    cwd = canonical_cwd(args.cwd)
+    with locked(pp["root"], pp["lock"]):
+        data = load_ready(pp, cwd)
+    active_jobs = [j for j in data["jobs"] if j["state"] not in TERMINAL_JOBS]
+    payload = {
+        "status": "SESSION_ROLLOVER_REQUIRED" if data["rollover_required"] else "ok",
+        "rollover_required": data["rollover_required"],
+        "phase": data["phase"],
+        "phase_round_count": data["phase_round_count"],
+        "rounds_total": len(data["rounds"]),
+        "active_rounds": active_round_ids(data),
+        "active_jobs": len(active_jobs),
+        "checkpoint": (data.get("last_checkpoint") or {}).get("path", ""),
+        "planner_pane": data.get("planner_pane") or "",
+        "session_id": data.get("session_id") or "",
+        "auto_compact": auto_compact_enabled(data),
+        "compact_queued": data.get("compact_queued"),
+        "compaction_epoch": data.get("compaction_epoch", 0),
+        "updated_at": data.get("updated_at", ""),
+        "session_switched": False,
+    }
+    if data["rollover_required"]:
+        payload["guidance"] = ROLLOVER_GUIDANCE
+    output(payload)
+    return ROLLOVER_EXIT if data["rollover_required"] else 0
+
+
+def cmd_rollover(args: argparse.Namespace) -> int:
+    pp = paths(args)
+    cwd = canonical_cwd(args.cwd)
+    with locked(pp["root"], pp["lock"]):
+        data = load_ready(pp, cwd)
+        active = active_round_ids(data)
+        if active:
+            raise ValueError(f"cannot rollover with active round: {active[0]}")
+        if not data["rollover_required"] and not args.force:
+            raise ValueError("rollover is not required; use --force only for an intentional phase boundary")
+        current = data.get("session_id") or ""
+        if args.reason == "compact":
+            # In-place compaction keeps the session id (Claude Code, pi). Accept the same
+            # id, but still refuse placeholders; the epoch counter records the boundary.
+            text = (args.new_session_id or current).strip()
+            if text.startswith("<") and text.endswith(">"):
+                raise ValueError(f"new-session-id is a placeholder: {text}")
+            data["session_id"] = text
+            data["compaction_epoch"] = int(data.get("compaction_epoch", 0)) + 1
+        else:
+            if not args.new_session_id:
+                raise ValueError("--new-session-id is required with --reason new")
+            data["session_id"] = validate_new_session_id(args.new_session_id, current)
+        write_checkpoint(pp["checkpoint"], data, f"session rollover ({args.reason})")
+        data["phase"] += 1
+        data["phase_round_count"] = 0
+        data["rollover_required"] = False
+        data["compact_queued"] = None
+        persist(pp, data)
+    output({
+        "status": "rollover_recorded",
+        "phase": data["phase"],
+        "reason": args.reason,
+        "session_id": data["session_id"],
+        "compaction_epoch": data.get("compaction_epoch", 0),
+        "session_switched": False,
+        "guidance": (
+            "State advanced locally only. This command records that the planner context "
+            "was already compacted or cleared; it does not start or switch a session."
+        ),
+        "carried_nonterminal_jobs": sum(j["state"] not in TERMINAL_JOBS for j in data["jobs"]),
+    })
+    return 0
+
+
+def cmd_compact_self(args: argparse.Namespace) -> int:
+    """Queue the planner pane's own compact command (or /clear) through herdr, on demand."""
+    pp = paths(args)
+    cwd = canonical_cwd(args.cwd)
+    with locked(pp["root"], pp["lock"]):
+        data = load(pp["state"], cwd)
+        write_ledger(pp["ledger"], data)
+        if args.planner_pane:
+            data["planner_pane"] = args.planner_pane
+        result = queue_planner_compact(args, pp, data, mode=args.mode, force=True)
+        if result.get("queued"):
+            write_checkpoint(pp["checkpoint"], data, f"planner {args.mode} queued")
+        persist(pp, data)
+    result["status"] = "planner_compact_queued" if result.get("queued") else "planner_compact_not_queued"
+    result["checkpoint"] = str(pp["checkpoint"])
+    output(result)
+    return 0 if result.get("queued") else 2
+
+
+def parser() -> argparse.ArgumentParser:
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--cwd", default=os.getcwd())
+    common.add_argument("--state-dir")
+    common.add_argument("--herdr", help="herdr executable; PAIRCTL_HERDR otherwise, then herdr")
+    ap = argparse.ArgumentParser(description=__doc__)
+    sub = ap.add_subparsers(dest="subcommand", required=True)
+
+    p = sub.add_parser("init", parents=[common])
+    p.add_argument("--planner-pane")
+    p.add_argument("--session-id")
+    p.add_argument(
+        "--no-auto-compact", action="store_true",
+        help="do not queue the planner's own compact command when the five-round limit is reached",
+    )
+    p.set_defaults(func=cmd_init)
+
+    p = sub.add_parser("start-round", parents=[common])
+    p.add_argument("--executor", required=True)
+    p.add_argument("--scope", required=True)
+    p.add_argument("--acceptance", required=True)
+    p.set_defaults(func=cmd_start_round)
+
+    p = sub.add_parser("send-round", parents=[common])
+    p.add_argument("--target", required=True, help="executor pane_id")
+    p.add_argument("--file", required=True, help="handoff file to send as the prompt")
+    p.add_argument("--executor", default="", help="defaults to --target")
+    p.add_argument("--scope", default="")
+    p.add_argument("--acceptance", default="")
+    p.add_argument("--send-timeout", type=float, default=30.0)
+    p.add_argument(
+        "--no-fresh", dest="fresh", action="store_false",
+        help="send into the executor's existing context instead of clearing it first",
+    )
+    p.add_argument("--fresh-command", help="override the per-kind fresh-session slash command")
+    p.add_argument(
+        "--fresh-marker", action="append",
+        help="extra screen text that proves the fresh command took effect (repeatable)",
+    )
+    p.add_argument("--fresh-timeout", type=float, default=15.0)
+    p.add_argument("--fresh-lines", type=int, default=40)
+    p.set_defaults(func=cmd_send_round, fresh=True)
+
+    p = sub.add_parser("resolve-pending", parents=[common])
+    p.add_argument("--outcome", required=True, choices=("delivered", "not-delivered"))
+    p.set_defaults(func=cmd_resolve_pending)
+
+    p = sub.add_parser("finish-round", parents=[common])
+    p.add_argument("--round-id", required=True)
+    p.add_argument("--status", required=True, choices=sorted(ROUND_STATES))
+    p.add_argument("--artifacts", default="")
+    p.add_argument("--notes", default="")
+    p.set_defaults(func=cmd_finish_round)
+
+    p = sub.add_parser("job-add", parents=[common])
+    p.add_argument("--round-id", required=True)
+    p.add_argument("--queue", required=True)
+    p.add_argument("--job-id", required=True)
+    p.add_argument("--label", required=True)
+    p.add_argument("--submitter", required=True)
+    p.add_argument("--command", required=True)
+    p.add_argument("--log", required=True)
+    p.add_argument("--expected-artifacts", required=True)
+    p.add_argument("--completion-assertion", required=True)
+    p.add_argument("--owner", required=True)
+    p.add_argument("--state", choices=sorted(JOB_STATES), default="submitted")
+    p.set_defaults(func=cmd_job_add)
+
+    p = sub.add_parser("job-update", parents=[common])
+    p.add_argument("--queue", required=True)
+    p.add_argument("--job-id", required=True)
+    p.add_argument("--state", required=True, choices=sorted(JOB_STATES))
+    p.add_argument("--log")
+    p.add_argument("--notes")
+    p.set_defaults(func=cmd_job_update)
+
+    p = sub.add_parser("checkpoint", parents=[common])
+    p.add_argument("--reason", required=True)
+    p.set_defaults(func=cmd_checkpoint)
+
+    p = sub.add_parser("status", parents=[common])
+    p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("rollover", parents=[common])
+    p.add_argument("--new-session-id", default="")
+    p.add_argument(
+        "--reason", choices=("new", "compact"), default="new",
+        help="new: a different session id is required; compact: in-place compaction, same id allowed",
+    )
+    p.add_argument("--force", action="store_true")
+    p.set_defaults(func=cmd_rollover)
+
+    p = sub.add_parser("compact-self", parents=[common])
+    p.add_argument("--mode", choices=("compact", "clear"), default="compact")
+    p.add_argument("--planner-pane", help="override the recorded planner pane")
+    p.set_defaults(func=cmd_compact_self)
+
+    p = sub.add_parser("watch-compact-continue", parents=[common])
+    p.set_defaults(func=cmd_watch_compact_continue)
+    return ap
+
+
+def main() -> int:
+    args = parser().parse_args()
+    try:
+        return args.func(args)
+    except PendingDispatchError as exc:
+        output(pending_payload(exc.pending))
+        return 2
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"PAIRCTL_ERROR: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
