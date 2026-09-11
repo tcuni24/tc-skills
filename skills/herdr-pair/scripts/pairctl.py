@@ -55,9 +55,14 @@ ROLLOVER_GUIDANCE = (
 )
 FRESH_GUIDANCE = (
     "The executor pane was not cleared, so the handoff was not sent and no round was "
-    "consumed. Inspect the pane (`herdr agent get` / `herdr agent read`), wait for idle, "
-    "then retry. Pass --fresh-command '/…' and --fresh-marker '…' for an agent kind pairctl "
-    "does not know, or --no-fresh to send into the existing context on purpose."
+    "consumed. Inspect both `herdr agent get` and `herdr agent read`; agent_status is a "
+    "routing hint, not proof that a turn completed or that the agent is unavailable. UI quota "
+    "banners (including `AI: Out of credits`) are informational and must not be interpreted "
+    "as proof that subscription capacity is exhausted. If the visible screen disagrees with "
+    "agent_status, treat the state as unknown and do not clear or resend. Pass --fresh-command "
+    "'/…' and --fresh-marker '…' for an agent kind pairctl does not know, or --no-fresh only "
+    "when deliberately retaining the existing context. An unknown fresh command is a dispatch "
+    "configuration problem, not evidence that the executor is unusable."
 )
 # Slash command that starts a fresh session (empties the context) per herdr agent kind.
 # Verified on this box 2026-09-07: pi /new, claude /clear, kimi /clear (all via

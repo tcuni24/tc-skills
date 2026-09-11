@@ -201,6 +201,14 @@ wait forever on a task that is already done. Every handoff you send must carry i
 `agent_status` — and never on brand preference. You do not get to decide another agent type is
 unworthy; only its track record on this task does (§7).
 
+`agent_status` is a **routing hint, not an availability verdict**. A visible model/quota banner is
+also not a verdict. In particular, Antigravity/Agy's `AI: Out of credits` means the supplemental
+quota is exhausted; subscription capacity may still be available. Never replace, reject or declare
+an executor unavailable from that banner. A definitive prompt execution failure, an explicit report
+from the executor, or the user's statement can establish unavailability; decorative or summary UI
+text cannot. If `agent_status` says `idle` while the visible screen says `generating`/`running`, the
+state is **unknown**: do not clear, resend, declare completion, or switch executors.
+
 Prefer, in order: same tab → same workspace + same `cwd` → same `cwd` anywhere. Use a level only
 when it yields **exactly one** match; never fall through past an ambiguous level. Always address
 the resolved `pane_id`, never the agent name — names repeat across panes, `pane_id` does not.
@@ -337,6 +345,19 @@ Always include, verbatim:
 - **stop conditions** — "do not commit", "do not push", "do not open a PR", "do not merge",
   whichever apply;
 - **acceptance** — the literal command and the expected result (`make ci` exit 0, coverage ≥ 84%);
+- **literal data keys**, for mapping/data tasks — write the exact source expression and one real
+  example (`source_key = strip_chr(chrom) + "_" + str(pos)`), not a semantic shorthand such as
+  “original ID”. Name both sides' columns. If the expression is not frozen, the Planner must settle
+  it before dispatch; the Executor must not infer it from whichever column happens to join;
+- **input integrity**, for generated artifacts — the Planner creates a machine-generated checksum
+  manifest before dispatch, lists it as a read-only input, and requires
+  `sha256sum -c <manifest>`. Prefer that over copying long hashes into code or prose. If hashes
+  must be inline, the Executor reads them from the handoff but never retypes them as source
+  constants without a mechanical comparison;
+- **publication contract**, for generated deliverables — name an exact in-scope staging path,
+  validate the staged artifact, then atomically publish it to the final path. The final path must
+  not appear until all data and presentation checks pass, and a repair must rebuild the staging
+  file rather than overwrite a partially accepted final artifact;
 - **background-job contract**, when applicable — queue, label, command, log, expected artifacts,
   completion test, and who may cancel or retry it;
 - **the return address** — your `$HERDR_PANE_ID` (§1), plus the literal command to reach you;
@@ -349,18 +370,31 @@ Template:
 [目标] 一句话说清要达成什么，不要说怎么做。
 [工作目录] /abs/path —— 所有命令都在这里跑，不要 cd 到仓库根。
 [可以改] docs/a.md, docs/b.md
-[可以新建] tests/contracts/test_x.py；其他新文件一律先问我
+[只读输入] inputs/source.xlsx, mapping.tsv, .handoff/<round_id>.inputs.sha256
+[可以新建] tests/contracts/test_x.py, .handoff/<round_id>.partial.xlsx, outputs/final.xlsx；
+           其他新文件一律先问我
 [不许动] src/, tests/, .ot-scratch/, 任何未跟踪文件
 [环境] 超 1 分钟 / 超 2G 内存 / 重读写 NFS 的命令走 slot；开跑前先 slot audit + slot status；
        中间文件不许放 /tmp，放当前目录下的临时子目录。
+[数据键] source_key = strip_chr(chrom) + "_" + str(pos)；例如 Chr1A + 3227213 -> 1A_3227213；
+         与 mapping.tsv 的 original_id 列连接。不得改用 id/target_id 猜测。
+[输入校验] 先运行 sha256sum -c .handoff/<round_id>.inputs.sha256；不要手抄 hash 到脚本。
+[发布] 先写 .handoff/<round_id>.partial.xlsx；对该文件完成数据+样式验收后，用同一文件系统
+       上的原子 replace 发布到 outputs/final.xlsx。最终文件已存在就停；不得为修样式直接覆盖正式文件。
 [停在哪] 改完就停。不要 commit / push / 开 PR。
 [验收] <literal command>，期望 <literal expected output>
 [后台作业] 无；或写明 queue/label/command/log/expected artifacts/completion/cancel owner。
 [回报] 用 `herdr agent prompt <你的 pane_id> '<短回报或报告路径>'` 发回给我，内容见下方回报契约。
        完成时和被卡住时都要主动发 —— 不要只在自己的窗口里写结论。
+       顺序固定：验收完成 -> 立即把完整报告落盘 -> 发送短回报 -> 才可补充窗口内解释。
        正文控制在几 KB 以内：prompt 是单个 argv 参数，超 131,071 字节（≈43,600 汉字）
        会被 shell 直接拒掉、什么都发不出去。长报告/全表/全日志落盘，回报里给路径 + 3–6 行摘要。
 ```
+
+The example key, manifest and paths above show the required **level of precision**, not universal
+filenames. Replace them with the round's real expression and paths. Say “lexicographic order”,
+“numeric order” or give an explicit sort tuple; never say “natural order” when the implementation
+is plain string sorting.
 
 ### The prompt is one argv argument — 131,071 bytes, hard
 
@@ -432,6 +466,25 @@ exit code of every command. Fix acceptance artifact paths in the prompt so you c
 yourself. Without version control you cannot recover from a bad overwrite, so **require `cp -p`
 backups for pre-existing files that may be overwritten**, named in the report.
 
+### Publish generated artifacts once
+
+A generated deliverable has two states: staged and published. Do not use the final customer-facing
+path as a scratch file:
+
+1. Generate only the explicitly allowed staging artifact (`.<round_id>.partial`, or a staging
+   directory on the same filesystem as the final destination).
+2. Run **both** content checks and presentation/format checks against staging. For large XLSX files,
+   use streaming/read-only parsing for table data and inspect workbook XML for freeze panes,
+   filters, widths, macros and external links instead of loading the whole workbook in normal mode.
+3. If any check fails, delete or rebuild only the staging artifact named in the fence.
+4. When all checks pass, publish once with an atomic same-filesystem replace/rename. If the final
+   path existed before the round, stop unless the handoff names its backup and overwrite policy.
+5. Hash and inventory the published artifact; never rebuild it merely to change a timestamp.
+
+The staging path is a created artifact and must appear under `[可以新建]`. “No temporary files”
+without an allowed staging path forces the Executor either to violate the fence or to test on the
+final file.
+
 ### Background jobs need a ledger
 
 Submitting a job is not completing a round. For every `slot`, scheduler, detached or long-running
@@ -488,6 +541,13 @@ round was consumed; read its `error` (pane still working, unknown agent kind, ma
 fix that, and rerun. Do not reach for `--no-fresh` to get past it unless you want the executor
 to keep its previous context on purpose.
 
+An unknown agent kind or unknown fresh command is a **dispatch configuration failure**, not an
+availability failure. Do not infer a slash command and do not substitute another executor. Supply
+`--fresh-command` plus a verified marker only when that agent's command is known; otherwise either
+ask once or use `--no-fresh` deliberately after confirming there is no active/stale write prompt,
+and record why preserving the context is safe. Never interpret `AI: Out of credits` or another
+quota banner as proof the agent cannot execute.
+
 Underlying CLI (pairctl invokes this; do not type it for a counted round):
 
 ```bash
@@ -506,6 +566,11 @@ Never treat it as completion.
 For asynchronous work, prefer the report contract over polling. Record the ETA from the Executor,
 check once after it passes, and if no report arrived send one concise stop/report request. After a
 second miss, take the task back instead of continuing to poll.
+
+Completion order is part of the contract: **acceptance finishes, full report is written to disk,
+then the short callback is sent**. The Executor must not spend a long final turn composing prose
+only in its TUI while the report path is still absent. The Planner treats callback text as a
+notification, not as evidence; the frozen artifact and on-disk report remain authoritative.
 
 Confirm delivery only on a successful `type: agent_prompted` response. If the command fails, say
 it failed — do not claim it was sent.

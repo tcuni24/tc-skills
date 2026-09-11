@@ -687,7 +687,10 @@ class PairctlTest(unittest.TestCase):
         handoff = self.write_handoff("cursor.md", "[轮次] round_id=<unique-id>\ncursor\n")
         proc = self.invoke("send-round", "--target", "w1:p2", "--file", str(handoff))
         self.assertEqual(proc.returncode, 2)
-        self.assertIn("no fresh-session command", json.loads(proc.stdout)["error"])
+        payload = json.loads(proc.stdout)
+        self.assertIn("no fresh-session command", payload["error"])
+        self.assertIn("dispatch configuration problem", payload["guidance"])
+        self.assertIn("AI: Out of credits", payload["guidance"])
         self.set_screen("┌───┐\n│ > │\n└───┘\n")
         sent = self.invoke_ok(
             "send-round", "--target", "w1:p2", "--file", str(handoff),
