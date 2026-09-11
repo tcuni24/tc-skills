@@ -6,6 +6,23 @@ Custom skills repository, organized in the same style as [antfu/skills](https://
 - each skill provides a `SKILL.md`
 - optional subfolders like `scripts/`, `references/`, `assets/`, `agents/`
 
+## Installation
+
+Install skills from this repo with the [skills CLI](https://github.com/vercel-labs/skills):
+
+```bash
+# Interactive install — pick skills and target agents
+npx skills@latest add tcuni24/tc-skills
+
+# Install a specific skill
+npx skills@latest add tcuni24/tc-skills --skill gitee-pr
+
+# Install all skills globally for all agents, no prompts
+npx skills@latest add tcuni24/tc-skills --all -g
+```
+
+Useful flags: `-s/--skill <name>` (specific skill, `*` for all), `-a/--agent <name>` (target agent, e.g. `claude-code`, `*` for all), `-g` (global `~/<agent>/skills/` instead of the project directory), `-y` (skip prompts).
+
 ## Skills
 
 | Skill | Description |
