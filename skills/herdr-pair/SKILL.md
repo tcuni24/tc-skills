@@ -116,6 +116,18 @@ python3 "$PAIRCTL" init --planner-pane "$HERDR_PANE_ID"
 python3 "$PAIRCTL" send-round --target <executor_pane_id> --file /abs/path/to/handoff.md \
   --executor <executor_pane_id> --scope '<fence>' --acceptance '<command>'
 python3 "$PAIRCTL" resolve-pending --outcome delivered  # or not-delivered, after pane inspection
+
+# Executor 协议回执与写入门槛检查:
+python3 "$PAIRCTL" ack-round --round-id <id> --revision 1 --pane "$HERDR_PANE_ID" \
+  --scope '<fence>' --contract-hash '<hash>' --action accept
+python3 "$PAIRCTL" ack-round --round-id <id> --revision 1 --pane "$HERDR_PANE_ID" \
+  --scope '<fence>' --contract-hash '<hash>' --action start
+python3 "$PAIRCTL" check-round --round-id <id> --revision 1 --pane "$HERDR_PANE_ID"  # 每次写入前调用
+
+# 旧活动轮显式绑定新契约恢复入口:
+python3 "$PAIRCTL" adopt-contract --round-id <id> --file /abs/path/to/contract.md \
+  --scope '<fence>' --acceptance '<command>'
+
 python3 "$PAIRCTL" job-add --round-id <id> --queue <queue> --job-id <id> --label <label> \
   --submitter <pane> --command '<exact command>' --log <log> \
   --expected-artifacts '<paths>' --completion-assertion '<test>' --owner <pane>
@@ -367,6 +379,9 @@ Template:
 
 ```text
 [轮次] round_id=<unique-id>
+[版本] revision=1
+[执行者] pane=<executor_pane_id>
+[契约摘要] contract_hash=<sha256> (由 pairctl 自动生成并持久化)
 [目标] 一句话说清要达成什么，不要说怎么做。
 [工作目录] /abs/path —— 所有命令都在这里跑，不要 cd 到仓库根。
 [可以改] docs/a.md, docs/b.md
@@ -384,6 +399,10 @@ Template:
 [停在哪] 改完就停。不要 commit / push / 开 PR。
 [验收] <literal command>，期望 <literal expected output>
 [后台作业] 无；或写明 queue/label/command/log/expected artifacts/completion/cancel owner。
+[协议操作]
+       1. 接受回执: python3 "$PAIRCTL" ack-round --round-id <round_id> --revision 1 --pane "$HERDR_PANE_ID" --scope '<可以改>' --contract-hash '<contract_hash>' --action accept
+       2. 开始执行: python3 "$PAIRCTL" ack-round --round-id <round_id> --revision 1 --pane "$HERDR_PANE_ID" --scope '<可以改>' --contract-hash '<contract_hash>' --action start
+       3. 每次写入前: python3 "$PAIRCTL" check-round --round-id <round_id> --revision 1 --pane "$HERDR_PANE_ID" (必须确认 allowed=true)
 [回报] 用 `herdr agent prompt <你的 pane_id> '<短回报或报告路径>'` 发回给我，内容见下方回报契约。
        完成时和被卡住时都要主动发 —— 不要只在自己的窗口里写结论。
        顺序固定：验收完成 -> 立即把完整报告落盘 -> 发送短回报 -> 才可补充窗口内解释。
@@ -843,6 +862,28 @@ rewrote.
 ## If you are the executor
 
 Same skill, other seat. Whatever your type, when another agent hands you a scoped task:
+
+### Executor 协议执行闭环（必须严格遵守）
+在无其他上下文的情况下，Executor 必须按以下 7 步完成任务，禁止跳步：
+1. **接收并核对契约**：检查 handoff 包含的 `round_id`、`revision`、`pane`、`scope`、`contract_hash` 及契约内容。
+2. **发送接受回执**（工作状态进入 `accepted`）：
+   ```bash
+   python3 "$PAIRCTL" ack-round --round-id <round_id> --revision 1 --pane "$HERDR_PANE_ID" \
+     --scope '<fence>' --contract-hash '<contract_hash>' --action accept
+   ```
+3. **发送开始执行回执**（工作状态进入 `running`，禁止从 pending_acceptance 直接 start）：
+   ```bash
+   python3 "$PAIRCTL" ack-round --round-id <round_id> --revision 1 --pane "$HERDR_PANE_ID" \
+     --scope '<fence>' --contract-hash '<contract_hash>' --action start
+   ```
+4. **每次新的写入步骤前进行写入资格检查**：
+   ```bash
+   python3 "$PAIRCTL" check-round --round-id <round_id> --revision 1 --pane "$HERDR_PANE_ID"
+   ```
+   强制必须传 `--revision`。若返回 `allowed: false`，立即停止写入并向 Planner 上报阻断原因。
+5. **在 fence 范围内执行编辑与测试**：严格遵守 stop 条件与范围限制。
+6. **落盘完整执行与验收证据**。
+7. **发送短回报给 Planner**：通过 `herdr agent prompt` 回报结论与证据。
 
 1. **Work the fence, not the goal.** Touch only the files listed. If the task cannot be done inside
    the fence, stop and say why — do not widen it and do not "fix things while you are in there".
