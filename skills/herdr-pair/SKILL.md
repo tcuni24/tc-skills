@@ -115,9 +115,15 @@ PAIRCTL=/home/tcuni-claw/.agents/skills/herdr-pair/scripts/pairctl.py
 python3 "$PAIRCTL" init --planner-pane "$HERDR_PANE_ID"
 python3 "$PAIRCTL" send-round --target <executor_pane_id> --file /abs/path/to/handoff.md \
   --executor <executor_pane_id> --scope '<fence>' --acceptance '<command>'
+# Alternative only when the complete task was already delivered manually:
+python3 "$PAIRCTL" start-round --file /abs/path/to/complete-contract.md \
+  --executor <executor_pane_id> --scope '<fence>' --acceptance '<command>'
 python3 "$PAIRCTL" resolve-pending --outcome delivered  # or not-delivered, after pane inspection
 
 # Executor 协议回执与写入门槛检查:
+python3 "$PAIRCTL" check-round --round-id <id> --revision 1 --pane "$HERDR_PANE_ID"
+# exit 2 + allowed=false is expected before acceptance; use the returned verified
+# contract_text/path/hash, scope, acceptance, executor, and revision for the receipts below.
 python3 "$PAIRCTL" ack-round --round-id <id> --revision 1 --pane "$HERDR_PANE_ID" \
   --scope '<fence>' --contract-hash '<hash>' --action accept
 python3 "$PAIRCTL" ack-round --round-id <id> --revision 1 --pane "$HERDR_PANE_ID" \
@@ -143,6 +149,13 @@ State defaults to `$XDG_STATE_HOME/herdr-pair/<cwd-hash>` (`~/.local/state/...` 
 (mode `0600`). `jobs.tsv` is a derived view rewritten from `state.json` whenever state loads
 successfully under the lock. Do not treat the two files as one cross-file atomic commit.
 `init` never wipes rounds or jobs.
+
+The handoff must name `PAIRCTL`, the canonical `--cwd`, and the state selection: either the exact
+`--state-dir` used by Planner or "default state" (derived from that cwd and `XDG_STATE_HOME`). A
+context-free Executor must use the same selection on every query, receipt, start, and write check.
+For a v2 pending dispatch with a recorded revision, missing or corrupt snapshot recovery stays
+blocked and preserves the pending source. A legacy v1 pending dispatch resolves as revision 0
+`unconfirmed_protocol`; bind it once with `adopt-contract`, which rejects repeat adoption.
 
 ### Context hygiene is automated
 
@@ -381,7 +394,9 @@ Template:
 [轮次] round_id=<unique-id>
 [版本] revision=1
 [执行者] pane=<executor_pane_id>
-[契约摘要] contract_hash=<sha256> (由 pairctl 自动生成并持久化)
+[状态位置] PAIRCTL=/abs/path/to/pairctl.py；cwd=/abs/project；state=default 或 --state-dir=/abs/state
+[契约查询] Executor 用 `check-round --revision 1` 读取 pairctl 持久化的摘要和完整契约；
+           不要把摘要写进契约本身，也不要声称 pairctl 会回填这个自引用字段。
 [目标] 一句话说清要达成什么，不要说怎么做。
 [工作目录] /abs/path —— 所有命令都在这里跑，不要 cd 到仓库根。
 [可以改] docs/a.md, docs/b.md
@@ -400,9 +415,11 @@ Template:
 [验收] <literal command>，期望 <literal expected output>
 [后台作业] 无；或写明 queue/label/command/log/expected artifacts/completion/cancel owner。
 [协议操作]
-       1. 接受回执: python3 "$PAIRCTL" ack-round --round-id <round_id> --revision 1 --pane "$HERDR_PANE_ID" --scope '<可以改>' --contract-hash '<contract_hash>' --action accept
-       2. 开始执行: python3 "$PAIRCTL" ack-round --round-id <round_id> --revision 1 --pane "$HERDR_PANE_ID" --scope '<可以改>' --contract-hash '<contract_hash>' --action start
-       3. 每次写入前: python3 "$PAIRCTL" check-round --round-id <round_id> --revision 1 --pane "$HERDR_PANE_ID" (必须确认 allowed=true)
+       1. 契约查询: python3 "$PAIRCTL" check-round --round-id <round_id> --revision 1 --pane "$HERDR_PANE_ID"
+          接受前预期 exit 2、allowed=false；逐项核对返回的完整 contract_text/path/hash、scope、acceptance、executor、revision。
+       2. 接受回执: 使用查询返回的精确 scope/hash 调用 ack-round --action accept。
+       3. 开始执行: 使用同一 revision/scope/hash 调用 ack-round --action start。
+       4. 每次写入前: python3 "$PAIRCTL" check-round --round-id <round_id> --revision 1 --pane "$HERDR_PANE_ID" (必须确认 allowed=true)
 [回报] 用 `herdr agent prompt <你的 pane_id> '<短回报或报告路径>'` 发回给我，内容见下方回报契约。
        完成时和被卡住时都要主动发 —— 不要只在自己的窗口里写结论。
        顺序固定：验收完成 -> 立即把完整报告落盘 -> 发送短回报 -> 才可补充窗口内解释。
@@ -458,7 +475,7 @@ pointer, never a wall of text that may not exec.
 
 Demand **evidence, not adjectives**. Require:
 
-1. the exact `round_id`, start state and end state;
+1. the exact `round_id`, `revision`, `contract_hash`, start state and end state;
 2. `git status --short` and `git rev-parse HEAD` (paste raw output);
 3. `git diff --stat` for what it changed;
 4. the acceptance command's **actual** output tail and exit code;
@@ -865,7 +882,12 @@ Same skill, other seat. Whatever your type, when another agent hands you a scope
 
 ### Executor 协议执行闭环（必须严格遵守）
 在无其他上下文的情况下，Executor 必须按以下 7 步完成任务，禁止跳步：
-1. **接收并核对契约**：检查 handoff 包含的 `round_id`、`revision`、`pane`、`scope`、`contract_hash` 及契约内容。
+1. **检索并核对权威契约**：使用 Planner 指定的同一 `--cwd` 与 `--state-dir` 调用
+   `check-round --round-id <dispatched-id> --revision <dispatched-revision> --pane "$HERDR_PANE_ID"`。
+   接受前该命令预期 exit 2、`allowed=false`；命令返回已验证的完整 `contract_text`、
+   `contract_path`、`contract_hash`、`scope`、`acceptance`、`executor` 和 `revision`。
+   将这些值与收到的轮次、版本、身份和指令逐项核对后，才可继续。省略 `--revision` 只用于发现，
+   同样 exit 2 且 reason=`missing_revision_query_only`，不能据此选择或接受不同版本。
 2. **发送接受回执**（工作状态进入 `accepted`）：
    ```bash
    python3 "$PAIRCTL" ack-round --round-id <round_id> --revision 1 --pane "$HERDR_PANE_ID" \

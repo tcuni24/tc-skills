@@ -161,8 +161,12 @@ class PairctlTest(unittest.TestCase):
         return path
 
     def start_finish(self, n: int) -> tuple[str, subprocess.CompletedProcess[str]]:
+        contract = self.write_handoff(
+            f"start-{n}.md", f"# Round {n}\nComplete contract body {n}\n"
+        )
         started = self.invoke_ok(
             "start-round",
+            "--file", str(contract),
             "--executor", f"w1:p{n + 1}",
             "--scope", f"file-{n}",
             "--acceptance", f"test-{n} exit 0",
@@ -211,7 +215,8 @@ class PairctlTest(unittest.TestCase):
         self.assertTrue(checkpoint.is_file())
         self.assertIn("Rounds in phase: `5`", checkpoint.read_text())
         blocked = self.invoke(
-            "start-round", "--executor", "w1:p9", "--scope", "x", "--acceptance", "y",
+            "start-round", "--file", str(self.write_handoff("blocked-start.md", "# Blocked\n")),
+            "--executor", "w1:p9", "--scope", "x", "--acceptance", "y",
         )
         self.assertEqual(blocked.returncode, 20)
         rolled = self.invoke_ok("rollover", "--new-session-id", "session-b")
@@ -222,7 +227,8 @@ class PairctlTest(unittest.TestCase):
 
     def test_job_ledger_and_checkpoint_carry_active_job(self) -> None:
         started = self.invoke_ok(
-            "start-round", "--executor", "w1:p2", "--scope", "pipeline",
+            "start-round", "--file", str(self.write_handoff("pipeline.md", "# Pipeline\nRun it\n")),
+            "--executor", "w1:p2", "--scope", "pipeline",
             "--acceptance", "marker exists",
         )
         self.invoke_ok(
@@ -247,10 +253,12 @@ class PairctlTest(unittest.TestCase):
 
     def test_duplicate_job_and_active_round_are_refused(self) -> None:
         started = self.invoke_ok(
-            "start-round", "--executor", "w1:p2", "--scope", "a", "--acceptance", "b",
+            "start-round", "--file", str(self.write_handoff("a.md", "# A\nFull contract\n")),
+            "--executor", "w1:p2", "--scope", "a", "--acceptance", "b",
         )
         active = self.invoke(
-            "start-round", "--executor", "w1:p3", "--scope", "c", "--acceptance", "d",
+            "start-round", "--file", str(self.write_handoff("c.md", "# C\nFull contract\n")),
+            "--executor", "w1:p3", "--scope", "c", "--acceptance", "d",
         )
         self.assertEqual(active.returncode, 2)
         args = (
@@ -360,7 +368,8 @@ class PairctlTest(unittest.TestCase):
 
     def test_nonterminal_job_survives_rollover(self) -> None:
         started = self.invoke_ok(
-            "start-round", "--executor", "w1:p2", "--scope", "pipeline",
+            "start-round", "--file", str(self.write_handoff("long.md", "# Long job\nFull contract\n")),
+            "--executor", "w1:p2", "--scope", "pipeline",
             "--acceptance", "marker exists",
         )
         self.invoke_ok(
@@ -480,7 +489,8 @@ class PairctlTest(unittest.TestCase):
         self.assertIn("p01-r001", payload["guidance"])
         self.assertFalse(log_path.exists())
         started = self.invoke(
-            "start-round", "--executor", "w1:p3", "--scope", "x", "--acceptance", "y",
+            "start-round", "--file", str(self.write_handoff("pending-start.md", "# Pending\n")),
+            "--executor", "w1:p3", "--scope", "x", "--acceptance", "y",
         )
         self.assertEqual(started.returncode, 2)
         self.assertEqual(self.read_state()["phase_round_count"], 0)
@@ -503,7 +513,8 @@ class PairctlTest(unittest.TestCase):
 
     def test_c_init_reset_rejected_and_existing_state_not_cleared(self) -> None:
         started = self.invoke_ok(
-            "start-round", "--executor", "w1:p2", "--scope", "keep",
+            "start-round", "--file", str(self.write_handoff("keep.md", "# Keep\nFull contract\n")),
+            "--executor", "w1:p2", "--scope", "keep",
             "--acceptance", "keep",
         )
         self.invoke_ok(
@@ -531,7 +542,8 @@ class PairctlTest(unittest.TestCase):
 
     def test_d_missing_or_stale_ledger_is_rebuilt_from_state_not_tsv(self) -> None:
         started = self.invoke_ok(
-            "start-round", "--executor", "w1:p2", "--scope", "pipeline",
+            "start-round", "--file", str(self.write_handoff("repair.md", "# Repair\nFull contract\n")),
+            "--executor", "w1:p2", "--scope", "pipeline",
             "--acceptance", "marker exists",
         )
         self.invoke_ok(
@@ -735,7 +747,10 @@ class PairctlTest(unittest.TestCase):
         self.assertIn("`/compact` was queued on planner pane `w1:p1`", checkpoint)
         # A second boundary command in the same phase is not re-queued.
         self.clear_calls()
-        blocked = self.invoke("start-round", "--executor", "w1:p9", "--scope", "x", "--acceptance", "y")
+        blocked = self.invoke(
+            "start-round", "--file", str(self.write_handoff("rollover-blocked.md", "# Blocked\n")),
+            "--executor", "w1:p9", "--scope", "x", "--acceptance", "y",
+        )
         self.assertEqual(blocked.returncode, 20)
         self.assertFalse(json.loads(blocked.stdout)["planner_compact"]["queued"])
         self.assertEqual(self.herdr_calls(), [])
@@ -803,7 +818,8 @@ class PairctlTest(unittest.TestCase):
         for n in range(1, 5):
             self.start_finish(n)
         started = self.invoke_ok(
-            "start-round", "--executor", "w1:p6", "--scope", "s", "--acceptance", "a",
+            "start-round", "--file", str(self.write_handoff("fifth.md", "# Fifth\nFull contract\n")),
+            "--executor", "w1:p6", "--scope", "s", "--acceptance", "a",
         )
         self.clear_calls()
         fifth = self.invoke(
@@ -835,7 +851,10 @@ class PairctlTest(unittest.TestCase):
     def test_auto_compact_can_be_disabled_by_env_and_init(self) -> None:
         for n in range(1, 5):
             self.start_finish(n)
-        started = self.invoke_ok("start-round", "--executor", "w1:p6", "--scope", "s", "--acceptance", "a")
+        started = self.invoke_ok(
+            "start-round", "--file", str(self.write_handoff("disabled.md", "# Disabled\nFull contract\n")),
+            "--executor", "w1:p6", "--scope", "s", "--acceptance", "a",
+        )
         self.clear_calls()
         fifth = self.invoke(
             "finish-round", "--round-id", started["round_id"], "--status", "accepted",
@@ -884,7 +903,8 @@ class PairctlTest(unittest.TestCase):
         )
         for n in range(1, 6):
             started = self.invoke_ok(
-                "start-round", "--executor", "w1:p2", "--scope", "s", "--acceptance", "a",
+                "start-round", "--file", str(self.write_handoff(f"hook-{n}.md", f"# Hook {n}\n")),
+                "--executor", "w1:p2", "--scope", "s", "--acceptance", "a",
                 use_state_dir=False, extra_env=env,
             )
             self.invoke(
@@ -911,7 +931,8 @@ class PairctlTest(unittest.TestCase):
         # /clear yields a new session id: recorded as reason=new.
         for n in range(1, 6):
             started = self.invoke_ok(
-                "start-round", "--executor", "w1:p2", "--scope", "s", "--acceptance", "a",
+                "start-round", "--file", str(self.write_handoff(f"clear-{n}.md", f"# Clear {n}\n")),
+                "--executor", "w1:p2", "--scope", "s", "--acceptance", "a",
                 use_state_dir=False, extra_env=env,
             )
             self.invoke(
@@ -960,6 +981,7 @@ class PairctlTest(unittest.TestCase):
             "--acceptance", "pytest tests/test_models.py exit 0",
         )
         self.assertEqual(sent["round_id"], "p01-r001")
+
         self.assertEqual(sent["revision"], 1)
         self.assertEqual(sent["dispatch_status"], "delivered")
         self.assertEqual(sent["work_status"], "pending_acceptance")
@@ -980,10 +1002,63 @@ class PairctlTest(unittest.TestCase):
         # Contract file mode is 0600
         self.assertEqual(stat.S_IMODE(Path(status["contract_path"]).stat().st_mode), 0o600)
 
+    def test_resolve_pending_delivered_fails_closed_on_missing_or_corrupt_snapshot(self) -> None:
+        for damage in ("missing", "corrupt"):
+            with self.subTest(damage=damage):
+                if self.read_state().get("pending_dispatch"):
+                    self.invoke_ok("resolve-pending", "--outcome", "not-delivered")
+                self.set_herdr_mode("stalled")
+                source = self.write_handoff(
+                    f"pending-{damage}.md", f"# Pending {damage}\nOriginal instructions\n"
+                )
+                stalled = self.invoke(
+                    "send-round", "--target", "w1:p2", "--file", str(source),
+                    "--herdr", str(self.herdr), "--scope", "alpha.txt", "--acceptance", "check",
+                )
+                self.assertEqual(stalled.returncode, 2)
+                pending = self.read_state()["pending_dispatch"]
+                snapshot = Path(pending["contract_path"])
+                if damage == "missing":
+                    snapshot.unlink()
+                    source.write_text("# Changed\nMust never be adopted\n", encoding="utf-8")
+                else:
+                    snapshot.write_text("corrupted", encoding="utf-8")
+                before = (self.state / "state.json").read_bytes()
+                rejected = self.invoke("resolve-pending", "--outcome", "delivered")
+                self.assertEqual(rejected.returncode, 2)
+                expected_reason = "contract_missing" if damage == "missing" else "contract_corrupted"
+                self.assertEqual(json.loads(rejected.stdout)["reason"], expected_reason)
+                self.assertEqual((self.state / "state.json").read_bytes(), before)
+                self.assertIsNotNone(self.read_state()["pending_dispatch"])
+
+    def test_v1_pending_delivery_migrates_unconfirmed_without_recreating_contract(self) -> None:
+        source = self.write_handoff("legacy.md", "# Legacy source\nMutable text\n")
+        baseline = self.read_state()
+        for version in (1, 2):
+            with self.subTest(version=version):
+                data = json.loads(json.dumps(baseline))
+                data["version"] = version
+                data["pending_dispatch"] = {
+                    "status": "uncertain", "counted": False, "round_id": "p01-r001",
+                    "target": "w1:p2", "executor": "w1:p2", "scope": "legacy.txt",
+                    "acceptance": "legacy-check", "handoff": str(source),
+                    "phase_round_count": 0, "created_at": "2026-09-18T00:00:00+00:00",
+                }
+                self.write_state(data)
+                source.write_text(f"# Changed after v{version} dispatch\n", encoding="utf-8")
+                resolved = self.invoke_ok("resolve-pending", "--outcome", "delivered")
+                self.assertEqual(resolved["revision"], 0)
+                self.assertEqual(resolved["work_status"], "unconfirmed_protocol")
+                state = self.read_state()
+                self.assertEqual(state["phase_round_count"], 1)
+                self.assertEqual(state["rounds"][0]["current_revision"], 0)
+                self.assertFalse(list((self.state / "contracts").glob("p01-r001*")))
+
     def test_cycle1_start_round_and_no_fresh_and_resolve_pending(self) -> None:
         # Test start-round
         started = self.invoke_ok(
             "start-round",
+            "--file", str(self.write_handoff("start-a.md", "# Start A\nFull contract body\n")),
             "--executor", "w1:p2",
             "--scope", "scope-a",
             "--acceptance", "test-a",
@@ -1035,9 +1110,24 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(resolved["dispatch_status"], "delivered")
         self.assertTrue(resolved["contract_hash"])
 
+    def test_start_round_requires_nonempty_complete_utf8_file(self) -> None:
+        absent = self.invoke(
+            "start-round", "--executor", "w1:p2", "--scope", "x", "--acceptance", "y",
+        )
+        self.assertEqual(absent.returncode, 2)
+        empty = self.write_handoff("empty.md", " \n\t")
+        rejected = self.invoke(
+            "start-round", "--file", str(empty),
+            "--executor", "w1:p2", "--scope", "x", "--acceptance", "y",
+        )
+        self.assertEqual(rejected.returncode, 2)
+        self.assertIn("contract file is empty", rejected.stderr)
+        self.assertEqual(self.read_state()["rounds"], [])
+
     def test_cycle1_contract_corrupted_or_missing(self) -> None:
         started = self.invoke_ok(
             "start-round",
+            "--file", str(self.write_handoff("corrupt.md", "# Corrupt\nFull contract body\n")),
             "--executor", "w1:p2",
             "--scope", "scope-corrupt",
             "--acceptance", "test-corrupt",
@@ -1059,6 +1149,7 @@ class PairctlTest(unittest.TestCase):
     def test_cycle2_ack_round_accept_and_start_transitions(self) -> None:
         started = self.invoke_ok(
             "start-round",
+            "--file", str(self.write_handoff("ack.md", "# Ack\nFull contract body\n")),
             "--executor", "w1:p2",
             "--scope", "scope-ack",
             "--acceptance", "test-ack",
@@ -1148,6 +1239,7 @@ class PairctlTest(unittest.TestCase):
     def test_cycle2_ack_round_validation_and_failures_do_not_modify_state(self) -> None:
         started = self.invoke_ok(
             "start-round",
+            "--file", str(self.write_handoff("validation.md", "# Validation\nFull contract body\n")),
             "--executor", "w1:p2",
             "--scope", "scope-val",
             "--acceptance", "test-val",
@@ -1214,6 +1306,7 @@ class PairctlTest(unittest.TestCase):
 
         # Corrupted contract file
         c_path = Path(started["contract_path"])
+        original_contract = c_path.read_bytes()
         c_path.write_text("corrupted", encoding="utf-8")
         proc = self.invoke(
             "ack-round",
@@ -1229,12 +1322,7 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(self.invoke_ok("status")["work_status"], "pending_acceptance")
 
         # Finish round and verify terminal round cannot be acknowledged
-        c_path.write_text((
-            f"[轮次] round_id={round_id}\n"
-            f"revision=1\n"
-            f"scope=scope-val\n"
-            f"acceptance=test-val\n"
-        ), encoding="utf-8")
+        c_path.write_bytes(original_contract)
         self.invoke_ok(
             "finish-round",
             "--round-id", round_id,
@@ -1255,6 +1343,7 @@ class PairctlTest(unittest.TestCase):
     def test_cycle3_check_round_allows_only_when_running_and_matching(self) -> None:
         started = self.invoke_ok(
             "start-round",
+            "--file", str(self.write_handoff("check.md", "# Check\nFull contract body\n")),
             "--executor", "w1:p2",
             "--scope", "scope-chk",
             "--acceptance", "test-chk",
@@ -1315,9 +1404,76 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(chk3["work_status"], "running")
         self.assertEqual(chk3["revision"], 1)
 
+    def test_check_round_returns_verified_contract_before_acceptance(self) -> None:
+        body = "# Authoritative task\nEdit only alpha.txt\nRun exact-check\n"
+        contract = self.write_handoff("authoritative.md", body)
+        started = self.invoke_ok(
+            "start-round", "--file", str(contract),
+            "--executor", "w1:p2", "--scope", "alpha.txt",
+            "--acceptance", "exact-check exits 0",
+        )
+
+        queried = self.invoke(
+            "check-round", "--round-id", started["round_id"],
+            "--revision", "1", "--pane", "w1:p2",
+        )
+        self.assertEqual(queried.returncode, 2)
+        payload = json.loads(queried.stdout)
+        self.assertFalse(payload["allowed"])
+        self.assertEqual(payload["reason"], "not_accepted")
+        self.assertEqual(payload["revision"], 1)
+        self.assertEqual(payload["executor"], "w1:p2")
+        self.assertEqual(payload["scope"], "alpha.txt")
+        self.assertEqual(payload["acceptance"], "exact-check exits 0")
+        self.assertEqual(payload["contract_hash"], started["contract_hash"])
+        self.assertEqual(payload["contract_path"], started["contract_path"])
+        self.assertEqual(payload["contract_text"], f"[轮次] round_id={started['round_id']}\n" + body)
+
+        query_only = self.invoke(
+            "check-round", "--round-id", started["round_id"], "--pane", "w1:p2",
+        )
+        self.assertEqual(query_only.returncode, 2)
+        query_payload = json.loads(query_only.stdout)
+        self.assertEqual(query_payload["reason"], "missing_revision_query_only")
+        self.assertEqual(query_payload["contract_hash"], started["contract_hash"])
+        self.assertEqual(query_payload["contract_text"], payload["contract_text"])
+
+    def test_executor_writes_real_file_only_after_query_accept_start_and_check(self) -> None:
+        contract = self.write_handoff(
+            "executor-flow.md", "# Executor flow\nCreate result.txt containing done\n"
+        )
+        started = self.invoke_ok(
+            "send-round", "--target", "w1:p2", "--file", str(contract), "--no-fresh",
+            "--executor", "w1:p2", "--scope", "result.txt", "--acceptance", "content is done",
+        )
+        result = self.cwd / "result.txt"
+        query = self.invoke(
+            "check-round", "--round-id", started["round_id"],
+            "--revision", "1", "--pane", "w1:p2",
+        )
+        self.assertEqual(query.returncode, 2)
+        metadata = json.loads(query.stdout)
+        self.assertEqual(metadata["reason"], "not_accepted")
+        self.assertFalse(result.exists())
+        for action in ("accept", "start"):
+            self.invoke_ok(
+                "ack-round", "--round-id", started["round_id"],
+                "--revision", str(metadata["revision"]), "--pane", metadata["executor"],
+                "--scope", metadata["scope"], "--contract-hash", metadata["contract_hash"],
+                "--action", action,
+            )
+        allowed = self.invoke_ok(
+            "check-round", "--round-id", started["round_id"],
+            "--revision", "1", "--pane", "w1:p2",
+        )
+        self.assertTrue(allowed["allowed"])
+        result.write_text("done\n", encoding="utf-8")
+        self.assertEqual(result.read_text(encoding="utf-8"), "done\n")
+
     def test_cycle3_check_round_rejects_omitted_revision_wrong_pane_and_contract_drift(self) -> None:
         started = self.invoke_ok(
             "start-round",
+            "--file", str(self.write_handoff("check-drift.md", "# Check drift\nFull contract body\n")),
             "--executor", "w1:p2",
             "--scope", "scope-chk2",
             "--acceptance", "test-chk2",
@@ -1365,6 +1521,7 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(chk_wrong_pane.returncode, 2)
         self.assertFalse(json.loads(chk_wrong_pane.stdout)["allowed"])
         self.assertEqual(json.loads(chk_wrong_pane.stdout)["reason"], "pane_mismatch")
+        self.assertNotIn("contract_text", json.loads(chk_wrong_pane.stdout))
 
         # Superseded revision (e.g. 0)
         chk_old = self.invoke(
@@ -1529,6 +1686,24 @@ class PairctlTest(unittest.TestCase):
         self.invoke_ok("status")
         state_text_2 = (self.state / "state.json").read_text(encoding="utf-8")
         self.assertEqual(json.loads(state_text_1)["version"], json.loads(state_text_2)["version"])
+
+    def test_adopt_contract_rejects_already_bound_round_without_changes(self) -> None:
+        original = self.write_handoff("bound.md", "# Bound contract\nOriginal instructions\n")
+        started = self.invoke_ok(
+            "start-round", "--file", str(original),
+            "--executor", "w1:p2", "--scope", "one.txt", "--acceptance", "check-one",
+        )
+        replacement = self.write_handoff("replacement.md", "# Replacement\nChanged instructions\n")
+        state_before = (self.state / "state.json").read_bytes()
+        snapshot_before = Path(started["contract_path"]).read_bytes()
+        rejected = self.invoke(
+            "adopt-contract", "--round-id", started["round_id"],
+            "--file", str(replacement), "--scope", "two.txt", "--acceptance", "check-two",
+        )
+        self.assertEqual(rejected.returncode, 2)
+        self.assertEqual(json.loads(rejected.stdout)["reason"], "already_bound")
+        self.assertEqual((self.state / "state.json").read_bytes(), state_before)
+        self.assertEqual(Path(started["contract_path"]).read_bytes(), snapshot_before)
 
     def test_cycle4_unsupported_future_version_and_corrupted_file_untouched(self) -> None:
         # Unsupported future version (e.g. 99)

@@ -177,6 +177,8 @@ def load(path: Path, cwd: str) -> dict[str, Any]:
     ver = data.get("version")
     if ver == 1:
         data["version"] = 2
+        if data.get("pending_dispatch"):
+            data["pending_dispatch"]["legacy_unconfirmed_protocol"] = True
         for r in data.get("rounds", []):
             if r.get("status") == "active":
                 r["work_status"] = "unconfirmed_protocol"
@@ -376,22 +378,39 @@ def verify_round_contract(
 ) -> tuple[bool, str]:
     if revision is None:
         revision = round_data.get("current_revision", 1)
+    payload, reason = verified_contract_payload(round_data, revision)
+    return payload is not None, reason
+
+
+def verified_contract_payload(
+    round_data: dict[str, Any], revision: int
+) -> tuple[dict[str, Any] | None, str]:
     revisions = round_data.get("revisions") or {}
     rev_info = revisions.get(str(revision))
     if not rev_info:
-        return False, "contract_missing"
-    path_str = rev_info.get("contract_path")
-    expected_hash = rev_info.get("contract_hash")
+        return None, "contract_missing"
+    path_str = str(rev_info.get("contract_path") or "")
+    expected_hash = str(rev_info.get("contract_hash") or "")
     if not path_str or not Path(path_str).is_file():
-        return False, "contract_missing"
+        return None, "contract_missing"
     try:
         content_bytes = Path(path_str).read_bytes()
-        actual_hash = hashlib.sha256(content_bytes).hexdigest()
-        if actual_hash != expected_hash:
-            return False, "contract_corrupted"
+        contract_text = content_bytes.decode("utf-8")
     except OSError:
-        return False, "contract_missing"
-    return True, "valid"
+        return None, "contract_missing"
+    except UnicodeDecodeError:
+        return None, "contract_corrupted"
+    if hashlib.sha256(content_bytes).hexdigest() != expected_hash:
+        return None, "contract_corrupted"
+    return {
+        "revision": revision,
+        "executor": round_data.get("executor") or "",
+        "scope": rev_info.get("scope") or round_data.get("scope") or "",
+        "acceptance": rev_info.get("acceptance") or round_data.get("acceptance") or "",
+        "contract_hash": expected_hash,
+        "contract_path": path_str,
+        "contract_text": contract_text,
+    }, "valid"
 
 
 def commit_round(
@@ -918,6 +937,15 @@ def cmd_init(args: argparse.Namespace) -> int:
 def cmd_start_round(args: argparse.Namespace) -> int:
     pp = paths(args)
     cwd = canonical_cwd(args.cwd)
+    handoff = Path(args.file).expanduser()
+    if not handoff.is_file():
+        raise ValueError(f"contract file not found: {handoff}")
+    try:
+        source_text = handoff.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"contract file is not valid UTF-8: {handoff}") from exc
+    if not source_text.strip():
+        raise ValueError("contract file is empty")
     with locked(pp["root"], pp["lock"]):
         data = load_ready(pp, cwd)
         if data["rollover_required"]:
@@ -926,12 +954,7 @@ def cmd_start_round(args: argparse.Namespace) -> int:
         if active:
             raise ValueError(f"active round already exists: {active[0]}")
         round_id = allocate_round_id(data)
-        contract_text = (
-            f"[轮次] round_id={round_id}\n"
-            f"revision=1\n"
-            f"scope={args.scope}\n"
-            f"acceptance={args.acceptance}\n"
-        )
+        contract_text = inject_round_id(source_text, round_id)
         contract_path, contract_hash = save_contract(pp, round_id, 1, contract_text)
         commit_round(
             data,
@@ -1270,42 +1293,46 @@ def cmd_check_round(args: argparse.Namespace) -> int:
             output({"allowed": False, "reason": "unconfirmed_protocol", "round_id": args.round_id, "work_status": current_work})
             return 2
 
-        # Check revision argument
-        if args.revision is None:
-            output({
-                "allowed": False,
-                "reason": "missing_revision_query_only",
-                "round_id": args.round_id,
-                "current_revision": current_rev,
-                "work_status": current_work,
-            })
-            return 2
-
         # Check pane
         if (args.pane or "").strip() != (round_item.get("executor") or "").strip():
             output({"allowed": False, "reason": "pane_mismatch", "pane": args.pane, "round_id": args.round_id})
             return 2
 
+        # Omitting the revision is a read-only discovery query. It still verifies
+        # the assigned pane and authoritative snapshot, but can never authorize work.
+        query_only = args.revision is None
+        claimed_revision = current_rev if query_only else args.revision
+
         # Check revision
-        if args.revision < current_rev:
-            output({"allowed": False, "reason": "superseded_revision", "revision": args.revision, "current_revision": current_rev})
+        if claimed_revision < current_rev:
+            output({"allowed": False, "reason": "superseded_revision", "revision": claimed_revision, "current_revision": current_rev})
             return 2
-        elif args.revision > current_rev:
-            output({"allowed": False, "reason": "unknown_future_revision", "revision": args.revision, "current_revision": current_rev})
+        elif claimed_revision > current_rev:
+            output({"allowed": False, "reason": "unknown_future_revision", "revision": claimed_revision, "current_revision": current_rev})
             return 2
 
-        # Check contract on disk
-        is_valid, contract_err = verify_round_contract(round_item, args.revision)
-        if not is_valid:
-            output({"allowed": False, "reason": contract_err, "round_id": args.round_id, "revision": args.revision})
+        contract, contract_err = verified_contract_payload(round_item, claimed_revision)
+        if contract is None:
+            output({"allowed": False, "reason": contract_err, "round_id": args.round_id, "revision": claimed_revision})
+            return 2
+
+        base = {
+            "allowed": False,
+            "round_id": args.round_id,
+            "current_revision": current_rev,
+            "work_status": current_work,
+            **contract,
+        }
+        if query_only:
+            output({**base, "reason": "missing_revision_query_only"})
             return 2
 
         # Check work status
         if current_work == "pending_acceptance":
-            output({"allowed": False, "reason": "not_accepted", "round_id": args.round_id, "work_status": current_work})
+            output({**base, "reason": "not_accepted"})
             return 2
         elif current_work == "accepted":
-            output({"allowed": False, "reason": "not_running", "round_id": args.round_id, "work_status": current_work})
+            output({**base, "reason": "not_running"})
             return 2
         elif current_work == "unconfirmed_protocol":
             output({"allowed": False, "reason": "unconfirmed_protocol", "round_id": args.round_id, "work_status": current_work})
@@ -1321,6 +1348,7 @@ def cmd_check_round(args: argparse.Namespace) -> int:
                 return 2
 
             output({
+                **contract,
                 "allowed": True,
                 "reason": "ok",
                 "round_id": args.round_id,
@@ -1354,7 +1382,10 @@ def cmd_adopt_contract(args: argparse.Namespace) -> int:
         if round_item.get("status") != "active":
             output({"status": "rejected", "reason": "round_terminal", "round_id": args.round_id})
             return 2
-        if round_item.get("work_status") not in ("unconfirmed_protocol", "pending_acceptance"):
+        if (
+            round_item.get("work_status") != "unconfirmed_protocol"
+            or round_item.get("current_revision") != 0
+        ):
             output({"status": "rejected", "reason": "already_bound", "work_status": round_item.get("work_status")})
             return 2
 
@@ -1408,14 +1439,35 @@ def cmd_resolve_pending(args: argparse.Namespace) -> int:
             active = active_round_ids(data)
             if active:
                 raise ValueError(f"active round already exists: {active[0]}")
-            revision = int(pending.get("revision") or 1)
+            legacy_pending = bool(pending.get("legacy_unconfirmed_protocol")) or (
+                "revision" not in pending
+                and "contract_path" not in pending
+                and "contract_hash" not in pending
+            )
+            revision = 0 if legacy_pending else int(pending.get("revision") or 1)
             contract_path = str(pending.get("contract_path") or "")
             contract_hash = str(pending.get("contract_hash") or "")
-            if not contract_path or not Path(contract_path).is_file():
-                handoff_path = Path(str(pending.get("handoff") or ""))
-                if handoff_path.is_file():
-                    msg = inject_round_id(handoff_path.read_text(encoding="utf-8"), round_id)
-                    contract_path, contract_hash = save_contract(pp, round_id, revision, msg)
+            pending_contract = {
+                "executor": pending.get("executor") or target,
+                "scope": pending.get("scope") or "",
+                "acceptance": pending.get("acceptance") or "",
+                "revisions": {str(revision): {
+                    "contract_path": contract_path,
+                    "contract_hash": contract_hash,
+                    "scope": pending.get("scope") or "",
+                    "acceptance": pending.get("acceptance") or "",
+                }},
+            }
+            verified, contract_err = verified_contract_payload(pending_contract, revision)
+            if not legacy_pending and verified is None:
+                output({
+                    "status": "rejected",
+                    "reason": contract_err,
+                    "round_id": round_id,
+                    "target": target,
+                    "round_consumed": False,
+                })
+                return 2
             commit_round(
                 data,
                 round_id=round_id,
@@ -1427,7 +1479,7 @@ def cmd_resolve_pending(args: argparse.Namespace) -> int:
                 contract_path=contract_path,
                 contract_hash=contract_hash,
                 dispatch_status="delivered",
-                work_status="pending_acceptance",
+                work_status="unconfirmed_protocol" if legacy_pending else "pending_acceptance",
             )
             data["pending_dispatch"] = None
             after_round_checkpoint(pp, data)
@@ -1439,7 +1491,7 @@ def cmd_resolve_pending(args: argparse.Namespace) -> int:
                 "round_consumed": True,
                 "revision": revision,
                 "dispatch_status": "delivered",
-                "work_status": "pending_acceptance",
+                "work_status": "unconfirmed_protocol" if legacy_pending else "pending_acceptance",
                 "contract_hash": contract_hash,
             })
             return 0
@@ -1702,6 +1754,7 @@ def parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_init)
 
     p = sub.add_parser("start-round", parents=[common])
+    p.add_argument("--file", required=True, help="complete UTF-8 contract / handoff file")
     p.add_argument("--executor", required=True)
     p.add_argument("--scope", required=True)
     p.add_argument("--acceptance", required=True)
