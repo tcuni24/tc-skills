@@ -29,6 +29,7 @@ Useful flags: `-s/--skill <name>` (specific skill, `*` for all), `-a/--agent <na
 | --- | --- |
 | `gitee-pr` | Auto commit/push and create Gitee pull requests from the current repository. |
 | `customer-report-simplify` | Simplify customer-facing delivery reports: diagnose why they overwhelm non-experts, restructure around the customer's questions, and audit the result with a script. |
+| `customer-delivery` | Build the customer delivery package (Excel + offline HTML report + plot/) from analysis results, strip internal paths/columns, render in the tc-design-md style, and audit for leaks. |
 
 ## Layout
 
