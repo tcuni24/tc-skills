@@ -1,0 +1,4 @@
+interface:
+  display_name: "HTML 报告打印优化"
+  short_description: "优化含图片 HTML 报告的 PDF 分页与页脚，并用真实浏览器验证"
+  default_prompt: "使用 $html-pdf-print 优化此 HTML 报告的 PDF 打印效果，验证图文分页及页脚位置。"
