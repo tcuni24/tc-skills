@@ -56,7 +56,13 @@ from xlsx_kit import Column, ReadmeSheet, tsv_to_sheet, write_workbook
 
 `with plot_style(): …; save(fig, delivery/plot/<name>)`。
 每张图先问"客户看这张图回答什么问题"；纯内部 QC 图不进交付。
-中文标签前调用 `cjk_font()`；没有中文字体就改英文标签。
+中文标签前调用 `cjk_font()`。它检查 normal / semibold 实际解析到的字体文件、字体内部 family 和常用字形，
+不会接受名称声称是 SC、实际打开却是 JP / KR / TC / HK 区域字形的 TTC。返回 `None` 时改用英文标签，
+并显式使用 `plot_style(cjk=False)`；不要让 matplotlib 自行回退字体。
+
+`save()` 会在写文件前生成刻度、图例和 colorbar，检查标题、坐标轴、图例、注释等可见中文文本
+（包括中文与全角标点）的实际字体及字形覆盖；发现日文区域字形或缺字会直接报错。需要留内部复核记录时，可调用
+`audit_fonts(fig)` 取得实际字体路径和 family，但不要把路径写进客户交付目录。
 
 ### 4. 写报告内容 JSON，渲染 HTML（`scripts/render_report.py`）
 
@@ -89,7 +95,8 @@ python3 ~/.agents/skills/customer-report-simplify/scripts/audit_report.py delive
 外部资源、缺图、自定义术语（xlsx 单元格也扫）。`audit_report` 查正文（附录前）的术语命中、
 字数、数字密集句。两者退出码都要为 0；命中就回到 deliver 脚本改，不要手改产物。
 
-再用浏览器（或 `agent-browser`）打开 `report.html` 看一眼封面、KPI、图是否显示；无浏览器时如实说明未做。
+两个审计脚本不识别 PNG 中汉字的地区字形。再用浏览器（或 `agent-browser`）打开 `report.html`，
+看一眼封面、KPI、图是否显示，并人工核对图中的简体中文字形；无浏览器时如实说明未做。
 
 ### 6. 汇报
 
@@ -120,3 +127,9 @@ deliver 脚本内部产生的 `content.json` 放在 `delivery/<date>/_build/`（
 - 报告说"所有图片已内嵌"但实际用的相对路径；或反过来只交付 HTML 不带 `plot/`。
 
 参考：`references/example-gene-map.md` 是一次实际交付（基因 ID 对应表）的规格与检查结果。
+
+维护 `plot_kit.py` 后运行字体回归检查：
+
+```bash
+python3 -m unittest discover -s <skill>/tests -v
+```
