@@ -4,3 +4,9 @@ __pycache__/
 
 # Backup files
 *.bak*
+
+# Local agent tooling & one-off work artifacts
+.agents/
+.claude/
+skills-lock.json
+issue-snapshot.json
