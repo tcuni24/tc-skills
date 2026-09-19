@@ -19,18 +19,20 @@
 
 ## 3. Commit 规范
 
-允许前缀：
-- `feat:`
-- `fix:`
-- `docs:`
-- `refactor:`
-- `style:`
-- `test:`
-- `chore:`
+允许前缀（支持可选的 `(scope)` 和破坏性变更标记 `!`）：
+- `feat:` / `feat(scope):` / `feat!:`
+- `fix:` / `fix(scope):` / `fix!:`
+- `docs:` / `docs(scope):`
+- `refactor:` / `refactor(scope):`
+- `style:` / `style(scope):`
+- `test:` / `test(scope):`
+- `chore:` / `chore(scope):`
 
 示例：
 - `feat: 添加质控过滤脚本`
+- `feat(probe): 支持自定义探针阈值`
 - `fix: 修复内存泄漏问题`
+- `fix(parser)!: 重构解析器返回值结构`
 - `docs: 更新使用说明`
 
 ## 4. 标准流程

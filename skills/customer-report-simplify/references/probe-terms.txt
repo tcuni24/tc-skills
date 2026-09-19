@@ -1,0 +1,34 @@
+# 探针设计项目专用列名、属性与枚举值
+# 使用方法：audit_report.py 报告.html --terms-file <skill>/references/probe-terms.txt
+
+# 内部列名与属性
+locus_type
+probe_type
+probe_class
+probe_level
+hairpin_level
+readout
+akd_
+at_chr
+at_start
+at_end
+xgeno
+ay61_state
+aneu_chr
+
+# 内部枚举值与标记
+AT-P
+AK-P
+SR-P
+PAIRED
+AT_ONLY
+HALF_AT
+HALF_AK
+SHARED_REF
+ratiometric
+presence_absence
+normalization_control
+Class-A
+Class-B
+Class-C
+Class-D

@@ -78,11 +78,12 @@ description: Use when a customer-facing delivery report (交付报告 / 白皮�
 无头浏览器通常不可用，所以验证靠脚本和结构检查：
 
 ```bash
-python3 ~/.agents/skills/customer-report-simplify/scripts/audit_report.py <报告.html> [--appendix-id sec-appendix]
+python3 ~/.agents/skills/customer-report-simplify/scripts/audit_report.py <报告.html> \
+    [--appendix-id sec-appendix] [--extra-terms 内部词1,内部词2] [--terms-file 词表.txt] [--strict]
 ```
 
-脚本输出：正文（附录之前）字数、缺图占位数、内嵌图数、折叠块列表、正文里命中的术语和列名清单。
-目标：正文命中数为 0；缺图为 0；正文字数约为原报告的 1/4 到 1/3。
+脚本输出：正文（附录之前）字数、缺图占位数、内嵌图数、折叠块列表、违禁术语（阻断项，退出码 1）与可读性建议术语（非阻断项，退出码 0；--strict 时阻断）。
+目标：违禁术语命中数为 0；缺图为 0；正文字数约为原报告的 1/4 到 1/3。特定项目词表可使用 `--terms-file`（如探针项目传 `references/probe-terms.txt`）。
 
 再手工确认：
 

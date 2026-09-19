@@ -24,13 +24,13 @@ Apply team rules from `gitee-pr-rules.md` before creating PR.
 2. Enforce branch naming format: `member/verb-description`.
 3. Ensure working tree is clean before PR (or auto-commit when `--auto-commit` is enabled).
 4. Validate all commit subjects in `remote/base..head` with allowed prefixes:
-   - `feat:`
-   - `fix:`
-   - `docs:`
-   - `refactor:`
-   - `style:`
-   - `test:`
-   - `chore:`
+   - `feat:`, `feat(scope):`, `feat!:`
+   - `fix:`, `fix(scope):`, `fix!:`
+   - `docs:`, `docs(scope):`
+   - `refactor:`, `refactor(scope):`
+   - `style:`, `style(scope):`
+   - `test:`, `test(scope):`
+   - `chore:`, `chore(scope):`
 5. Warn (non-blocking) when multiple core files are changed.
 6. Enforce Chinese PR content: title and body must include Chinese text.
 7. Enforce PR body template sections and order:

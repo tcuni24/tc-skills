@@ -17,7 +17,7 @@ from urllib.request import Request, urlopen
 
 BRANCH_NAME_PATTERN = re.compile(r"^[^/\s]+/[a-z0-9]+-[a-z0-9-]+$")
 COMMIT_SUBJECT_PATTERN = re.compile(
-    r"^(feat|fix|docs|refactor|style|test|chore):\s+\S.+$"
+    r"^(feat|fix|docs|refactor|style|test|chore)(?:\([^)]+\))?!?:[ \t]+\S.*$"
 )
 CHINESE_TEXT_PATTERN = re.compile(r"[\u4e00-\u9fff]")
 CONFIG_EXTENSIONS = {".yml", ".yaml", ".json", ".toml", ".ini", ".cfg", ".conf", ".lock"}
@@ -159,7 +159,8 @@ def validate_commit_subjects(commits: list[str]) -> None:
     formatted = "\n".join(f"- {message}" for message in invalid)
     fail(
         "Commit message prefix validation failed. "
-        "Use one of: feat|fix|docs|refactor|style|test|chore.\n"
+        "Use '<type>(<scope>)!: <description>' or '<type>: <description>' "
+        "with allowed types: feat|fix|docs|refactor|style|test|chore.\n"
         f"{formatted}"
     )
 
