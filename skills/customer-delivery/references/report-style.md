@@ -1,7 +1,7 @@
-# 报告样式要点（摘自 /public/scripts/tc-design-md/probe.design.md，2026-09-18 基准）
+# 报告样式要点（基于 tc-design-md 白皮书视觉规范）
 
 `scripts/render_report.py` 已内置这套样式。这里只列内容层在写 JSON 时必须遵守的约束；
-完整规范以 probe.design.md 为准。
+包含阅读顺序、颜色语义、KPI 指标格规范及分页打印约定。
 
 ## 阅读顺序
 

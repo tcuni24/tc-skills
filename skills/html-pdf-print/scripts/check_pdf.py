@@ -21,19 +21,9 @@ def distance(value: str) -> float:
     return number
 
 
-def inspect(pdf: Path, inset: float, footer: str | None, band: float) -> dict:
-    """读取真实 PDF 坐标；同行文案匹配用于辅助识别页脚。"""
-    if not pdf.is_file():
-        raise RuntimeError(f"PDF 不存在：{pdf}")
-    if not shutil.which("pdftotext"):
-        raise RuntimeError("缺少 Poppler pdftotext")
-    result = subprocess.run(
-        ["pdftotext", "-bbox-layout", str(pdf.resolve()), "-"],
-        check=True,
-        capture_output=True,
-        timeout=30,
-    )
-    pages = ET.fromstring(result.stdout).findall(".//{*}page")
+def parse_bbox_xml(xml_content: str | bytes, pdf_path: Path | str, inset: float, footer: str | None, band: float) -> dict:
+    """根据 pdftotext -bbox-layout 输出的 XML 结构分析坐标与页脚。"""
+    pages = ET.fromstring(xml_content).findall(".//{*}page")
     if not pages:
         raise RuntimeError("未提取到 PDF 页面")
     sizes, violations, matches = [], [], []
@@ -74,7 +64,7 @@ def inspect(pdf: Path, inset: float, footer: str | None, band: float) -> dict:
         and footer_hits[0]["page"] == len(pages)
     )
     return {
-        "pdf": str(pdf.resolve()),
+        "pdf": str(Path(pdf_path).resolve()),
         "pages": sizes,
         "words": word_count,
         "boundary_violations": violations,
@@ -82,6 +72,21 @@ def inspect(pdf: Path, inset: float, footer: str | None, band: float) -> dict:
         "footer_band_matches": footer_hits,
         "passed": not violations and footer_ok,
     }
+
+
+def inspect(pdf: Path, inset: float, footer: str | None, band: float) -> dict:
+    """读取真实 PDF 坐标；同行文案匹配用于辅助识别页脚。"""
+    if not pdf.is_file():
+        raise RuntimeError(f"PDF 不存在：{pdf}")
+    if not shutil.which("pdftotext"):
+        raise RuntimeError("缺少 Poppler pdftotext 工具 (Debian/Ubuntu: apt install poppler-utils, macOS: brew install poppler)")
+    result = subprocess.run(
+        ["pdftotext", "-bbox-layout", str(pdf.resolve()), "-"],
+        check=True,
+        capture_output=True,
+        timeout=30,
+    )
+    return parse_bbox_xml(result.stdout, pdf, inset, footer, band)
 
 
 def main() -> int:

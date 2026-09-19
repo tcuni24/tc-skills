@@ -10,8 +10,8 @@ description: Use when an analysis is finished and the user asks to 生成交付�
 本 skill 把分析结果整理成这个交付包，并保证表格和报告里没有内部文件、内部路径、内部分析细节。
 
 依赖：`python3` + `openpyxl` + `matplotlib`（渲染器本身只用标准库）。
-配套：报告文案遵循 `customer-report-simplify`（同仓库 skill），样式遵循
-`/public/scripts/tc-design-md/probe.design.md`（要点见 `references/report-style.md`）。
+配套：报告文案遵循 `customer-report-simplify`（同仓库 skill），样式要点与配色规约详见
+`references/report-style.md`（脚本 `render_report.py` 已内置该套样式）。
 
 ## 交付默认边界
 
@@ -81,13 +81,19 @@ from xlsx_kit import Column, ReadmeSheet, tsv_to_sheet, write_workbook
 python3 <skill>/scripts/render_report.py content.json -o delivery/<date>/<name>/report.html [--logo brand.png]
 ```
 
-logo 可选：`/public/scripts/tc-probe-design-v2/src/tc_probe_design/templates/assets/brand-logo.png`。
+logo 可选：`--logo <brand.png>`，传入项目自有品牌图片文件；若省略则不渲染封面 logo。
 
 ### 5. 体检
 
 ```bash
-python3 <skill>/scripts/audit_delivery.py delivery/<date>/<name> --terms <内部列名,内部枚举值,内部样本码>
-python3 ~/.agents/skills/customer-report-simplify/scripts/audit_report.py delivery/<date>/<name>/report.html \
+# 1. 交付目录结构与信息泄漏体检（本 skill 内置脚本）
+python3 <skill-dir>/scripts/audit_delivery.py delivery/<date>/<name> --terms <内部列名,内部枚举值,内部样本码>
+
+# 2. 报告文本可读性与通俗度体检（依赖同仓库 customer-report-simplify skill）
+# 定位方式：
+#   - 仓库内同级引用：<skill-dir>/../customer-report-simplify/scripts/audit_report.py
+#   - Agent 全局安装引用：<agent-skills-dir>/customer-report-simplify/scripts/audit_report.py
+python3 <simplify-skill-dir>/scripts/audit_report.py delivery/<date>/<name>/report.html \
     --extra-terms <同一批术语>
 ```
 

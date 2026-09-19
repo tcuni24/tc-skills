@@ -111,7 +111,10 @@ the round. Failure paths:
   Nothing is sent and no round is consumed in that case.
 
 ```bash
-PAIRCTL=/home/tcuni-claw/.agents/skills/herdr-pair/scripts/pairctl.py
+# Locate pairctl.py relative to this skill's directory (parent of SKILL.md):
+# e.g., in this repo: PAIRCTL="skills/herdr-pair/scripts/pairctl.py"
+# or if installed globally: PAIRCTL="${SKILL_DIR:-~/.agents/skills/herdr-pair}/scripts/pairctl.py"
+PAIRCTL="<skill-dir>/scripts/pairctl.py"
 python3 "$PAIRCTL" init --planner-pane "$HERDR_PANE_ID"
 python3 "$PAIRCTL" send-round --target <executor_pane_id> --file /abs/path/to/handoff.md \
   --executor <executor_pane_id> --scope '<fence>' --acceptance '<command>'
@@ -559,7 +562,7 @@ Two numbers that disagree is a *fixture* question before it is an *honesty* ques
 Canonical path — every pairing dispatch:
 
 ```bash
-python3 /home/tcuni-claw/.agents/skills/herdr-pair/scripts/pairctl.py send-round \
+python3 "$PAIRCTL" send-round \
   --target <pane_id> --file /abs/path/to/handoff.md
 ```
 

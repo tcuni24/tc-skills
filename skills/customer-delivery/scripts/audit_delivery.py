@@ -115,11 +115,14 @@ def main() -> int:
     for p in sorted(root.rglob("*")):
         rel = p.relative_to(root)
         if p.is_dir():
+            if any(part.startswith(".") for part in rel.parts):
+                problems.append(f"隐藏目录: {rel}/")
+                continue
             if rel.parts[0] not in allow_dirs:
                 problems.append(f"非白名单子目录: {rel}/")
             continue
         files.append(p)
-        if p.name.startswith("."):
+        if any(part.startswith(".") for part in rel.parts):
             problems.append(f"隐藏文件: {rel}")
             continue
         if len(rel.parts) > 1 and rel.parts[0] not in allow_dirs:
@@ -136,6 +139,8 @@ def main() -> int:
     # 2/3. 内容
     for p in files:
         rel = p.relative_to(root)
+        if any(part.startswith(".") for part in rel.parts):
+            continue
         suf = p.suffix.lower()
         if suf in (".html", ".htm"):
             raw = p.read_text(encoding="utf-8", errors="replace")
