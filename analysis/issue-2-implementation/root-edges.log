@@ -1,0 +1,5 @@
+Command: python3 -m pytest skills/herdr-pair/tests/test_skill_layout.py skills/herdr-pair/tests/test_context_edges.py -q -p no:cacheprovider --basetemp /public/scripts/tc-skills/analysis/issue-2-implementation/pytest-root-edges
+......                                                                   [100%]
+6 passed in 1.45s
+
+Exit: 0

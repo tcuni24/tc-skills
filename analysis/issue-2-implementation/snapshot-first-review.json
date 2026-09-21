@@ -1,0 +1,17 @@
+{
+  "scope_id": "issue-2-herdr-pair-context-budget",
+  "snapshot_id": "be438f73bdde60fb4dd54a07add27b1f629175bdbc5c4d0f163b76dc05d15cf3",
+  "files": {
+    "skills/herdr-pair/SKILL.md": "288636b415ff7001d116ae546be1583c2862e03f2f4a0eef1c1d592fcb181580",
+    "skills/herdr-pair/scripts/claude_session_start_hook.py": "4f91ff26e10e5700dbad80a7fee9634df474184f35cd0fe7eb91ae3ebea4ef46",
+    "skills/herdr-pair/scripts/pairctl.py": "6b7944dd3a40052591ce4c9a2b88d47ce1a179f624c5bc1c1d6394feb88e2b0b",
+    "skills/herdr-pair/tests/test_context_edges.py": "75c9aea0d0a4baf609be6423778816212f4690ec48061f6eb9e5a24f423cc04c",
+    "skills/herdr-pair/tests/test_pairctl.py": "24921f0bc1333b2b14fe2a4e9bc3262cbc6496b4881f418e637224519e9553e8",
+    "skills/herdr-pair/tests/test_skill_layout.py": "42993bd83457dab0a011c9df2d5df44d4d5c974d2ebf56d64e7dd15bdb1e66b0",
+    "skills/herdr-pair/reference/common-requests.md": "7bcc5f03d212562d4b4e9e45b3256592b0128ec18af52b52cbf24173e13ecb83",
+    "skills/herdr-pair/reference/executor-resolution.md": "136bcc86d08ef12bbda3a4c236856ac19adc9ded4a946e8d2c4c25de8099fc97",
+    "skills/herdr-pair/reference/handoff.md": "27449619dff071d42becef74d75b0d90881535b0c3dd2b88f49240823b40e66c",
+    "skills/herdr-pair/reference/recovery.md": "6199ae433e22c015c28ffdeb2c90737331bdb0210947da0bacb9571864e163b3",
+    "skills/herdr-pair/reference/verification.md": "89cb3bdd7f16eb92f5b6c40ed8cc498816c5c8ff4248a39626dc114905edc6d3"
+  }
+}

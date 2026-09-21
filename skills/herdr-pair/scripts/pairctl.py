@@ -12,6 +12,8 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -98,6 +100,13 @@ COMPACT_ACCEPTS_INSTRUCTIONS = {"claude", "pi"}
 FRESH_OK_STATUS = {"idle", "done"}
 FRESH_MAX_LINES = 12
 HERDR_CALL_TIMEOUT = 30.0
+DEFAULT_CONTEXT_BUDGET = 150000
+DEFAULT_STALE_HOURS = 12.0
+SNAPSHOT_COPY_LIMIT = 50 * 1024 * 1024
+FENCE_RE = re.compile(
+    r"^\s*\[(可以改|只读输入|可以新建|不许动|环境)\]\s*(.*?)\s*$", re.MULTILINE
+)
+TMP_PATH_RE = re.compile(r"(^|[^\w])/tmp(/|\b)")
 
 
 class FreshError(ValueError):
@@ -128,6 +137,8 @@ def paths(args: argparse.Namespace) -> dict[str, Path]:
         "ledger": root / "jobs.tsv",
         "checkpoint": root / "CHECKPOINT.md",
         "contracts": root / "contracts",
+        "planner_session": root / "planner-session.json",
+        "snapshots": root / "snapshots",
     }
 
 
@@ -272,9 +283,306 @@ def table_cell(value: Any) -> str:
     return str(value or "").replace("|", "\\|").replace("\n", " ")
 
 
+def budget_for(args: argparse.Namespace, data: dict[str, Any] | None = None) -> int:
+    explicit = getattr(args, "budget", None)
+    if explicit is None:
+        explicit = getattr(args, "context_budget", None)
+    if explicit is not None:
+        if explicit <= 0:
+            raise ValueError("--budget must be positive")
+        return explicit
+    raw = (os.environ.get("PAIRCTL_CONTEXT_BUDGET") or "").strip()
+    if raw:
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise ValueError("PAIRCTL_CONTEXT_BUDGET must be an integer") from exc
+        if value <= 0:
+            raise ValueError("PAIRCTL_CONTEXT_BUDGET must be positive")
+        return value
+    if data and data.get("context_budget"):
+        return int(data["context_budget"])
+    return DEFAULT_CONTEXT_BUDGET
+
+
+def parse_stamp(value: Any) -> dt.datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        stamp = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=dt.timezone.utc)
+    return stamp.astimezone(dt.timezone.utc)
+
+
+def unknown_usage(budget: int, reason: str, source: str = "unknown") -> dict[str, Any]:
+    return {
+        "status": "unknown", "context_tokens": None, "budget": budget,
+        "over_budget": False, "session_started_at": None, "session_age_hours": None,
+        "stale": False, "source": source, "measured_at": now(), "reason": reason,
+    }
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def derive_transcript(cwd: str, session_id: str) -> Path:
+    escaped = re.sub(r"[^A-Za-z0-9-]", "-", cwd)
+    return Path.home() / ".claude" / "projects" / escaped / f"{session_id}.jsonl"
+
+
+def read_context_usage(
+    pp: dict[str, Path], cwd: str, budget: int, stale_hours: float,
+    data: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if not pp["planner_session"].is_file():
+        return unknown_usage(budget, "planner session record missing")
+    try:
+        session = json.loads(pp["planner_session"].read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return unknown_usage(budget, "planner session record unreadable")
+    if session.get("cwd") != cwd:
+        return unknown_usage(budget, "planner session cwd mismatch")
+    if session.get("kind") != "claude":
+        return unknown_usage(budget, "planner kind is not claude")
+    planner_pane = str((data or {}).get("planner_pane") or "")
+    recorded_pane = str(session.get("pane") or "")
+    if planner_pane and recorded_pane and recorded_pane != planner_pane:
+        return unknown_usage(budget, "planner pane does not match session record")
+    session_id = str(session.get("session_id") or "")
+    if not session_id:
+        return unknown_usage(budget, "planner session id missing")
+    recorded = str(session.get("transcript_path") or "")
+    transcript = Path(recorded).expanduser() if recorded else derive_transcript(cwd, session_id)
+    source = "recorded" if recorded else "derived"
+    if not transcript.is_file():
+        return unknown_usage(budget, "transcript missing", source)
+    first: dt.datetime | None = None
+    last_usage: dict[str, Any] | None = None
+    saw_session = False
+    try:
+        with transcript.open(encoding="utf-8") as transcript_handle:
+            lines = transcript_handle
+            for raw in lines:
+                if not raw.strip():
+                    continue
+                try:
+                    entry = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                entry_session = str(entry.get("sessionId") or entry.get("session_id") or "")
+                if entry_session == session_id:
+                    saw_session = True
+                    stamp = parse_stamp(entry.get("timestamp") or entry.get("created_at"))
+                    if stamp is not None and (first is None or stamp < first):
+                        first = stamp
+                message = entry.get("message") if isinstance(entry.get("message"), dict) else entry
+                synthetic = bool(
+                    entry.get("isSynthetic") or entry.get("synthetic")
+                    or message.get("isSynthetic") or message.get("synthetic")
+                    or message.get("model") == "<synthetic>"
+                )
+                is_assistant = message.get("role") == "assistant" or entry.get("type") == "assistant"
+                if entry_session != session_id or synthetic or not is_assistant:
+                    continue
+                usage = message.get("usage")
+                fields = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
+                if isinstance(usage, dict) and all(
+                    isinstance(usage.get(key), int) and not isinstance(usage.get(key), bool)
+                    for key in fields
+                ):
+                    last_usage = usage
+                else:
+                    last_usage = None
+    except (OSError, UnicodeDecodeError):
+        return unknown_usage(budget, "transcript unreadable", source)
+    if not saw_session:
+        return unknown_usage(budget, "transcript sessionId mismatch", source)
+    if last_usage is None:
+        return unknown_usage(budget, "assistant usage missing", source)
+    tokens = sum(int(last_usage[key]) for key in (
+        "input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"
+    ))
+    age = None
+    stale = False
+    if first is not None:
+        age = max(0.0, (dt.datetime.now(dt.timezone.utc) - first).total_seconds() / 3600)
+        stale = age > stale_hours
+    return {
+        "status": "ok", "context_tokens": tokens, "budget": budget,
+        "over_budget": tokens > budget,
+        "session_started_at": first.isoformat() if first else None,
+        "session_age_hours": round(age, 3) if age is not None else None,
+        "stale": stale, "source": source, "measured_at": now(), "reason": "",
+    }
+
+
+def parse_handoff_fences(text: str) -> dict[str, list[str]]:
+    result = {key: [] for key in ("可以改", "只读输入", "可以新建", "不许动", "环境")}
+    for match in FENCE_RE.finditer(text):
+        value = match.group(2).strip().rstrip("；;")
+        if match.group(1) == "环境":
+            result["环境"].append(value)
+        else:
+            result[match.group(1)].extend(
+                part.strip().rstrip("；;") for part in re.split(r"[,，]", value) if part.strip()
+            )
+    return result
+
+
+def normalized_fence_path(value: str, cwd: str | None = None) -> str:
+    value = value.strip().replace("\\", "/")
+    path = Path(value).expanduser()
+    if path.is_absolute() and cwd:
+        try:
+            value = path.resolve().relative_to(Path(cwd).resolve()).as_posix()
+        except ValueError:
+            return path.resolve().as_posix()
+    else:
+        value = os.path.normpath(value).replace("\\", "/")
+    return value.rstrip("/") or "/"
+
+
+def paths_intersect(left: str, right: str) -> bool:
+    a, b = normalized_fence_path(left), normalized_fence_path(right)
+    if a == "." or b == ".":
+        other = b if a == "." else a
+        return not Path(other).is_absolute() and other != ".." and not other.startswith("../")
+    return bool(a and b and (a == b or a.startswith(b + "/") or b.startswith(a + "/")))
+
+
+def handoff_lint(cwd: str, text: str) -> list[dict[str, Any]]:
+    fences = parse_handoff_fences(text)
+    findings: list[dict[str, Any]] = []
+    groups = ("可以改", "可以新建", "不许动")
+    for index, left in enumerate(groups):
+        for right in groups[index + 1:]:
+            for a in fences[left]:
+                for b in fences[right]:
+                    normalized_a = normalized_fence_path(a, cwd)
+                    normalized_b = normalized_fence_path(b, cwd)
+                    if paths_intersect(normalized_a, normalized_b):
+                        findings.append({"rule": "fence_overlap", "left": a, "right": b})
+    if TMP_PATH_RE.search(text):
+        findings.append({"rule": "tmp_path"})
+    if not fences["环境"]:
+        findings.append({"rule": "env_block_missing"})
+    forbidden_text = " ".join(fences["不许动"]).lower()
+    if "未跟踪" in forbidden_text or "untracked" in forbidden_text:
+        try:
+            top = subprocess.run(
+                ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+                capture_output=True, text=True, check=False, timeout=10,
+            )
+            proc = subprocess.run(
+                ["git", "-C", top.stdout.strip(), "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+                capture_output=True, text=True, check=False, timeout=10,
+            ) if top.returncode == 0 else None
+        except (OSError, subprocess.TimeoutExpired):
+            proc = None
+        if proc and proc.returncode == 0:
+            untracked = []
+            repo_root = Path(top.stdout.strip()).resolve()
+            cwd_path = Path(cwd).resolve()
+            for line in proc.stdout.split("\0"):
+                if line.startswith("?? "):
+                    absolute = repo_root / line[3:]
+                    try:
+                        untracked.append(absolute.resolve().relative_to(cwd_path).as_posix())
+                    except ValueError:
+                        continue
+            for allowed in fences["可以改"] + fences["可以新建"]:
+                allowed = normalized_fence_path(allowed, cwd)
+                matches = [path for path in untracked if paths_intersect(allowed, path)]
+                if matches:
+                    findings.append({
+                        "rule": "untracked_conflict", "path": allowed, "untracked": matches
+                    })
+    return findings
+
+
+def parse_report_path(text: str, cwd: str) -> str:
+    match = re.search(r"^\s*(?:\[报告\]|\[report\]|report\s*:)\s*(\S.*?)\s*$", text, re.I | re.M)
+    if not match:
+        return ""
+    value = match.group(1).strip().strip("`").rstrip("；;")
+    path = Path(value).expanduser()
+    return str(path if path.is_absolute() else Path(cwd) / path)
+
+
+def snapshot_round(
+    pp: dict[str, Path], cwd: str, round_id: str, revision: int, text: str
+) -> tuple[dict[str, Any] | None, list[str]]:
+    fences = parse_handoff_fences(text)
+    requested = fences["可以改"] + fences["只读输入"] + fences["可以新建"]
+    warnings: list[str] = []
+    if not requested:
+        return None, ["handoff has no snapshot fence paths"]
+    root = pp["snapshots"] / f"{round_id}-r{revision}"
+    root.mkdir(parents=True, exist_ok=True)
+    chmod_private(root, DIR_MODE)
+    records: dict[str, dict[str, Any]] = {}
+    skipped: list[dict[str, Any]] = []
+    cwd_path = Path(cwd)
+    for raw in requested:
+        rel = normalized_fence_path(raw, cwd)
+        candidate = (cwd_path / rel).resolve()
+        try:
+            relative = candidate.relative_to(cwd_path)
+        except ValueError:
+            warnings.append(f"snapshot path outside cwd skipped: {raw}")
+            continue
+        if candidate.is_dir():
+            files = sorted(path for path in candidate.rglob("*") if path.is_file())
+            if not files:
+                records.setdefault(rel, {"path": rel, "sha256": "", "size": 0, "mode": 0, "exists": True, "directory": True})
+        elif candidate.exists():
+            files = [candidate]
+        else:
+            records.setdefault(rel, {"path": rel, "sha256": "", "size": 0, "mode": 0, "exists": False})
+            continue
+        for source in files:
+            file_rel = source.relative_to(cwd_path).as_posix()
+            content_hash = file_sha256(source)
+            size = source.stat().st_size
+            record = {
+                "path": file_rel, "sha256": content_hash, "size": size,
+                "mode": source.stat().st_mode & 0o7777, "exists": True,
+            }
+            records[file_rel] = record
+            if size > SNAPSHOT_COPY_LIMIT:
+                record["copied"] = False
+                skipped.append({"path": file_rel, "reason": "size_exceeds_copy_limit", "size": size})
+            else:
+                destination = root / "files" / file_rel
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source, destination)
+                record["copied"] = True
+    manifest = root / "manifest.json"
+    atomic_text(manifest, json.dumps(list(records.values()), indent=2, sort_keys=True) + "\n")
+    return {
+        "manifest": str(manifest), "files": sorted(records), "skipped": skipped,
+        "roots": [normalized_fence_path(value, cwd) for value in requested],
+    }, warnings
+
+
 def write_checkpoint(path: Path, data: dict[str, Any], reason: str) -> None:
-    current = [r for r in data["rounds"] if r["phase"] == data["phase"]]
+    current = [
+        r for r in data["rounds"]
+        if r["phase"] == data["phase"] or r.get("status") == "active"
+    ]
     active_jobs = [j for j in data["jobs"] if j["state"] not in TERMINAL_JOBS]
+    usage = data.get("last_context_usage") or {}
+    tokens = usage.get("context_tokens")
     lines = [
         "# Herdr Pair Checkpoint",
         "",
@@ -285,22 +593,34 @@ def write_checkpoint(path: Path, data: dict[str, Any], reason: str) -> None:
         f"- Rounds in phase: `{data['phase_round_count']}`",
         f"- Rollover required: `{str(data['rollover_required']).lower()}`",
         f"- Session ID: `{data.get('session_id') or 'unknown'}`",
+        f"- Goal: `{table_cell(data.get('goal')) or 'unspecified'}`",
+        f"- Context usage: `{tokens if tokens is not None else 'unknown'}`",
+        f"- Budget: `{usage.get('budget', data.get('context_budget', DEFAULT_CONTEXT_BUDGET))}`",
         "",
         "## Current phase rounds",
         "",
-        "| Round | Executor | Status | Scope | Acceptance |",
-        "|---|---|---|---|---|",
+        "| Round | Revision | Executor | Status | Contract | Report | Snapshot | Scope | Acceptance | Artifacts | Notes |",
+        "|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for item in current:
         lines.append(
-            "| {round_id} | {executor} | {status} | {scope} | {acceptance} |".format(
+            "| {round_id} | {current_revision} | {executor} | {status} | {contract} | {report} | {snapshot} | {scope} | {acceptance} | {artifacts} | {notes} |".format(
                 **{key: table_cell(item.get(key)) for key in (
-                    "round_id", "executor", "status", "scope", "acceptance"
-                )}
+                    "round_id", "current_revision", "executor", "status", "scope", "acceptance",
+                    "artifacts", "notes", "report",
+                )},
+                contract=table_cell(((item.get("revisions") or {}).get(str(item.get("current_revision", 1))) or {}).get("contract_path")),
+                snapshot=table_cell((item.get("snapshot") or {}).get("manifest")),
             )
         )
     if not current:
-        lines.append("| none |  |  |  |  |")
+        lines.append("| none |  |  |  |  |  |  |  |  |  |  |")
+    lines += ["", "## Decisions", ""]
+    notes = data.get("notes") or []
+    if notes:
+        lines.extend(f"- `{item.get('created_at')}` {item.get('text')}" for item in notes)
+    else:
+        lines.append("None.")
     lines += ["", "## Nonterminal background jobs", ""]
     if active_jobs:
         lines += ["```json", json.dumps(active_jobs, indent=2, ensure_ascii=False), "```"]
@@ -312,8 +632,9 @@ def write_checkpoint(path: Path, data: dict[str, Any], reason: str) -> None:
         "## Resume",
         "",
         "1. Read this checkpoint and `jobs.tsv`.",
-        "2. Verify every nonterminal job from its scheduler and log.",
-        "3. Planner compaction: "
+        "2. Before finishing a round, check whether every active round's Report path now exists.",
+        "3. Verify every nonterminal job from its scheduler and log.",
+        "4. Planner compaction: "
         + (
             f"`{compact_queued.get('command')}` was queued on planner pane "
             f"`{compact_queued.get('pane')}` at `{compact_queued.get('queued_at')}`; it runs "
@@ -322,10 +643,10 @@ def write_checkpoint(path: Path, data: dict[str, Any], reason: str) -> None:
             else f"not queued yet; run `python3 {PAIRCTL_SCRIPT} compact-self` or ask the user "
             "to run that kind's compact command (cursor `/summarize`) or clear."
         ),
-        "4. Record the rollover once the context is fresh: a Claude Code planner does this from "
+        "5. Record the rollover once the context is fresh: a Claude Code planner does this from "
         f"its SessionStart hook; otherwise run `python3 {PAIRCTL_SCRIPT} rollover --reason "
         "compact --new-session-id <id>` (use `--reason new` when the session id changed).",
-        "5. Do not cancel, retry, or replace jobs without the recorded owner's authorization.",
+        "6. Do not cancel, retry, or replace jobs without the recorded owner's authorization.",
         "",
     ]
     atomic_text(path, "\n".join(lines))
@@ -426,6 +747,9 @@ def commit_round(
     contract_hash: str = "",
     dispatch_status: str = "delivered",
     work_status: str = "pending_acceptance",
+    snapshot: dict[str, Any] | None = None,
+    skip_lint: str = "",
+    report: str = "",
 ) -> None:
     expected = allocate_round_id(data)
     if round_id != expected:
@@ -456,6 +780,9 @@ def commit_round(
         "finished_at": "",
         "artifacts": "",
         "notes": "",
+        "report": report,
+        "snapshot": snapshot,
+        "skip_lint": skip_lint,
         "fresh": fresh,
     })
     if data["phase_round_count"] >= 5:
@@ -633,17 +960,25 @@ def pid_alive(pid: int) -> bool:
 
 def compact_continue_prompt(pp: dict[str, Path], data: dict[str, Any]) -> str:
     session = str(data.get("session_id") or "").strip() or "<session id from status>"
+    selection = shlex.join(["--cwd", data["cwd"], "--state-dir", str(pp["root"])])
+    reports = "; ".join(
+        f"{item['round_id']} revision {item.get('current_revision', 1)}: "
+        f"{item.get('report') or 'read the contract for the report path'}"
+        for item in data.get("rounds", []) if item.get("status") == "active"
+    ) or "no active rounds recorded"
     return (
         "herdr-pair auto-continue after compaction. Do not wait for the user to say 继续.\n"
         f"Working directory: {data['cwd']}\n"
         f"Checkpoint: {pp['checkpoint']}\n"
-        f"PAIRCTL={PAIRCTL_SCRIPT}\n"
-        "1. python3 \"$PAIRCTL\" status\n"
-        "2. If rollover_required or status is SESSION_ROLLOVER_REQUIRED, run:\n"
-        f"   python3 \"$PAIRCTL\" rollover --reason compact --new-session-id {session}\n"
-        "3. Read the checkpoint. Re-resolve the executor with herdr agent list "
+        f"PAIRCTL={shlex.quote(PAIRCTL_SCRIPT)}\n"
+        f"1. python3 \"$PAIRCTL\" status {selection}\n"
+        f"2. Read any active Report files that have arrived: {reports}.\n"
+        "3. If status still has compact_queued or rollover_required (or status is "
+        "SESSION_ROLLOVER_REQUIRED), record the completed compaction:\n"
+        f"   python3 \"$PAIRCTL\" rollover --reason compact --new-session-id {shlex.quote(session)} {selection}\n"
+        "4. Read the checkpoint. Re-resolve the executor with herdr agent list "
         "(one writer per cwd).\n"
-        "4. Continue the pairing immediately: independently verify any outstanding "
+        "5. Continue the pairing immediately: independently verify any outstanding "
         "executor report, or dispatch the next prepared handoff. Do not ask the user "
         "to confirm."
     )
@@ -762,12 +1097,25 @@ def compact_instructions(pp: dict[str, Path], data: dict[str, Any], kind: str) -
         if kind == "claude"
         else f"then run python3 {PAIRCTL_SCRIPT} rollover --reason compact --new-session-id <your session id>"
     )
+    active = [r for r in data.get("rounds", []) if r.get("status") == "active"]
+    if active:
+        item = active[0]
+        revision = item.get("current_revision", 1)
+        contract = ((item.get("revisions") or {}).get(str(revision)) or {}).get("contract_path", "")
+        focus = (
+            f" Active round_id {item.get('round_id')} revision {revision}, contract {contract}, "
+            f"executor pane {item.get('executor')}, Report {item.get('report') or 'unspecified'}."
+        )
+    else:
+        focus = " No active round."
     return (
-        "herdr-pair phase boundary. Keep verbatim: the checkpoint file "
-        f"{pp['checkpoint']}, planner pane {data.get('planner_pane') or 'unknown'}, working "
-        f"directory {data['cwd']}, every round_id with its executor pane and status, all "
-        "nonterminal background jobs, open blockers, and the user's original task statement. "
-        f"After compaction read the checkpoint file before doing anything else. {rollover}"
+        "herdr-pair context checkpoint. Keep verbatim: checkpoint file "
+        f"{pp['checkpoint']}. Goal: {data.get('goal') or 'unspecified'}. Preserve "
+        f"planner pane {data.get('planner_pane') or 'unknown'}, working "
+        f"directory {data['cwd']}.{focus} Keep every round_id with status, all nonterminal "
+        "background jobs, open blockers, and the user's original task statement. The executor "
+        "report may already have arrived; after compaction first read pairctl status and the "
+        f"Report file, then read the checkpoint. {rollover}"
     )
 
 
@@ -787,8 +1135,9 @@ def queue_planner_compact(
     """
     pane = str(data.get("planner_pane") or "")
     already = data.get("compact_queued") or {}
-    if not force and already.get("phase") == data["phase"]:
-        return {"queued": False, "reason": "already queued for this phase", "previous": already}
+    epoch = int(data.get("compaction_epoch", 0))
+    if not force and already and already.get("compaction_epoch", epoch) == epoch:
+        return {"queued": False, "reason": "already queued for this compaction epoch", "previous": already}
     if not pane:
         return {"queued": False, "reason": "planner_pane unknown; run init --planner-pane"}
     if not force and not auto_compact_enabled(data):
@@ -823,6 +1172,7 @@ def queue_planner_compact(
         }
     record = {
         "phase": data["phase"],
+        "compaction_epoch": epoch,
         "pane": pane,
         "kind": kind,
         "mode": mode,
@@ -834,6 +1184,21 @@ def queue_planner_compact(
         "queued": True,
         **record,
         "note": "queued in the planner pane; it executes when the current turn ends",
+    }
+
+
+def compact_pending(data: dict[str, Any]) -> bool:
+    queued = data.get("compact_queued") or {}
+    return bool(queued and int(queued.get("compaction_epoch", data.get("compaction_epoch", 0))) == int(data.get("compaction_epoch", 0)))
+
+
+def compact_pending_payload(pp: dict[str, Path], data: dict[str, Any]) -> dict[str, Any]:
+    queued = data.get("compact_queued") or {}
+    return {
+        "status": "CONTEXT_COMPACT_QUEUED", "trigger": "CONTEXT_COMPACT_QUEUED",
+        "checkpoint": str(pp["checkpoint"]), "planner_compact": {"queued": False, "previous": queued},
+        "compaction_epoch": data.get("compaction_epoch", 0),
+        "guidance": "Planner compaction is queued and must be consumed before dispatching another round.",
     }
 
 
@@ -893,7 +1258,21 @@ def clip(text: str, limit: int = 2000) -> str:
     return text[:limit] + "…"
 
 
+def queue_budget_compact(
+    args: argparse.Namespace, pp: dict[str, Path], data: dict[str, Any], reason: str,
+) -> dict[str, Any]:
+    """Persist recoverable state before requesting the planner's context refresh."""
+    write_checkpoint(pp["checkpoint"], data, reason)
+    persist(pp, data)
+    result = queue_planner_compact(args, pp, data)
+    if result.get("queued"):
+        write_checkpoint(pp["checkpoint"], data, reason)
+    return result
+
+
 def cmd_init(args: argparse.Namespace) -> int:
+    if args.context_budget is not None and args.context_budget <= 0:
+        raise ValueError("--context-budget must be positive")
     pp = paths(args)
     cwd = canonical_cwd(args.cwd)
     with locked(pp["root"], pp["lock"], create=True):
@@ -906,6 +1285,10 @@ def cmd_init(args: argparse.Namespace) -> int:
                 data["session_id"] = args.session_id
             if args.no_auto_compact:
                 data["auto_compact"] = False
+            if args.goal:
+                data["goal"] = args.goal
+            if args.context_budget is not None:
+                data["context_budget"] = args.context_budget
         else:
             data = {
                 "version": VERSION,
@@ -913,6 +1296,10 @@ def cmd_init(args: argparse.Namespace) -> int:
                 "planner_pane": args.planner_pane or "",
                 "session_id": args.session_id or "",
                 "auto_compact": not args.no_auto_compact,
+                "goal": args.goal or "",
+                "context_budget": args.context_budget or budget_for(args),
+                "last_context_usage": None,
+                "notes": [],
                 "phase": 1,
                 "round_seq": 0,
                 "phase_round_count": 0,
@@ -925,12 +1312,78 @@ def cmd_init(args: argparse.Namespace) -> int:
                 "created_at": now(),
             }
         persist(pp, data)
-    output({
-        "status": "initialized",
+        usage = read_context_usage(
+            pp, cwd, budget_for(args, data), env_float("PAIRCTL_SESSION_STALE_HOURS", DEFAULT_STALE_HOURS), data
+        )
+        data["last_context_usage"] = usage
+        planner_compact = None
+        if (
+            not args.no_context_check and auto_compact_enabled(data)
+            and (usage.get("over_budget") or usage.get("stale"))
+        ):
+            planner_compact = queue_budget_compact(args, pp, data, "init_context_budget")
+        persist(pp, data)
+    continue_after = spawn_compact_continue_watcher(args, pp, data, planner_compact) if planner_compact else None
+    payload = {
+        "status": "CONTEXT_COMPACT_QUEUED" if planner_compact and planner_compact.get("queued") else "initialized",
         "state": str(pp["state"]),
         "ledger": str(pp["ledger"]),
         "state_root": str(pp["root"]),
-    })
+        "context_usage": usage,
+    }
+    if planner_compact:
+        payload.update({"planner_compact": planner_compact, "checkpoint": str(pp["checkpoint"]), "continue_after_compact": continue_after})
+    output(payload)
+    return 0
+
+
+def cmd_note_session(args: argparse.Namespace) -> int:
+    pp = paths(args)
+    cwd = canonical_cwd(args.cwd)
+    record = {
+        "cwd": cwd, "session_id": args.session_id, "transcript_path": args.transcript_path or "",
+        "kind": args.kind, "source": args.source, "pane": args.pane or "", "recorded_at": now(),
+    }
+    with locked(pp["root"], pp["lock"], create=True):
+        if pp["state"].is_file() and args.pane:
+            data = load(pp["state"], cwd)
+            planner_pane = str(data.get("planner_pane") or "")
+            if planner_pane and args.pane != planner_pane:
+                output({"status": "session_ignored", "reason": "non_planner_pane"})
+                return 0
+        atomic_text(pp["planner_session"], json.dumps(record, indent=2, sort_keys=True) + "\n")
+    output({"status": "session_noted", "planner_session": str(pp["planner_session"])})
+    return 0
+
+
+def cmd_context_usage(args: argparse.Namespace) -> int:
+    pp = paths(args)
+    cwd = canonical_cwd(args.cwd)
+    data = None
+    if pp["state"].is_file():
+        with locked(pp["root"], pp["lock"]):
+            data = load(pp["state"], cwd)
+    usage = read_context_usage(
+        pp, cwd, budget_for(args, data), env_float("PAIRCTL_SESSION_STALE_HOURS", DEFAULT_STALE_HOURS), data
+    )
+    if data is not None:
+        with locked(pp["root"], pp["lock"]):
+            current = load(pp["state"], cwd)
+            current["last_context_usage"] = usage
+            persist(pp, current)
+    output(usage)
+    return 0
+
+
+def cmd_note(args: argparse.Namespace) -> int:
+    pp = paths(args)
+    cwd = canonical_cwd(args.cwd)
+    with locked(pp["root"], pp["lock"]):
+        data = load_ready(pp, cwd)
+        data.setdefault("notes", []).append({"created_at": now(), "text": args.text})
+        write_checkpoint(pp["checkpoint"], data, "decision noted")
+        persist(pp, data)
+    output({"status": "note_added", "checkpoint": str(pp["checkpoint"])})
     return 0
 
 
@@ -950,11 +1403,19 @@ def cmd_start_round(args: argparse.Namespace) -> int:
         data = load_ready(pp, cwd)
         if data["rollover_required"]:
             return emit_rollover_block(pp, data, "round limit reached", args)
+        if compact_pending(data):
+            output(compact_pending_payload(pp, data))
+            return ROLLOVER_EXIT
         active = active_round_ids(data)
         if active:
             raise ValueError(f"active round already exists: {active[0]}")
+        findings = [] if args.skip_lint else handoff_lint(cwd, source_text)
+        if findings:
+            output({"status": "rejected", "reason": "handoff_lint", "findings": findings})
+            return 2
         round_id = allocate_round_id(data)
         contract_text = inject_round_id(source_text, round_id)
+        snapshot, warnings = snapshot_round(pp, cwd, round_id, 1, source_text)
         contract_path, contract_hash = save_contract(pp, round_id, 1, contract_text)
         commit_round(
             data,
@@ -967,6 +1428,9 @@ def cmd_start_round(args: argparse.Namespace) -> int:
             contract_hash=contract_hash,
             dispatch_status="delivered",
             work_status="pending_acceptance",
+            snapshot=snapshot,
+            skip_lint=args.skip_lint or "",
+            report=parse_report_path(source_text, cwd),
         )
         after_round_checkpoint(pp, data)
         persist(pp, data)
@@ -978,6 +1442,8 @@ def cmd_start_round(args: argparse.Namespace) -> int:
         "work_status": "pending_acceptance",
         "contract_hash": contract_hash,
         "contract_path": contract_path,
+        "snapshot": snapshot,
+        "warnings": warnings,
     }
     if data["rollover_required"]:
         payload["after_round"] = "SESSION_ROLLOVER_REQUIRED"
@@ -996,9 +1462,16 @@ def cmd_send_round(args: argparse.Namespace) -> int:
         data = load_ready(pp, cwd)
         if data["rollover_required"]:
             return emit_rollover_block(pp, data, "round limit reached", args)
+        if compact_pending(data):
+            output(compact_pending_payload(pp, data))
+            return ROLLOVER_EXIT
         active = active_round_ids(data)
         if active:
             raise ValueError(f"active round already exists: {active[0]}")
+        findings = [] if args.skip_lint else handoff_lint(cwd, text)
+        if findings:
+            output({"status": "rejected", "reason": "handoff_lint", "findings": findings})
+            return 2
         round_id = allocate_round_id(data)
         message = inject_round_id(text, round_id)
         encoded = message.encode("utf-8")
@@ -1023,6 +1496,7 @@ def cmd_send_round(args: argparse.Namespace) -> int:
                     "guidance": FRESH_GUIDANCE,
                 })
                 return 2
+        snapshot, warnings = snapshot_round(pp, cwd, round_id, 1, text)
         contract_path, contract_hash = save_contract(pp, round_id, 1, message)
         argv = [herdr_bin(args), "agent", "prompt", args.target, message]
         data["pending_dispatch"] = {
@@ -1038,6 +1512,9 @@ def cmd_send_round(args: argparse.Namespace) -> int:
             "contract_path": contract_path,
             "contract_hash": contract_hash,
             "fresh": fresh,
+            "snapshot": snapshot,
+            "skip_lint": args.skip_lint or "",
+            "report": parse_report_path(text, cwd),
             "phase_round_count": data["phase_round_count"],
             "created_at": now(),
         }
@@ -1112,9 +1589,22 @@ def cmd_send_round(args: argparse.Namespace) -> int:
             contract_hash=contract_hash,
             dispatch_status="delivered",
             work_status="pending_acceptance",
+            snapshot=snapshot,
+            skip_lint=args.skip_lint or "",
+            report=parse_report_path(text, cwd),
         )
         after_round_checkpoint(pp, data)
+        planner_compact = None
+        # A delivered round must be durable before any further Herdr call can fail.
         persist(pp, data)
+        usage = read_context_usage(
+            pp, cwd, budget_for(args, data), env_float("PAIRCTL_SESSION_STALE_HOURS", DEFAULT_STALE_HOURS), data
+        )
+        data["last_context_usage"] = usage
+        if usage.get("status") == "ok" and usage.get("over_budget") and auto_compact_enabled(data):
+            planner_compact = queue_budget_compact(args, pp, data, "post_dispatch_budget")
+        persist(pp, data)
+    continue_after = spawn_compact_continue_watcher(args, pp, data, planner_compact) if planner_compact else None
     result = {
         "status": "round_sent",
         "round_id": round_id,
@@ -1127,7 +1617,13 @@ def cmd_send_round(args: argparse.Namespace) -> int:
         "work_status": "pending_acceptance",
         "contract_hash": contract_hash,
         "contract_path": contract_path,
+        "snapshot": snapshot,
+        "warnings": warnings,
+        "context_usage": usage,
     }
+    if planner_compact:
+        result["planner_compact"] = planner_compact
+        result["continue_after_compact"] = continue_after
     if data["phase_round_count"] == 3:
         result["checkpoint"] = str(pp["checkpoint"])
         result["checkpoint_reason"] = "automatic three-round checkpoint"
@@ -1480,6 +1976,9 @@ def cmd_resolve_pending(args: argparse.Namespace) -> int:
                 contract_hash=contract_hash,
                 dispatch_status="delivered",
                 work_status="unconfirmed_protocol" if legacy_pending else "pending_acceptance",
+                snapshot=pending.get("snapshot"),
+                skip_lint=str(pending.get("skip_lint") or ""),
+                report=str(pending.get("report") or ""),
             )
             data["pending_dispatch"] = None
             after_round_checkpoint(pp, data)
@@ -1514,12 +2013,28 @@ def cmd_finish_round(args: argparse.Namespace) -> int:
         item = find_round(data, args.round_id)
         if item["status"] != "active":
             raise ValueError(f"round is not active: {args.round_id} ({item['status']})")
+        if args.report:
+            report_path = Path(args.report).expanduser()
+            if not report_path.is_absolute():
+                report_path = Path(cwd) / report_path
+            if not report_path.exists():
+                output({"status": "rejected", "reason": "report_missing", "report": str(report_path)})
+                return 2
+        else:
+            report_path = Path(str(item.get("report") or "")) if item.get("report") else None
+        if args.status == "accepted" and (not args.artifacts.strip() or not args.notes.strip()):
+            output({
+                "status": "rejected", "reason": "missing_acceptance_evidence",
+                "missing": [name for name, value in (("artifacts", args.artifacts), ("notes", args.notes)) if not value.strip()],
+            })
+            return 2
         item.update({
             "status": args.status,
             "work_status": "finished",
             "finished_at": now(),
             "artifacts": args.artifacts,
             "notes": args.notes,
+            "report": str(report_path) if report_path else str(item.get("report") or ""),
         })
         if data["phase_round_count"] >= 5:
             data["rollover_required"] = True
@@ -1528,11 +2043,10 @@ def cmd_finish_round(args: argparse.Namespace) -> int:
             # The phase is over and no round is active: queue the planner's own compaction
             # now, so it runs as soon as the planner's current turn ends.
             planner_compact = queue_planner_compact(args, pp, data)
-        if data["phase_round_count"] >= 3:
-            reason = "round completed"
-            if data["rollover_required"]:
-                reason = "five-round limit reached"
-            write_checkpoint(pp["checkpoint"], data, reason)
+        reason = "round completed"
+        if data["rollover_required"]:
+            reason = "five-round limit reached"
+        write_checkpoint(pp["checkpoint"], data, reason)
         persist(pp, data)
     if data["rollover_required"]:
         continue_after = spawn_compact_continue_watcher(args, pp, data, planner_compact)
@@ -1550,6 +2064,42 @@ def cmd_finish_round(args: argparse.Namespace) -> int:
         return ROLLOVER_EXIT
     output({"status": "round_finished", "round_id": args.round_id})
     return 0
+
+
+def cmd_diff_round(args: argparse.Namespace) -> int:
+    pp = paths(args)
+    cwd = canonical_cwd(args.cwd)
+    with locked(pp["root"], pp["lock"]):
+        data = load_ready(pp, cwd)
+        item = find_round(data, args.round_id)
+        revision = args.revision or int(item.get("current_revision", 1))
+        if revision != int(item.get("current_revision", 1)):
+            rev_snapshot = ((item.get("revisions") or {}).get(str(revision)) or {}).get("snapshot")
+            snapshot = rev_snapshot
+        else:
+            snapshot = item.get("snapshot")
+        if not snapshot or not Path(str(snapshot.get("manifest") or "")).is_file():
+            raise ValueError(f"snapshot missing for {args.round_id} revision {revision}")
+        manifest = json.loads(Path(snapshot["manifest"]).read_text(encoding="utf-8"))
+    original = {record["path"]: record for record in manifest}
+    current: dict[str, dict[str, Any]] = {}
+    cwd_path = Path(cwd)
+    for root_value in snapshot.get("roots") or list(original):
+        candidate = (cwd_path / root_value).resolve()
+        try:
+            candidate.relative_to(cwd_path)
+        except ValueError:
+            continue
+        paths_now = sorted(path for path in candidate.rglob("*") if path.is_file()) if candidate.is_dir() else ([candidate] if candidate.is_file() else [])
+        for path in paths_now:
+            rel = path.relative_to(cwd_path).as_posix()
+            current[rel] = {"sha256": file_sha256(path)}
+    changed = sorted(path for path in original if original[path].get("exists") and path in current and original[path].get("sha256") != current[path]["sha256"])
+    removed = sorted(path for path in original if original[path].get("exists") and not original[path].get("directory") and path not in current)
+    added = sorted(path for path in current if path not in original or not original[path].get("exists"))
+    unchanged = sorted(path for path in original if original[path].get("exists") and path in current and original[path].get("sha256") == current[path]["sha256"])
+    output({"round_id": args.round_id, "revision": revision, "changed": changed, "added": added, "removed": removed, "unchanged": unchanged})
+    return 1 if changed or added or removed else 0
 
 
 def cmd_job_add(args: argparse.Namespace) -> int:
@@ -1631,6 +2181,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     contract_path = ""
     contract_status = "none"
     contract_valid = False
+    report = ""
     if active_ids:
         active_round = find_round(data, active_ids[0])
         dispatch_status = str(active_round.get("dispatch_status") or "delivered")
@@ -1641,6 +2192,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         contract_hash = str(rev_info.get("contract_hash") or "")
         contract_path = str(rev_info.get("contract_path") or "")
         contract_valid, contract_status = verify_round_contract(active_round, current_revision)
+        report = str(active_round.get("report") or "")
 
     payload = {
         "status": "SESSION_ROLLOVER_REQUIRED" if data["rollover_required"] else "ok",
@@ -1665,6 +2217,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         "contract_path": contract_path,
         "contract_status": contract_status,
         "contract_valid": contract_valid,
+        "report": report,
     }
     if data["rollover_required"]:
         payload["guidance"] = ROLLOVER_GUIDANCE
@@ -1678,9 +2231,9 @@ def cmd_rollover(args: argparse.Namespace) -> int:
     with locked(pp["root"], pp["lock"]):
         data = load_ready(pp, cwd)
         active = active_round_ids(data)
-        if active:
+        if active and args.reason != "compact":
             raise ValueError(f"cannot rollover with active round: {active[0]}")
-        if not data["rollover_required"] and not args.force:
+        if not data["rollover_required"] and not compact_pending(data) and not args.force:
             raise ValueError("rollover is not required; use --force only for an intentional phase boundary")
         current = data.get("session_id") or ""
         if args.reason == "compact":
@@ -1696,9 +2249,11 @@ def cmd_rollover(args: argparse.Namespace) -> int:
                 raise ValueError("--new-session-id is required with --reason new")
             data["session_id"] = validate_new_session_id(args.new_session_id, current)
         write_checkpoint(pp["checkpoint"], data, f"session rollover ({args.reason})")
-        data["phase"] += 1
-        data["phase_round_count"] = 0
-        data["rollover_required"] = False
+        phase_advanced = bool(not active and (data["rollover_required"] or args.force))
+        if phase_advanced:
+            data["phase"] += 1
+            data["phase_round_count"] = 0
+            data["rollover_required"] = False
         data["compact_queued"] = None
         persist(pp, data)
     output({
@@ -1708,6 +2263,7 @@ def cmd_rollover(args: argparse.Namespace) -> int:
         "session_id": data["session_id"],
         "compaction_epoch": data.get("compaction_epoch", 0),
         "session_switched": False,
+        "phase_advanced": phase_advanced,
         "guidance": (
             "State advanced locally only. This command records that the planner context "
             "was already compacted or cleared; it does not start or switch a session."
@@ -1751,13 +2307,33 @@ def parser() -> argparse.ArgumentParser:
         "--no-auto-compact", action="store_true",
         help="do not queue the planner's own compact command when the five-round limit is reached",
     )
+    p.add_argument("--goal", default="")
+    p.add_argument("--context-budget", type=int)
+    p.add_argument("--no-context-check", action="store_true")
     p.set_defaults(func=cmd_init)
+
+    p = sub.add_parser("note-session", parents=[common])
+    p.add_argument("--session-id", required=True)
+    p.add_argument("--transcript-path", default="")
+    p.add_argument("--kind", required=True)
+    p.add_argument("--source", required=True)
+    p.add_argument("--pane", default="")
+    p.set_defaults(func=cmd_note_session)
+
+    p = sub.add_parser("context-usage", parents=[common])
+    p.add_argument("--budget", type=int)
+    p.set_defaults(func=cmd_context_usage)
+
+    p = sub.add_parser("note", parents=[common])
+    p.add_argument("--text", required=True)
+    p.set_defaults(func=cmd_note)
 
     p = sub.add_parser("start-round", parents=[common])
     p.add_argument("--file", required=True, help="complete UTF-8 contract / handoff file")
     p.add_argument("--executor", required=True)
     p.add_argument("--scope", required=True)
     p.add_argument("--acceptance", required=True)
+    p.add_argument("--skip-lint", default="", metavar="REASON")
     p.set_defaults(func=cmd_start_round)
 
     p = sub.add_parser("send-round", parents=[common])
@@ -1778,6 +2354,7 @@ def parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--fresh-timeout", type=float, default=15.0)
     p.add_argument("--fresh-lines", type=int, default=40)
+    p.add_argument("--skip-lint", default="", metavar="REASON")
     p.set_defaults(func=cmd_send_round, fresh=True)
 
     p = sub.add_parser("ack-round", parents=[common])
@@ -1811,7 +2388,13 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--status", required=True, choices=sorted(ROUND_STATES))
     p.add_argument("--artifacts", default="")
     p.add_argument("--notes", default="")
+    p.add_argument("--report", default="")
     p.set_defaults(func=cmd_finish_round)
+
+    p = sub.add_parser("diff-round", parents=[common])
+    p.add_argument("--round-id", required=True)
+    p.add_argument("--revision", type=int)
+    p.set_defaults(func=cmd_diff_round)
 
     p = sub.add_parser("job-add", parents=[common])
     p.add_argument("--round-id", required=True)

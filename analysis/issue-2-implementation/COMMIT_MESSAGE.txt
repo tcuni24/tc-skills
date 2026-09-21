@@ -1,0 +1,11 @@
+feat: add herdr-pair context budgets and recovery checkpoints
+
+Record planner sessions, measure context usage, and queue budget-driven
+compaction with durable active-round recovery. Require acceptance evidence,
+lint handoff fences, and snapshot pre-dispatch files for workspace diffs.
+
+Split the skill into a short core and five focused references.
+
+Validation: 66 tests and 4 subtests passed; independent final review passed.
+
+Refs #2

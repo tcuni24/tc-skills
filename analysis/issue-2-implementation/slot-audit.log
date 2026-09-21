@@ -1,0 +1,4 @@
+PID      RSS         CPU%  COMM             状态
+
+没发现绕过 slot 的重进程。
+/home/tcuni-claw/.local/bin/slot: line 58: /home/tcuni-claw/.local/share/slot/audit.log: Read-only file system
