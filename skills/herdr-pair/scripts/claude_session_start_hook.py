@@ -65,12 +65,30 @@ def recent(updated_at: str) -> bool:
 
 
 def emit(context: str) -> None:
+    if len(context) >= MAX_CONTEXT_CHARS:
+        marker = "\n...[header truncated]...\n"
+        tail_len = MAX_CONTEXT_CHARS - 1 - 4000 - len(marker)
+        context = context[:4000] + marker + context[-tail_len:]
     print(json.dumps({
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
-            "additionalContext": context[:MAX_CONTEXT_CHARS],
+            "additionalContext": context,
         }
     }, ensure_ascii=False))
+
+
+def checkpoint_context(path: str) -> str:
+    checkpoint = Path(path)
+    if not checkpoint.is_file():
+        return ""
+    try:
+        text = checkpoint.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    heading = text.rfind("\n## Resume\n")
+    header = text[:heading].split("\n## Current phase rounds\n", 1)[0].rstrip() if heading >= 0 else text[:2000].rstrip()
+    resume = text[heading:].strip() if heading >= 0 else ""
+    return f"{header}\n\n{resume}\n\nFull checkpoint: {checkpoint}".strip()
 
 
 def main() -> int:
@@ -84,6 +102,20 @@ def main() -> int:
     cwd = str(payload.get("cwd") or os.getcwd())
     source = str(payload.get("source") or "")
     session_id = str(payload.get("session_id") or "")
+    transcript_path = str(payload.get("transcript_path") or "")
+
+    if not payload.get("cwd") or not source or not session_id:
+        return 0
+    note_args = ["note-session", "--session-id", session_id, "--kind", "claude", "--source", source]
+    if transcript_path:
+        note_args += ["--transcript-path", transcript_path]
+    pane = (os.environ.get("HERDR_PANE_ID") or "").strip()
+    if pane:
+        note_args += ["--pane", pane]
+    note_code, note_out, _note_err = run_pairctl(cwd, *note_args)
+    noted = parse_json(note_out)
+    if note_code != 0 or noted.get("status") == "session_ignored":
+        return 0
 
     code, out, _err = run_pairctl(cwd, "status")
     status = parse_json(out)
@@ -98,6 +130,7 @@ def main() -> int:
         return 0
 
     rollover_required = bool(status.get("rollover_required"))
+    compact_queued = bool(status.get("compact_queued"))
     fresh_now = source in FRESH_SOURCES
     touched_recently = recent(str(status.get("updated_at") or ""))
     if not rollover_required and not fresh_now:
@@ -108,7 +141,7 @@ def main() -> int:
         return 0
 
     lines = ["herdr-pair SessionStart hook."]
-    if rollover_required:
+    if rollover_required or (source == "compact" and compact_queued):
         recorded = str(status.get("session_id") or "")
         reason = "compact" if source == "compact" or not session_id or session_id == recorded else "new"
         rcode, rout, rerr = run_pairctl(
@@ -134,13 +167,9 @@ def main() -> int:
             f"{status.get('phase')} with {status.get('phase_round_count')} rounds used."
         )
     checkpoint = str(status.get("checkpoint") or "")
-    if checkpoint and Path(checkpoint).is_file():
-        try:
-            text = Path(checkpoint).read_text(encoding="utf-8")
-        except OSError:
-            text = ""
-        if text:
-            lines += ["", f"Checkpoint `{checkpoint}` (read it before doing anything else):", "", text]
+    text = checkpoint_context(checkpoint)
+    if text:
+        lines += ["", "Recovery checkpoint:", "", text]
     lines += [
         "",
         f"Then run `python3 {PAIRCTL} status` and continue with the herdr-pair skill. "

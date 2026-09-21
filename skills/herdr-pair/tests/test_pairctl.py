@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import subprocess
 import tempfile
@@ -157,6 +158,8 @@ class PairctlTest(unittest.TestCase):
 
     def write_handoff(self, name: str, body: str) -> Path:
         path = self.cwd / name
+        if body.strip() and "[环境]" not in body:
+            body = body.rstrip("\n") + "\n[环境] local lightweight test only\n"
         path.write_text(body, encoding="utf-8")
         return path
 
@@ -173,7 +176,7 @@ class PairctlTest(unittest.TestCase):
         )
         proc = self.invoke(
             "finish-round", "--round-id", started["round_id"],
-            "--status", "accepted", "--artifacts", f"artifact-{n}",
+            "--status", "accepted", "--artifacts", f"artifact-{n}", "--notes", f"verified-{n}",
         )
         return started["round_id"], proc
 
@@ -200,7 +203,7 @@ class PairctlTest(unittest.TestCase):
         sent = self.send_round(n)
         proc = self.invoke(
             "finish-round", "--round-id", sent["round_id"],
-            "--status", "accepted", "--artifacts", f"artifact-{n}",
+            "--status", "accepted", "--artifacts", f"artifact-{n}", "--notes", f"verified-{n}",
         )
         return sent["round_id"], proc
 
@@ -337,7 +340,7 @@ class PairctlTest(unittest.TestCase):
         self.assertIn("automatic three-round checkpoint", text)
         self.invoke(
             "finish-round", "--round-id", third["round_id"],
-            "--status", "accepted", "--artifacts", "a3",
+            "--status", "accepted", "--artifacts", "a3", "--notes", "verified",
         )
         for n in range(4, 6):
             _, proc = self.send_finish(n)
@@ -382,7 +385,7 @@ class PairctlTest(unittest.TestCase):
         )
         self.invoke(
             "finish-round", "--round-id", started["round_id"],
-            "--status", "accepted", "--artifacts", "queued",
+            "--status", "accepted", "--artifacts", "queued", "--notes", "verified",
         )
         for n in range(2, 6):
             self.start_finish(n)
@@ -823,7 +826,7 @@ class PairctlTest(unittest.TestCase):
         )
         self.clear_calls()
         fifth = self.invoke(
-            "finish-round", "--round-id", started["round_id"], "--status", "accepted",
+            "finish-round", "--round-id", started["round_id"], "--status", "accepted", "--artifacts", "artifact", "--notes", "verified",
             extra_env={
                 "PAIRCTL_CONTINUE_AFTER_COMPACT": "1",
                 "PAIRCTL_CONTINUE_MIN_DELAY_S": "0",
@@ -857,7 +860,7 @@ class PairctlTest(unittest.TestCase):
         )
         self.clear_calls()
         fifth = self.invoke(
-            "finish-round", "--round-id", started["round_id"], "--status", "accepted",
+            "finish-round", "--round-id", started["round_id"], "--status", "accepted", "--artifacts", "artifact", "--notes", "verified",
             extra_env={"PAIRCTL_AUTO_COMPACT": "0"},
         )
         self.assertEqual(fifth.returncode, 20)
@@ -887,6 +890,7 @@ class PairctlTest(unittest.TestCase):
 
     def run_hook(self, payload: dict, xdg: Path) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
+        env.pop("HERDR_PANE_ID", None)
         env["XDG_STATE_HOME"] = str(xdg)
         env["PAIRCTL_HERDR"] = str(self.herdr)
         return subprocess.run(
@@ -908,7 +912,7 @@ class PairctlTest(unittest.TestCase):
                 use_state_dir=False, extra_env=env,
             )
             self.invoke(
-                "finish-round", "--round-id", started["round_id"], "--status", "accepted",
+                "finish-round", "--round-id", started["round_id"], "--status", "accepted", "--artifacts", "artifact", "--notes", "verified",
                 use_state_dir=False, extra_env=env,
             )
         status = self.invoke("status", use_state_dir=False, extra_env=env)
@@ -936,7 +940,7 @@ class PairctlTest(unittest.TestCase):
                 use_state_dir=False, extra_env=env,
             )
             self.invoke(
-                "finish-round", "--round-id", started["round_id"], "--status", "accepted",
+                "finish-round", "--round-id", started["round_id"], "--status", "accepted", "--artifacts", "artifact", "--notes", "verified",
                 use_state_dir=False, extra_env=env,
             )
         hook = self.run_hook({"session_id": "sess-2", "source": "clear", "cwd": str(self.cwd)}, xdg)
@@ -1069,7 +1073,7 @@ class PairctlTest(unittest.TestCase):
         self.assertTrue(started["contract_hash"])
         self.invoke(
             "finish-round", "--round-id", started["round_id"],
-            "--status", "accepted",
+            "--status", "accepted", "--artifacts", "artifact", "--notes", "verified",
         )
 
         # Test no-fresh send-round
@@ -1088,7 +1092,7 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(sent["dispatch_status"], "delivered")
         self.invoke(
             "finish-round", "--round-id", sent["round_id"],
-            "--status", "accepted",
+            "--status", "accepted", "--artifacts", "artifact", "--notes", "verified",
         )
 
         # Test resolve-pending delivered binds contract and statuses
@@ -1327,6 +1331,7 @@ class PairctlTest(unittest.TestCase):
             "finish-round",
             "--round-id", round_id,
             "--status", "accepted",
+            "--artifacts", "artifact", "--notes", "verified",
         )
         proc = self.invoke(
             "ack-round",
@@ -1427,7 +1432,10 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(payload["acceptance"], "exact-check exits 0")
         self.assertEqual(payload["contract_hash"], started["contract_hash"])
         self.assertEqual(payload["contract_path"], started["contract_path"])
-        self.assertEqual(payload["contract_text"], f"[轮次] round_id={started['round_id']}\n" + body)
+        self.assertEqual(
+            payload["contract_text"],
+            f"[轮次] round_id={started['round_id']}\n" + body + "[环境] local lightweight test only\n",
+        )
 
         query_only = self.invoke(
             "check-round", "--round-id", started["round_id"], "--pane", "w1:p2",
@@ -1720,6 +1728,336 @@ class PairctlTest(unittest.TestCase):
         res2 = self.invoke("status")
         self.assertEqual(res2.returncode, 2)
         self.assertEqual((self.state / "state.json").read_text(encoding="utf-8"), "invalid json {{{")
+
+    # --- issue 2: planner context budget, recovery, snapshots, and lint ------------
+
+    def note_transcript(self, session_id: str, entries: list[dict], *, kind: str = "claude") -> Path:
+        transcript = self.root / f"{session_id}.jsonl"
+        transcript.write_text(
+            "\n".join(json.dumps(entry) for entry in entries) + "\n", encoding="utf-8"
+        )
+        self.invoke_ok(
+            "note-session", "--session-id", session_id, "--transcript-path", str(transcript),
+            "--kind", kind, "--source", "startup",
+        )
+        return transcript
+
+    def test_context_usage_last_real_assistant_budget_stale_and_unknown(self) -> None:
+        old = "2026-01-01T00:00:00+00:00"
+        self.note_transcript("session-a", [
+            {"sessionId": "session-a", "timestamp": old, "message": {"role": "user"}},
+            {"sessionId": "session-a", "timestamp": old, "message": {
+                "role": "assistant", "usage": {"input_tokens": 10, "cache_creation_input_tokens": 20, "cache_read_input_tokens": 30}
+            }},
+            {"sessionId": "session-a", "timestamp": old, "message": {
+                "role": "assistant", "model": "<synthetic>",
+                "usage": {"input_tokens": 900, "cache_creation_input_tokens": 900, "cache_read_input_tokens": 900}
+            }},
+            {"sessionId": "session-a", "timestamp": old, "message": {
+                "role": "assistant", "usage": {"input_tokens": 40, "cache_creation_input_tokens": 50, "cache_read_input_tokens": 60}
+            }},
+        ])
+        usage = self.invoke_ok("context-usage", "--budget", "100")
+        self.assertEqual(usage["context_tokens"], 150)
+        self.assertTrue(usage["over_budget"])
+        self.assertTrue(usage["stale"])
+
+        self.invoke_ok(
+            "note-session", "--session-id", "other", "--transcript-path", str(self.root / "session-a.jsonl"),
+            "--kind", "claude", "--source", "resume",
+        )
+        mismatch = self.invoke_ok("context-usage")
+        self.assertEqual(mismatch["status"], "unknown")
+        self.assertIsNone(mismatch["context_tokens"])
+        self.invoke_ok(
+            "note-session", "--session-id", "session-a", "--kind", "cursor", "--source", "startup",
+        )
+        non_claude = self.invoke_ok("context-usage")
+        self.assertEqual(non_claude["status"], "unknown")
+        self.assertIsNone(non_claude["context_tokens"])
+
+    def test_budget_priority_init_queue_and_dispatch_gate(self) -> None:
+        stamp = "2026-09-21T00:00:00+00:00"
+        self.note_transcript("session-a", [{
+            "sessionId": "session-a", "timestamp": stamp,
+            "message": {"role": "assistant", "usage": {
+                "input_tokens": 100, "cache_creation_input_tokens": 100, "cache_read_input_tokens": 100,
+            }},
+        }])
+        self.set_kind("claude")
+        queued = self.invoke_ok(
+            "init", "--planner-pane", "w1:p1", "--context-budget", "200",
+            extra_env={"PAIRCTL_CONTEXT_BUDGET": "250"},
+        )
+        self.assertEqual(queued["status"], "CONTEXT_COMPACT_QUEUED")
+        self.assertEqual(queued["context_usage"]["budget"], 200)
+        blocked = self.invoke(
+            "start-round", "--file", str(self.write_handoff("queued.md", "# queued\n")),
+            "--executor", "w1:p2", "--scope", "x", "--acceptance", "y",
+        )
+        self.assertEqual(blocked.returncode, 20)
+        self.assertEqual(json.loads(blocked.stdout)["status"], "CONTEXT_COMPACT_QUEUED")
+
+    def test_post_dispatch_compact_active_hook_recovery_preserves_round(self) -> None:
+        xdg = self.root / "xdg-active"
+        env = {"XDG_STATE_HOME": str(xdg), "PAIRCTL_CONTINUE_AFTER_COMPACT": "0"}
+        transcript = self.root / "active.jsonl"
+        transcript.write_text(json.dumps({
+            "sessionId": "active-session", "timestamp": "2026-09-21T00:00:00+00:00",
+            "message": {"role": "assistant", "usage": {
+                "input_tokens": 100000, "cache_creation_input_tokens": 30000,
+                "cache_read_input_tokens": 30000,
+            }},
+        }) + "\n", encoding="utf-8")
+        self.run_hook({
+            "session_id": "active-session", "source": "startup", "cwd": str(self.cwd),
+            "transcript_path": str(transcript),
+        }, xdg)
+        self.invoke_ok(
+            "init", "--planner-pane", "w1:p1", "--session-id", "active-session",
+            "--no-context-check", "--goal", "G" * 20000, use_state_dir=False, extra_env=env,
+        )
+        report = self.cwd / "reports" / "round-report.md"
+        handoff = self.write_handoff(
+            "active-handoff.md",
+            "# Active\n[可以新建] reports/round-report.md\n[报告] reports/round-report.md\n",
+        )
+        sent = self.invoke_ok(
+            "send-round", "--target", "w1:p2", "--file", str(handoff), "--no-fresh",
+            "--executor", "w1:p2", "--scope", "reports/round-report.md", "--acceptance", "report",
+            use_state_dir=False, extra_env=env,
+        )
+        self.assertTrue(sent["planner_compact"]["queued"])
+        for action in ("accept", "start"):
+            self.invoke_ok(
+                "ack-round", "--round-id", sent["round_id"], "--revision", "1",
+                "--pane", "w1:p2", "--scope", "reports/round-report.md",
+                "--contract-hash", sent["contract_hash"], "--action", action,
+                use_state_dir=False, extra_env=env,
+            )
+        report.parent.mkdir()
+        report.write_text("done\n", encoding="utf-8")
+        hook = self.run_hook({
+            "session_id": "active-session", "source": "compact", "cwd": str(self.cwd),
+            "transcript_path": str(transcript),
+        }, xdg)
+        context = json.loads(hook.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("Full checkpoint:", context)
+        self.assertLess(len(context), 16000)
+        self.assertIn("CHECKPOINT.md", context)
+        status = json.loads(self.invoke("status", use_state_dir=False, extra_env=env).stdout)
+        self.assertEqual(status["active_rounds"], [sent["round_id"]])
+        self.assertEqual(status["phase_round_count"], 1)
+        self.assertEqual(status["compaction_epoch"], 1)
+        self.assertEqual(status["report"], str(report))
+        checked = self.invoke_ok(
+            "check-round", "--round-id", sent["round_id"], "--pane", "w1:p2", "--revision", "1",
+            use_state_dir=False, extra_env=env,
+        )
+        self.assertTrue(checked["allowed"])
+
+    def test_finish_evidence_report_and_checkpoint_decisions(self) -> None:
+        report = self.cwd / "report.md"
+        started = self.invoke_ok(
+            "start-round", "--file", str(self.write_handoff(
+                "evidence.md", "# Evidence\n[可以新建] report.md\n[报告] report.md\n"
+            )), "--executor", "w1:p2", "--scope", "report.md", "--acceptance", "review",
+        )
+        before = (self.state / "state.json").read_bytes()
+        missing = self.invoke("finish-round", "--round-id", started["round_id"], "--status", "accepted")
+        self.assertEqual(json.loads(missing.stdout)["reason"], "missing_acceptance_evidence")
+        self.assertEqual((self.state / "state.json").read_bytes(), before)
+        absent = self.invoke(
+            "finish-round", "--round-id", started["round_id"], "--status", "accepted",
+            "--artifacts", "a", "--notes", "n", "--report", str(report),
+        )
+        self.assertEqual(json.loads(absent.stdout)["reason"], "report_missing")
+        report.write_text("ok\n", encoding="utf-8")
+        self.invoke_ok("note", "--text", "scope confirmed")
+        self.invoke_ok(
+            "finish-round", "--round-id", started["round_id"], "--status", "accepted",
+            "--artifacts", "artifact-a", "--notes", "verified-a", "--report", str(report),
+        )
+        checkpoint = (self.state / "CHECKPOINT.md").read_text(encoding="utf-8")
+        for value in ("Goal", "Context usage", "Revision", "Contract", "Report", "Snapshot", "artifact-a", "verified-a", "scope confirmed"):
+            self.assertIn(value, checkpoint)
+
+    def test_snapshot_diff_tracks_changed_added_removed_and_missing(self) -> None:
+        tracked = self.cwd / "tracked.txt"
+        tracked.write_text("one\n", encoding="utf-8")
+        directory = self.cwd / "tree"
+        directory.mkdir()
+        (directory / "old.txt").write_text("old\n", encoding="utf-8")
+        handoff = self.write_handoff(
+            "snapshot.md",
+            "# Snapshot\n[可以改] tracked.txt, tree\n[只读输入] missing-input.txt\n[可以新建] new.txt\n",
+        )
+        started = self.invoke_ok(
+            "start-round", "--file", str(handoff), "--executor", "w1:p2",
+            "--scope", "tracked.txt", "--acceptance", "diff",
+        )
+        manifest = json.loads(Path(started["snapshot"]["manifest"]).read_text(encoding="utf-8"))
+        by_path = {item["path"]: item for item in manifest}
+        self.assertEqual(by_path["tracked.txt"]["sha256"], hashlib.sha256(b"one\n").hexdigest())
+        self.assertFalse(by_path["new.txt"]["exists"])
+        clean = self.invoke("diff-round", "--round-id", started["round_id"])
+        self.assertEqual(clean.returncode, 0, clean.stdout)
+        tracked.write_text("two\n", encoding="utf-8")
+        (directory / "old.txt").unlink()
+        (directory / "added.txt").write_text("new\n", encoding="utf-8")
+        (self.cwd / "new.txt").write_text("created\n", encoding="utf-8")
+        changed = self.invoke("diff-round", "--round-id", started["round_id"])
+        self.assertEqual(changed.returncode, 1)
+        payload = json.loads(changed.stdout)
+        self.assertIn("tracked.txt", payload["changed"])
+        self.assertIn("tree/old.txt", payload["removed"])
+        self.assertIn("tree/added.txt", payload["added"])
+        self.assertIn("new.txt", payload["added"])
+
+    def test_handoff_lint_rules_and_skip_reason(self) -> None:
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        (self.cwd / "子 目录").mkdir()
+        (self.cwd / "子 目录" / "未跟踪.txt").write_text("u\n", encoding="utf-8")
+        cases = {
+            "env_block_missing": "# no environment\n",
+            "tmp_path": "# bad /tmp/cache\n[环境] local\n",
+            "fence_overlap": "[可以改] tests\n[可以新建] tests/x.py\n[环境] local\n",
+            "untracked_conflict": "[可以改] 子 目录\n[不许动] 任何未跟踪文件\n[环境] local\n",
+        }
+        for index, (rule, body) in enumerate(cases.items()):
+            path = self.cwd / f"lint-{index}.md"
+            path.write_text(body, encoding="utf-8")
+            rejected = self.invoke(
+                "start-round", "--file", str(path), "--executor", "w1:p2",
+                "--scope", "x", "--acceptance", "y",
+            )
+            self.assertEqual(rejected.returncode, 2, rejected.stdout + rejected.stderr)
+            self.assertIn(rule, [item["rule"] for item in json.loads(rejected.stdout)["findings"]])
+            self.assertEqual(self.read_state()["phase_round_count"], 0)
+            self.assertIsNone(self.read_state()["pending_dispatch"])
+        valid = self.cwd / "valid.md"
+        valid.write_text("[可以改] tracked.txt\n[可以新建] output.txt\n[不许动] docs\n[环境] local\n", encoding="utf-8")
+        passed = self.invoke_ok(
+            "start-round", "--file", str(valid), "--executor", "w1:p2",
+            "--scope", "tracked.txt", "--acceptance", "y",
+        )
+        self.assertEqual(passed["round_id"], "p01-r001")
+
+        # A separate state proves --skip-lint records its explicit reason.
+        second_state = self.root / "skip-state"
+        init = subprocess.run(
+            ["python3", str(SCRIPT), "init", "--cwd", str(self.cwd), "--state-dir", str(second_state)],
+            text=True, capture_output=True, check=False, env={**os.environ, "PAIRCTL_HERDR": str(self.herdr)},
+        )
+        self.assertEqual(init.returncode, 0, init.stderr)
+        skipped = subprocess.run(
+            ["python3", str(SCRIPT), "start-round", "--cwd", str(self.cwd), "--state-dir", str(second_state),
+             "--file", str(self.cwd / "lint-0.md"), "--executor", "w1:p2", "--scope", "x",
+             "--acceptance", "y", "--skip-lint", "legacy fixture"],
+            text=True, capture_output=True, check=False, env={**os.environ, "PAIRCTL_HERDR": str(self.herdr)},
+        )
+        self.assertEqual(skipped.returncode, 0, skipped.stderr + skipped.stdout)
+        state = json.loads((second_state / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["rounds"][0]["skip_lint"], "legacy fixture")
+
+    def test_hook_notes_all_sources_before_init_missing_fields_are_silent(self) -> None:
+        xdg = self.root / "xdg-sources"
+        transcript = self.root / "source.jsonl"
+        transcript.write_text("{}\n", encoding="utf-8")
+        key = hashlib.sha256(str(self.cwd.resolve()).encode()).hexdigest()[:20]
+        record = xdg / "herdr-pair" / key / "planner-session.json"
+        for source in ("startup", "resume", "compact", "clear"):
+            hook = self.run_hook({
+                "session_id": f"sess-{source}", "source": source, "cwd": str(self.cwd),
+                "transcript_path": str(transcript),
+            }, xdg)
+            self.assertEqual(hook.returncode, 0)
+            self.assertEqual(hook.stdout, "")
+            saved = json.loads(record.read_text(encoding="utf-8"))
+            self.assertEqual(saved["session_id"], f"sess-{source}")
+            self.assertEqual(saved["source"], source)
+        before = record.read_bytes()
+        for payload in ({"source": "startup", "cwd": str(self.cwd)}, {"session_id": "x", "cwd": str(self.cwd)}, {"session_id": "x", "source": "startup"}):
+            hook = self.run_hook(payload, xdg)
+            self.assertEqual(hook.returncode, 0)
+            self.assertEqual(hook.stdout, "")
+            self.assertEqual(record.read_bytes(), before)
+
+    def test_context_usage_derived_locator_and_invalid_latest_usage(self) -> None:
+        fake_home = self.root / "home"
+        encoded = re.sub(r"[^A-Za-z0-9-]", "-", str(self.cwd.resolve()))
+        project = fake_home / ".claude" / "projects" / encoded
+        project.mkdir(parents=True)
+        transcript = project / "derived-session.jsonl"
+        transcript.write_text("\n".join([
+            json.dumps({"sessionId": "derived-session", "timestamp": "2026-09-21T00:00:00Z", "type": "assistant", "message": {"usage": {"input_tokens": 1, "cache_creation_input_tokens": 2, "cache_read_input_tokens": 3}}}),
+            json.dumps({"sessionId": "derived-session", "timestamp": "2026-09-21T00:01:00Z", "type": "assistant", "message": {"usage": {"input_tokens": 9}}}),
+        ]) + "\n", encoding="utf-8")
+        env = {"HOME": str(fake_home)}
+        self.invoke_ok(
+            "note-session", "--session-id", "derived-session", "--kind", "claude", "--source", "resume",
+            extra_env=env,
+        )
+        invalid = self.invoke_ok("context-usage", extra_env=env)
+        self.assertEqual(invalid["status"], "unknown")
+        self.assertIsNone(invalid["context_tokens"])
+        lines = transcript.read_text(encoding="utf-8").splitlines()
+        transcript.write_text(lines[0] + "\n", encoding="utf-8")
+        derived = self.invoke_ok("context-usage", extra_env=env)
+        self.assertEqual(derived["status"], "ok")
+        self.assertEqual(derived["source"], "derived")
+        self.assertEqual(derived["context_tokens"], 6)
+
+    def test_pending_unknown_and_disabled_never_auto_compact(self) -> None:
+        self.note_transcript("session-a", [{
+            "sessionId": "session-a", "timestamp": "2026-09-21T00:00:00Z",
+            "message": {"role": "assistant", "usage": {"input_tokens": 200000, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}},
+        }])
+        self.set_herdr_mode("stalled")
+        self.clear_calls()
+        pending = self.invoke(
+            "send-round", "--target", "w1:p2", "--file", str(self.write_handoff("pending-budget.md", "# Pending\n")),
+            "--no-fresh",
+        )
+        self.assertEqual(pending.returncode, 2)
+        self.assertFalse(any(call[:3] == ["agent", "prompt", "w1:p1"] for call in self.herdr_calls()))
+
+        self.invoke_ok("resolve-pending", "--outcome", "not-delivered")
+        self.set_herdr_mode("ok")
+        self.invoke_ok("init", "--no-auto-compact", "--no-context-check")
+        disabled = self.send_round(1)
+        self.assertNotIn("planner_compact", disabled)
+
+    def test_stale_only_init_queues_compaction(self) -> None:
+        self.note_transcript("session-a", [{
+            "sessionId": "session-a", "timestamp": "2020-01-01T00:00:00Z",
+            "message": {"role": "assistant", "usage": {"input_tokens": 1, "cache_creation_input_tokens": 2, "cache_read_input_tokens": 3}},
+        }])
+        queued = self.invoke_ok("init", "--planner-pane", "w1:p1", "--context-budget", "999999")
+        self.assertEqual(queued["status"], "CONTEXT_COMPACT_QUEUED")
+        self.assertFalse(queued["context_usage"]["over_budget"])
+        self.assertTrue(queued["context_usage"]["stale"])
+
+    def test_snapshot_large_hash_only_and_manifest_name_collision(self) -> None:
+        large = self.cwd / "large.bin"
+        with large.open("wb") as handle:
+            handle.truncate(50 * 1024 * 1024 + 1)
+        source_manifest = self.cwd / "manifest.json"
+        source_manifest.write_text('{"source": true}\n', encoding="utf-8")
+        handoff = self.write_handoff(
+            "snapshot-large.md", "# Large\n[只读输入] large.bin, manifest.json\n"
+        )
+        started = self.invoke_ok(
+            "start-round", "--file", str(handoff), "--executor", "w1:p2",
+            "--scope", "none", "--acceptance", "snapshot",
+        )
+        snapshot = started["snapshot"]
+        metadata = Path(snapshot["manifest"])
+        records = {item["path"]: item for item in json.loads(metadata.read_text(encoding="utf-8"))}
+        self.assertFalse(records["large.bin"]["copied"])
+        self.assertTrue(records["large.bin"]["sha256"])
+        self.assertTrue((metadata.parent / "files" / "manifest.json").is_file())
+        self.assertIsInstance(json.loads(metadata.read_text(encoding="utf-8")), list)
 
 
 if __name__ == "__main__":
