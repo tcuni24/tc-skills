@@ -2,7 +2,6 @@
 
 import datetime as dt
 import json
-import os
 from pathlib import Path
 import subprocess
 import unittest
@@ -17,6 +16,40 @@ class ContextEdgesTest(unittest.TestCase):
 
     def tearDown(self):
         self.h.tearDown()
+
+    def test_unknown_pane_preserves_planner_session(self):
+        h = self.h
+        for has_state, recorded_pane in ((True, None), (True, ""), (True, "w1:p1"), (False, "w1:p1")):
+            with self.subTest(has_state=has_state, recorded_pane=recorded_pane):
+                h.state = h.root / f"state-{has_state}-{recorded_pane}"
+                if has_state:
+                    h.invoke_ok("init", "--planner-pane", "w1:p1", "--no-context-check")
+                if recorded_pane is not None:
+                    h.invoke_ok("note-session", "--session-id", "planner", "--kind", "claude",
+                                "--source", "startup", "--pane", "w1:p1")
+                    if not recorded_pane:
+                        record = h.state / "planner-session.json"
+                        data = json.loads(record.read_text())
+                        data["pane"] = ""  # A legacy record written before pane tracking.
+                        record.write_text(json.dumps(data))
+                files = [h.state / name for name in ("state.json", "planner-session.json")]
+                before = [path.read_bytes() if path.exists() else None for path in files]
+                result = h.invoke_ok("note-session", "--session-id", "unrelated", "--kind", "claude",
+                                     "--source", "startup", "--pane", "")
+                self.assertEqual(result, {"status": "session_ignored", "reason": "pane_unknown"})
+                self.assertEqual(before, [path.read_bytes() if path.exists() else None for path in files])
+
+    def test_unknown_pane_can_record_before_init(self):
+        h = self.h
+        h.state = h.root / "before-init"
+        for session_id in ("first", "resumed"):
+            result = h.invoke_ok("note-session", "--session-id", session_id, "--kind", "claude",
+                                 "--source", "startup", "--pane", "")
+            self.assertEqual(result["status"], "session_noted")
+            record = json.loads((h.state / "planner-session.json").read_text())
+            self.assertEqual(record["session_id"], session_id)
+            self.assertEqual(record["pane"], "")
+        self.assertFalse((h.state / "state.json").exists())
 
     def test_large_checkpoint_keeps_resume_and_full_path_without_body(self):
         h = self.h
@@ -37,7 +70,7 @@ class ContextEdgesTest(unittest.TestCase):
         self.assertIn("Full checkpoint: " + str(Path(initialized["state_root"]) / "CHECKPOINT.md"), context)
         self.assertNotIn("DECISION_BODY_NOT_INJECTED", context)
 
-    def test_executor_hook_does_not_record_or_rollover_planner(self):
+    def test_executor_or_unknown_pane_hook_does_not_record_or_rollover_planner(self):
         h = self.h
         xdg = h.root / "xdg"
         env = {"XDG_STATE_HOME": str(xdg)}
@@ -48,15 +81,13 @@ class ContextEdgesTest(unittest.TestCase):
         h.invoke_ok("compact-self", use_state_dir=False, extra_env=env)
         root = Path(initialized["state_root"])
         before = [(root / filename).read_bytes() for filename in ("state.json", "planner-session.json")]
-        hook = subprocess.run(
-            ["python3", str(support.HOOK)],
-            input=json.dumps({"cwd": str(h.cwd), "session_id": "executor", "source": "compact"}),
-            text=True, capture_output=True, check=False,
-            env={**os.environ, **env, "HERDR_PANE_ID": "w1:p2", "PAIRCTL_HERDR": str(h.herdr)},
-        )
-        self.assertEqual(hook.returncode, 0, hook.stderr)
-        self.assertEqual(hook.stdout, "")
-        self.assertEqual(before, [(root / filename).read_bytes() for filename in ("state.json", "planner-session.json")])
+        for pane in ("w1:p2", ""):
+            with self.subTest(pane=pane):
+                hook = h.run_hook({"cwd": str(h.cwd), "session_id": "unrelated", "source": "compact"},
+                                  xdg, pane=pane)
+                self.assertEqual(hook.returncode, 0, hook.stderr)
+                self.assertEqual(hook.stdout, "")
+                self.assertEqual(before, [(root / filename).read_bytes() for filename in ("state.json", "planner-session.json")])
 
     def test_nested_unicode_untracked_and_root_fence_fail_before_send(self):
         h = self.h
@@ -93,7 +124,7 @@ class ContextEdgesTest(unittest.TestCase):
             }},
         }) + "\n", encoding="utf-8")
         h.invoke_ok("note-session", "--session-id", "session-a", "--transcript-path", str(transcript),
-                    "--kind", "claude", "--source", "startup")
+                    "--kind", "claude", "--source", "startup", "--pane", "w1:p1")
         source = h.cwd / "input.txt"
         source.write_text("before dispatch\n", encoding="utf-8")
         handoff = h.write_handoff("active.md", "[可以改] input.txt\n[可以新建] report.md\n[报告] report.md\n")

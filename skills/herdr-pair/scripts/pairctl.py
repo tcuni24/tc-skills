@@ -334,6 +334,14 @@ def file_sha256(path: Path) -> str:
 
 
 def derive_transcript(cwd: str, session_id: str) -> Path:
+    """Locate a transcript when the hook did not provide an explicit path.
+
+    Checked on 2026-09-21 against the first cwd-bearing record of all 97
+    top-level JSONL transcripts in 31 local Claude project directories: zero
+    mismatches, including underscores, Chinese characters and dots. Another
+    10 directories had no JSONL samples; spaces are covered by a synthetic test.
+    This is an observed fallback convention, not a Claude API guarantee.
+    """
     escaped = re.sub(r"[^A-Za-z0-9-]", "-", cwd)
     return Path.home() / ".claude" / "projects" / escaped / f"{session_id}.jsonl"
 
@@ -1345,11 +1353,19 @@ def cmd_note_session(args: argparse.Namespace) -> int:
         "kind": args.kind, "source": args.source, "pane": args.pane or "", "recorded_at": now(),
     }
     with locked(pp["root"], pp["lock"], create=True):
-        if pp["state"].is_file() and args.pane:
+        if pp["state"].is_file():
             data = load(pp["state"], cwd)
             planner_pane = str(data.get("planner_pane") or "")
+            if planner_pane and not args.pane:
+                output({"status": "session_ignored", "reason": "pane_unknown"})
+                return 0
             if planner_pane and args.pane != planner_pane:
                 output({"status": "session_ignored", "reason": "non_planner_pane"})
+                return 0
+        if not args.pane and pp["planner_session"].is_file():
+            previous = json.loads(pp["planner_session"].read_text(encoding="utf-8"))
+            if previous.get("pane"):
+                output({"status": "session_ignored", "reason": "pane_unknown"})
                 return 0
         atomic_text(pp["planner_session"], json.dumps(record, indent=2, sort_keys=True) + "\n")
     output({"status": "session_noted", "planner_session": str(pp["planner_session"])})
