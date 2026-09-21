@@ -1,0 +1,5 @@
+Command: python3 -m pytest skills/herdr-pair/tests -q -p no:cacheprovider --basetemp /public/scripts/tc-skills/analysis/issue-2-implementation/pytest-integrated
+..................................................................   [100%]
+66 passed, 4 subtests passed in 30.22s
+
+Exit: 0

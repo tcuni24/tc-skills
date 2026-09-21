@@ -1,0 +1,234 @@
+{
+  "whole": {
+    "calls": 716,
+    "input_tokens": 1432,
+    "cache_creation_input_tokens": 23193543,
+    "cache_read_input_tokens": 250055955,
+    "output_tokens": 731365,
+    "thinking_tokens": 210581,
+    "context_min": 22263,
+    "context_median": 334819.0,
+    "context_max": 978771
+  },
+  "before_pair_request": {
+    "calls": 287,
+    "input_tokens": 574,
+    "cache_creation_input_tokens": 3265559,
+    "cache_read_input_tokens": 71515317,
+    "output_tokens": 307736,
+    "thinking_tokens": 84456,
+    "context_min": 22263,
+    "context_median": 256625,
+    "context_max": 538908
+  },
+  "pair_request_through_push": {
+    "calls": 413,
+    "input_tokens": 826,
+    "cache_creation_input_tokens": 19112381,
+    "cache_read_input_tokens": 172841154,
+    "output_tokens": 415888,
+    "thinking_tokens": 124281,
+    "context_min": 67827,
+    "context_median": 381742,
+    "context_max": 978771
+  },
+  "pair_phase1": {
+    "calls": 187,
+    "input_tokens": 374,
+    "cache_creation_input_tokens": 16474345,
+    "cache_read_input_tokens": 125461971,
+    "output_tokens": 244502,
+    "thinking_tokens": 70190,
+    "context_min": 540258,
+    "context_median": 729376,
+    "context_max": 978771
+  },
+  "phase2": {
+    "calls": 204,
+    "input_tokens": 408,
+    "cache_creation_input_tokens": 2237821,
+    "cache_read_input_tokens": 39169967,
+    "output_tokens": 157311,
+    "thinking_tokens": 50373,
+    "context_min": 67827,
+    "context_median": 185482.5,
+    "context_max": 378656
+  },
+  "close_and_push": {
+    "calls": 22,
+    "input_tokens": 44,
+    "cache_creation_input_tokens": 400215,
+    "cache_read_input_tokens": 8209216,
+    "output_tokens": 14075,
+    "thinking_tokens": 3718,
+    "context_min": 379733,
+    "context_median": 392274.5,
+    "context_max": 400217
+  },
+  "post_work_export": {
+    "calls": 16,
+    "input_tokens": 32,
+    "cache_creation_input_tokens": 815603,
+    "cache_read_input_tokens": 5699484,
+    "output_tokens": 7741,
+    "thinking_tokens": 1844,
+    "context_min": 400926,
+    "context_median": 407659.5,
+    "context_max": 411951
+  },
+  "source": {
+    "path": "/public/log/hyf/session-63ae5e07-20260921.jsonl",
+    "sha256": "d9b5c30c2513e7165c59075d11cd7d83d941e6029b4785a282a3f4c18a203259",
+    "lines": 4813
+  },
+  "method": "Unique message.id; identical usage across blocks asserted. Exclude synthetic. Windows are line ranges, not causal task attribution. thinking_tokens are a subset of output, never added again.",
+  "naive_block_sum": {
+    "input_tokens": 2902,
+    "cache_creation_input_tokens": 58840794,
+    "cache_read_input_tokens": 485285394,
+    "output_tokens": 1691891
+  },
+  "cache_creation": {
+    "ephemeral_1h_input_tokens": 0,
+    "ephemeral_5m_input_tokens": 23193543
+  },
+  "round6_pre_dispatch_window": {
+    "calls": 79,
+    "input_tokens": 158,
+    "cache_creation_input_tokens": 149803,
+    "cache_read_input_tokens": 9411967,
+    "output_tokens": 54271,
+    "thinking_tokens": 18485,
+    "context_min": 67827,
+    "context_median": 124554,
+    "context_max": 164466
+  },
+  "round9_window": {
+    "calls": 15,
+    "input_tokens": 30,
+    "cache_creation_input_tokens": 748630,
+    "cache_read_input_tokens": 4809517,
+    "output_tokens": 14809,
+    "thinking_tokens": 3915,
+    "context_min": 358748,
+    "context_median": 369978,
+    "context_max": 378656
+  },
+  "handoff_initial_write_calls": {
+    "calls": 9,
+    "input_tokens": 18,
+    "cache_creation_input_tokens": 11022,
+    "cache_read_input_tokens": 4849258,
+    "output_tokens": 50906,
+    "thinking_tokens": 6068,
+    "context_min": 141331,
+    "context_median": 581789,
+    "context_max": 950737,
+    "note": "Whole-call output includes thinking and companion text, not just handoff text; excludes later edits."
+  },
+  "phase1_large_cache_writes": {
+    "calls": 22,
+    "input_tokens": 44,
+    "cache_creation_input_tokens": 16083972,
+    "cache_read_input_tokens": 11688,
+    "output_tokens": 37204,
+    "thinking_tokens": 17252,
+    "context_min": 540258,
+    "context_median": 673452.0,
+    "context_max": 968045
+  },
+  "by_date": {
+    "UTC": {
+      "2026-09-17": {
+        "calls": 136,
+        "input_tokens": 272,
+        "cache_creation_input_tokens": 1202143,
+        "cache_read_input_tokens": 12562998,
+        "output_tokens": 132260,
+        "thinking_tokens": 49028,
+        "context_min": 22263,
+        "context_median": 91647.0,
+        "context_max": 226368
+      },
+      "2026-09-18": {
+        "calls": 210,
+        "input_tokens": 420,
+        "cache_creation_input_tokens": 8404035,
+        "cache_read_input_tokens": 89097887,
+        "output_tokens": 250378,
+        "thinking_tokens": 59898,
+        "context_min": 239543,
+        "context_median": 455484.0,
+        "context_max": 667839
+      },
+      "2026-09-20": {
+        "calls": 279,
+        "input_tokens": 558,
+        "cache_creation_input_tokens": 11014883,
+        "cache_read_input_tokens": 118862330,
+        "output_tokens": 283470,
+        "thinking_tokens": 82991,
+        "context_min": 67827,
+        "context_median": 246707,
+        "context_max": 978771
+      },
+      "2026-09-21": {
+        "calls": 91,
+        "input_tokens": 182,
+        "cache_creation_input_tokens": 2572482,
+        "cache_read_input_tokens": 29532740,
+        "output_tokens": 65257,
+        "thinking_tokens": 18664,
+        "context_min": 258915,
+        "context_median": 369978,
+        "context_max": 411951
+      }
+    },
+    "Asia/Shanghai": {
+      "2026-09-17": {
+        "calls": 136,
+        "input_tokens": 272,
+        "cache_creation_input_tokens": 1202143,
+        "cache_read_input_tokens": 12562998,
+        "output_tokens": 132260,
+        "thinking_tokens": 49028,
+        "context_min": 22263,
+        "context_median": 91647.0,
+        "context_max": 226368
+      },
+      "2026-09-18": {
+        "calls": 210,
+        "input_tokens": 420,
+        "cache_creation_input_tokens": 8404035,
+        "cache_read_input_tokens": 89097887,
+        "output_tokens": 250378,
+        "thinking_tokens": 59898,
+        "context_min": 239543,
+        "context_median": 455484.0,
+        "context_max": 667839
+      },
+      "2026-09-20": {
+        "calls": 262,
+        "input_tokens": 524,
+        "cache_creation_input_tokens": 10757405,
+        "cache_read_input_tokens": 114889122,
+        "output_tokens": 270906,
+        "thinking_tokens": 79678,
+        "context_min": 67827,
+        "context_median": 227224.0,
+        "context_max": 978771
+      },
+      "2026-09-21": {
+        "calls": 108,
+        "input_tokens": 216,
+        "cache_creation_input_tokens": 2829960,
+        "cache_read_input_tokens": 33505948,
+        "output_tokens": 77821,
+        "thinking_tokens": 21977,
+        "context_min": 234553,
+        "context_median": 335511.0,
+        "context_max": 411951
+      }
+    }
+  }
+}

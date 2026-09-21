@@ -1,0 +1,155 @@
+{
+  "method": "Full rebuild = cache_creation > 90% of that call's context. Gap = seconds since the previous deduplicated call in line order. Rates are matched-bill fee / tokens per category; phase 1 on 2026-09-18 is not billed, so its estimate is an extrapolation. Counterfactual cap keeps the same call sequence and only clamps read/rebuild context to CAP.",
+  "rates_per_million": {
+    "input_tokens": 5.0,
+    "cache_creation_input_tokens": 6.249999540013829,
+    "cache_read_input_tokens": 0.49999993261231657,
+    "output_tokens": 25.0
+  },
+  "gap_buckets_overall": {
+    "<=2min": {
+      "calls": 629,
+      "full_rebuilds": 0
+    },
+    ">5min": {
+      "calls": 49,
+      "full_rebuilds": 46
+    },
+    "2-5min": {
+      "calls": 37,
+      "full_rebuilds": 0
+    }
+  },
+  "gap_buckets_by_window": {
+    "before_pair_request|2-5min": {
+      "calls": 10,
+      "full_rebuilds": 0,
+      "cache_creation_tokens": 47533
+    },
+    "before_pair_request|<=2min": {
+      "calls": 261,
+      "full_rebuilds": 0,
+      "cache_creation_tokens": 385130
+    },
+    "before_pair_request|>5min": {
+      "calls": 15,
+      "full_rebuilds": 14,
+      "cache_creation_tokens": 2810635
+    },
+    "close_and_push|2-5min": {
+      "calls": 1,
+      "full_rebuilds": 0,
+      "cache_creation_tokens": 1998
+    },
+    "close_and_push|<=2min": {
+      "calls": 20,
+      "full_rebuilds": 0,
+      "cache_creation_tokens": 18486
+    },
+    "close_and_push|>5min": {
+      "calls": 1,
+      "full_rebuilds": 1,
+      "cache_creation_tokens": 379731
+    },
+    "pair_phase1|2-5min": {
+      "calls": 18,
+      "full_rebuilds": 0,
+      "cache_creation_tokens": 43813
+    },
+    "pair_phase1|<=2min": {
+      "calls": 146,
+      "full_rebuilds": 0,
+      "cache_creation_tokens": 346488
+    },
+    "pair_phase1|>5min": {
+      "calls": 23,
+      "full_rebuilds": 22,
+      "cache_creation_tokens": 16084044
+    },
+    "phase2|2-5min": {
+      "calls": 7,
+      "full_rebuilds": 0,
+      "cache_creation_tokens": 62696
+    },
+    "phase2|<=2min": {
+      "calls": 189,
+      "full_rebuilds": 0,
+      "cache_creation_tokens": 245912
+    },
+    "phase2|>5min": {
+      "calls": 8,
+      "full_rebuilds": 7,
+      "cache_creation_tokens": 1929213
+    },
+    "post_work_export|2-5min": {
+      "calls": 1,
+      "full_rebuilds": 0,
+      "cache_creation_tokens": 499
+    },
+    "post_work_export|<=2min": {
+      "calls": 13,
+      "full_rebuilds": 0,
+      "cache_creation_tokens": 9418
+    },
+    "post_work_export|>5min": {
+      "calls": 2,
+      "full_rebuilds": 2,
+      "cache_creation_tokens": 805686
+    }
+  },
+  "per_window": {
+    "before_pair_request": {
+      "calls": 287,
+      "estimated_total": 63.86,
+      "estimated_full_rebuild_creation": 17.7,
+      "estimated_cache_read": 35.76,
+      "estimated_output": 7.69,
+      "full_rebuild_calls": 15,
+      "estimated_if_context_capped": 38.68
+    },
+    "pair_phase1": {
+      "calls": 187,
+      "estimated_total": 171.81,
+      "estimated_full_rebuild_creation": 100.52,
+      "estimated_cache_read": 62.73,
+      "estimated_output": 6.11,
+      "full_rebuild_calls": 22,
+      "estimated_if_context_capped": 41.56
+    },
+    "phase2": {
+      "calls": 204,
+      "estimated_total": 37.51,
+      "estimated_full_rebuild_creation": 12.05,
+      "estimated_cache_read": 19.58,
+      "estimated_output": 3.93,
+      "full_rebuild_calls": 7,
+      "estimated_if_context_capped": 25.93
+    },
+    "close_and_push": {
+      "calls": 22,
+      "estimated_total": 6.96,
+      "estimated_full_rebuild_creation": 2.37,
+      "estimated_cache_read": 4.1,
+      "estimated_output": 0.35,
+      "full_rebuild_calls": 1,
+      "estimated_if_context_capped": 2.99
+    },
+    "post_work_export": {
+      "calls": 16,
+      "estimated_total": 8.14,
+      "estimated_full_rebuild_creation": 5.04,
+      "estimated_cache_read": 2.85,
+      "estimated_output": 0.19,
+      "full_rebuild_calls": 2,
+      "estimated_if_context_capped": 3.18
+    }
+  },
+  "pre_pair_attribution_phase1": {
+    "context_tokens": 540258,
+    "rebuild_cost_attributable": 74.29,
+    "read_cost_attributable": 44.58,
+    "total_attributable": 118.87,
+    "share_of_phase1_estimate": 0.692
+  },
+  "counterfactual_cap": 150000
+}

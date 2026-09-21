@@ -1,0 +1,10 @@
+ M skills/herdr-pair/SKILL.md
+ M skills/herdr-pair/scripts/claude_session_start_hook.py
+ M skills/herdr-pair/scripts/pairctl.py
+ M skills/herdr-pair/tests/test_pairctl.py
+?? AGENTS.md
+?? analysis/
+?? docs/
+?? skills/herdr-pair/reference/
+?? skills/herdr-pair/tests/test_context_edges.py
+?? skills/herdr-pair/tests/test_skill_layout.py

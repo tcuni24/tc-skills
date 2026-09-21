@@ -1,0 +1,17 @@
+{
+  "scope_id": "issue-2-herdr-pair-context-budget",
+  "snapshot_id": "7074ed9bd2ab06e423e7c24df5c8b1f2140cac73163edb2d0251875b05e9ae98",
+  "code_review": "NOT_REQUESTED",
+  "validation": "PASS",
+  "final_acceptance": "PASS",
+  "review_kind": "final",
+  "review_verdict": "PASS",
+  "isolation_requirement": "ordinary",
+  "evidence_refs": [
+    "post-review-validation.log",
+    "snapshot.json",
+    "final-review.md",
+    "root-edges.log"
+  ],
+  "contract_error": null
+}
