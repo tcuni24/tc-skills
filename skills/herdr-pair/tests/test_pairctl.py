@@ -888,9 +888,11 @@ class PairctlTest(unittest.TestCase):
 
     # --- Claude Code SessionStart hook ------------------------------------------------
 
-    def run_hook(self, payload: dict, xdg: Path) -> subprocess.CompletedProcess[str]:
+    def run_hook(self, payload: dict, xdg: Path, *, pane: str = "w1:p1") -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
         env.pop("HERDR_PANE_ID", None)
+        if pane:
+            env["HERDR_PANE_ID"] = pane
         env["XDG_STATE_HOME"] = str(xdg)
         env["PAIRCTL_HERDR"] = str(self.herdr)
         return subprocess.run(
@@ -1738,7 +1740,7 @@ class PairctlTest(unittest.TestCase):
         )
         self.invoke_ok(
             "note-session", "--session-id", session_id, "--transcript-path", str(transcript),
-            "--kind", kind, "--source", "startup",
+            "--kind", kind, "--source", "startup", "--pane", "w1:p1",
         )
         return transcript
 
@@ -1764,13 +1766,13 @@ class PairctlTest(unittest.TestCase):
 
         self.invoke_ok(
             "note-session", "--session-id", "other", "--transcript-path", str(self.root / "session-a.jsonl"),
-            "--kind", "claude", "--source", "resume",
+            "--kind", "claude", "--source", "resume", "--pane", "w1:p1",
         )
         mismatch = self.invoke_ok("context-usage")
         self.assertEqual(mismatch["status"], "unknown")
         self.assertIsNone(mismatch["context_tokens"])
         self.invoke_ok(
-            "note-session", "--session-id", "session-a", "--kind", "cursor", "--source", "startup",
+            "note-session", "--session-id", "session-a", "--kind", "cursor", "--source", "startup", "--pane", "w1:p1",
         )
         non_claude = self.invoke_ok("context-usage")
         self.assertEqual(non_claude["status"], "unknown")
@@ -1970,7 +1972,7 @@ class PairctlTest(unittest.TestCase):
             hook = self.run_hook({
                 "session_id": f"sess-{source}", "source": source, "cwd": str(self.cwd),
                 "transcript_path": str(transcript),
-            }, xdg)
+            }, xdg, pane="")
             self.assertEqual(hook.returncode, 0)
             self.assertEqual(hook.stdout, "")
             saved = json.loads(record.read_text(encoding="utf-8"))
@@ -1985,7 +1987,12 @@ class PairctlTest(unittest.TestCase):
 
     def test_context_usage_derived_locator_and_invalid_latest_usage(self) -> None:
         fake_home = self.root / "home"
-        encoded = re.sub(r"[^A-Za-z0-9-]", "-", str(self.cwd.resolve()))
+        base = self.cwd
+        self.cwd = base / "under_score" / "中文 space.with-dot"
+        self.cwd.mkdir(parents=True)
+        self.state = self.root / "derived-state"
+        self.invoke_ok("init", "--planner-pane", "w1:p1", "--no-context-check")
+        encoded = re.sub(r"[^A-Za-z0-9-]", "-", str(base.resolve())) + "-under-score----space-with-dot"
         project = fake_home / ".claude" / "projects" / encoded
         project.mkdir(parents=True)
         transcript = project / "derived-session.jsonl"
@@ -1995,7 +2002,7 @@ class PairctlTest(unittest.TestCase):
         ]) + "\n", encoding="utf-8")
         env = {"HOME": str(fake_home)}
         self.invoke_ok(
-            "note-session", "--session-id", "derived-session", "--kind", "claude", "--source", "resume",
+            "note-session", "--session-id", "derived-session", "--kind", "claude", "--source", "resume", "--pane", "w1:p1",
             extra_env=env,
         )
         invalid = self.invoke_ok("context-usage", extra_env=env)
@@ -2007,6 +2014,18 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(derived["status"], "ok")
         self.assertEqual(derived["source"], "derived")
         self.assertEqual(derived["context_tokens"], 6)
+
+        explicit = self.root / "explicit-transcript.jsonl"
+        entry = json.loads(lines[0])
+        entry["message"]["usage"]["input_tokens"] = 10
+        explicit.write_text(json.dumps(entry) + "\n", encoding="utf-8")
+        self.invoke_ok("note-session", "--session-id", "derived-session", "--kind", "claude",
+                       "--source", "resume", "--pane", "w1:p1", "--transcript-path", str(explicit),
+                       extra_env=env)
+        recorded = self.invoke_ok("context-usage", extra_env=env)
+        self.assertEqual(recorded["status"], "ok")
+        self.assertEqual(recorded["source"], "recorded")
+        self.assertEqual(recorded["context_tokens"], 15)
 
     def test_pending_unknown_and_disabled_never_auto_compact(self) -> None:
         self.note_transcript("session-a", [{
