@@ -1006,11 +1006,20 @@ def spawn_compact_continue_watcher(
 
     Must not be queued through herdr behind `/compact`/`/summarize`: a follow-up
     prompt in that queue was observed to run before the summary existed.
+
+    Only spawns for a freshly armed record (issue #9): the parent marker
+    PAIRCTL_INTERNAL_WATCHER=1 suppresses spawning (we *are* an internal watcher),
+    and the child itself runs with that marker instead of the user-facing
+    PAIRCTL_CONTINUE_AFTER_COMPACT switch.
     """
+    if os.environ.get("PAIRCTL_INTERNAL_WATCHER", "") == "1":
+        return {"spawned": False, "reason": "internal watcher parent"}
     if not continue_after_compact_enabled():
         return {"spawned": False, "reason": "disabled"}
     if not planner_compact or not planner_compact.get("queued"):
         return {"spawned": False, "reason": "compact not queued"}
+    if not planner_compact.get("resume_armed"):
+        return {"spawned": False, "reason": "resume record not newly armed"}
     pid_path = pp["root"] / "compact-continue.pid"
     try:
         existing = int(pid_path.read_text(encoding="utf-8").strip())
@@ -1025,9 +1034,11 @@ def spawn_compact_continue_watcher(
         cmd += ["--state-dir", str(state_dir)]
     herdr = herdr_bin(args)
     cmd += ["--herdr", herdr]
+    # Child env = parent copy + the internal marker. Never rewrite the user's
+    # PAIRCTL_CONTINUE_AFTER_COMPACT here (issue #9): that flag is not recursion control.
     env = os.environ.copy()
     env["PAIRCTL_HERDR"] = herdr
-    env["PAIRCTL_CONTINUE_AFTER_COMPACT"] = "0"
+    env["PAIRCTL_INTERNAL_WATCHER"] = "1"
     try:
         handle = log.open("ab")
         proc = subprocess.Popen(
@@ -1047,60 +1058,73 @@ def spawn_compact_continue_watcher(
 
 
 def cmd_watch_compact_continue(args: argparse.Namespace) -> int:
-    """Poll until the planner pane is idle after compaction, then prompt it to resume."""
+    """Low-frequency record-driven loop: deliver the armed resume exactly once (issue #9).
+
+    Each tick re-reads resume_pending under the lock: terminal records exit, a
+    pending/uncertain record past its deadline claims one delivery through
+    `resume-deliver --via watcher`, and epoch_not_advanced / planner_busy / claimed
+    simply wait for the next tick without counting failures. Delivery success still
+    reports status=continue_prompted with exit 0, and the prompt text comes only
+    from the existing compact_continue_prompt.
+    """
     pp = paths(args)
     cwd = canonical_cwd(args.cwd)
-    min_delay = env_float("PAIRCTL_CONTINUE_MIN_DELAY_S", 20.0)
-    idle_needed = env_float("PAIRCTL_CONTINUE_IDLE_S", 8.0)
-    timeout = env_float("PAIRCTL_CONTINUE_TIMEOUT_S", 600.0)
-    poll = max(env_float("PAIRCTL_CONTINUE_POLL_S", 1.0), 0.05)
-    with locked(pp["root"], pp["lock"]):
-        data = load(pp["state"], cwd)
-        queued = data.get("compact_queued") or {}
-        pane = str(queued.get("pane") or data.get("planner_pane") or "")
-    if not pane:
-        output({"status": "continue_skipped", "reason": "planner pane unknown"})
-        return 0
-    started = time.monotonic()
-    deadline = started + timeout
-    idle_for = 0.0
-    while time.monotonic() < deadline:
-        try:
-            status = str(agent_info(args, pane).get("agent_status") or "")
-        except ValueError:
-            idle_for = 0.0
+    poll = max(env_float("PAIRCTL_CONTINUE_POLL_S", 15.0), 0.05)
+    while True:
+        with locked(pp["root"], pp["lock"]):
+            data = load(pp["state"], cwd)
+            write_ledger(pp["ledger"], data)
+            raw = data.get("resume_pending")
+            record = dict(raw) if isinstance(raw, dict) else {}
+            pane = str(record.get("planner_pane") or "")
+        if not record:
+            output({"status": "continue_skipped", "reason": "no_record"})
+            return 0
+        status = str(record.get("status") or "")
+        if status in {"delivered", "cancelled", "expired"}:
+            output({"status": "continue_skipped", "reason": f"record_{status}", "pane": pane})
+            return 0
+        if status not in {"pending", "uncertain"}:
+            # claimed by another wake-up source: only wait for that delivery.
             time.sleep(poll)
             continue
-        if status in FRESH_OK_STATUS:
-            idle_for += poll
-        else:
-            idle_for = 0.0
-        elapsed = time.monotonic() - started
-        if idle_for >= idle_needed and elapsed >= min_delay:
-            break
+        try:
+            due = dt.datetime.fromisoformat(str(record.get("deadline") or "")).timestamp() <= time.time()
+        except ValueError:
+            due = True  # an unparsable deadline must never block delivery forever
+        if not due:
+            time.sleep(poll)
+            continue
+        if not pane:
+            output({"status": "continue_skipped", "reason": "planner_pane_unknown"})
+            return 0
+        # One claim per tick; the subprocess owns the state machine, so a concurrent
+        # wake-up source (plugin, a second watcher) cannot double-send.
+        cmd = [
+            sys.executable, PAIRCTL_SCRIPT, "resume-deliver",
+            "--pane", pane, "--via", "watcher", "--cwd", cwd,
+        ]
+        state_dir = getattr(args, "state_dir", None)
+        if state_dir:
+            cmd += ["--state-dir", str(state_dir)]
+        cmd += ["--herdr", herdr_bin(args)]
+        env = os.environ.copy()
+        env["PAIRCTL_HERDR"] = herdr_bin(args)
+        proc = subprocess.run(cmd, text=True, capture_output=True, check=False, env=env)
+        try:
+            payload = json.loads(proc.stdout)
+        except ValueError:
+            payload = {}
+        result = payload.get("status") if isinstance(payload, dict) else None
+        if result == "resume_delivered":
+            output({"status": "continue_prompted", "pane": pane})
+            return 0
+        if result == "resume_expired":
+            output({"status": "continue_skipped", "reason": "resume_expired", "pane": pane})
+            return 0
+        # epoch_not_advanced / planner_busy / uncertain / unparsable response:
+        # no failure counting here — the loop just waits for the next low-frequency tick.
         time.sleep(poll)
-    else:
-        output({"status": "continue_timeout", "pane": pane, "timeout_s": timeout})
-        return 2
-    with locked(pp["root"], pp["lock"]):
-        data = load(pp["state"], cwd)
-        write_ledger(pp["ledger"], data)
-    text = compact_continue_prompt(pp, data)
-    try:
-        code, out, err, payload = run_herdr(args, ["agent", "prompt", pane, text])
-    except ValueError as exc:
-        output({"status": "continue_failed", "pane": pane, "reason": str(exc)})
-        return 2
-    ok = code == 0 and is_agent_prompted(payload)
-    result = {
-        "status": "continue_prompted" if ok else "continue_failed",
-        "pane": pane,
-        "herdr_exit": code,
-    }
-    if not ok:
-        result["reason"] = herdr_error_code(payload) or clip(err or out, 300)
-    output(result)
-    return 0 if ok else 2
 
 
 def compact_instructions(pp: dict[str, Path], data: dict[str, Any], kind: str) -> str:
@@ -1129,6 +1153,42 @@ def compact_instructions(pp: dict[str, Path], data: dict[str, Any], kind: str) -
         "report may already have arrived; after compaction first read pairctl status and the "
         f"Report file, then read the checkpoint. {rollover}"
     )
+
+
+def probe_resume_mechanism(args: argparse.Namespace, kind: str) -> str:
+    """Decide `mechanism` for a fresh resume_pending write (issue #9).
+
+    'plugin' only when `herdr plugin list --json` returns a well-formed plugin_list
+    envelope carrying an enabled tc.herdr-pair entry AND the planner's `agent get`
+    said claude (its kind, fetched by the caller). Any other outcome — non-zero
+    exit, bad envelope, missing plugins, disabled plugin, non-Claude planner —
+    means 'watcher'. Probing is best-effort and never fails the compact queue.
+    """
+    if kind != "claude":
+        return "watcher"
+    try:
+        code, _out, _err, payload = run_herdr(args, ["plugin", "list", "--json"])
+    except ValueError:
+        return "watcher"
+    if code != 0 or not isinstance(payload, dict) or payload.get("error"):
+        return "watcher"
+    result = payload.get("result")
+    if not isinstance(result, dict) or result.get("type") != "plugin_list":
+        return "watcher"
+    plugins = result.get("plugins")
+    if not isinstance(plugins, list):
+        return "watcher"
+    for entry in plugins:
+        if not isinstance(entry, dict) or entry.get("plugin_id") != "tc.herdr-pair":
+            continue
+        enabled = entry.get("enabled")
+        if isinstance(enabled, str):
+            try:
+                enabled = json.loads(enabled)
+            except ValueError:
+                enabled = None
+        return "plugin" if enabled is True else "watcher"
+    return "watcher"
 
 
 def queue_planner_compact(
@@ -1169,6 +1229,19 @@ def queue_planner_compact(
     text = command
     if mode == "compact" and kind in COMPACT_ACCEPTS_INSTRUCTIONS:
         text = f"{command} {compact_instructions(pp, data, kind)}"
+    # issue #9: the mechanism is decided only where a fresh record would be written
+    # with auto-continue on, and it must be probed before the compact prompt so that
+    # prompt stays pairctl's last Herdr call in this queue operation.
+    auto_continue = continue_after_compact_enabled()
+    existing = data.get("resume_pending")
+    same_epoch_requeue = False
+    if isinstance(existing, dict) and existing:
+        try:
+            same_epoch_requeue = int(existing.get("epoch_at_arm", -1)) == int(epoch)
+        except (TypeError, ValueError):
+            same_epoch_requeue = False
+    newly_armed = auto_continue and not same_epoch_requeue
+    mechanism = probe_resume_mechanism(args, kind) if newly_armed else ""
     try:
         code, out, err, payload = run_herdr(args, ["agent", "prompt", pane, text])
     except ValueError as exc:
@@ -1192,36 +1265,53 @@ def queue_planner_compact(
         "queued_at": now(),
     }
     data["compact_queued"] = record
-    arm_resume_record(pp, data, pane, epoch)
+    # PAIRCTL_CONTINUE_AFTER_COMPACT=0 disables auto-continue: the compact still
+    # queues, but no resume_pending record is written (issue #9).
+    if auto_continue:
+        arm_resume_record(pp, data, pane, epoch, mechanism)
     return {
         "queued": True,
         **record,
+        "resume_armed": newly_armed,
         "note": "queued in the planner pane; it executes when the current turn ends",
     }
 
 
 def arm_resume_record(
-    pp: dict[str, Path], data: dict[str, Any], pane: str, epoch: int,
+    pp: dict[str, Path], data: dict[str, Any], pane: str, epoch: int, mechanism: str = "watcher",
 ) -> dict[str, Any]:
     """Arm the resume owed to the planner once the compaction epoch advances.
 
     Written exactly where compact_queued is set, so every arm path (finish-round,
     emit_rollover_block, compact-self, budget compaction) gets one record.
+
+    Same epoch_at_arm requeue (issue #9): keep the record — armed_at, mechanism,
+    status, attempts, last_error all stay — and push only the deadline out to now +
+    PAIRCTL_RESUME_DEADLINE_S. A different epoch, or no record at all, replaces it
+    with a fresh pending record carrying the probed mechanism.
     """
-    armed_at = now()
     deadline_s = env_float("PAIRCTL_RESUME_DEADLINE_S", DEFAULT_RESUME_DEADLINE_S)
-    # The deadline is recorded here but not consumed by pairctl itself: the
-    # low-frequency wake-up watcher reads it to decide when a still-pending
-    # resume is due for claim-delivery.
+    stamp = now()
+    deadline = (dt.datetime.fromisoformat(stamp) + dt.timedelta(seconds=deadline_s)).isoformat()
+    existing = data.get("resume_pending")
+    if isinstance(existing, dict) and existing:
+        try:
+            same_epoch = int(existing.get("epoch_at_arm", -1)) == int(epoch)
+        except (TypeError, ValueError):
+            same_epoch = False
+        if same_epoch:
+            # The deadline is recorded here but not consumed by pairctl itself: the
+            # low-frequency wake-up watcher reads it to decide when a still-pending
+            # resume is due for claim-delivery.
+            existing["deadline"] = deadline
+            return existing
     record = {
-        "armed_at": armed_at,
+        "armed_at": stamp,
         "epoch_at_arm": int(epoch),
         "planner_pane": pane,
         "state_dir": str(pp["root"]),
-        "mechanism": "watcher",
-        "deadline": (
-            dt.datetime.fromisoformat(armed_at) + dt.timedelta(seconds=deadline_s)
-        ).isoformat(),
+        "mechanism": mechanism if mechanism in {"plugin", "watcher"} else "watcher",
+        "deadline": deadline,
         "status": "pending",
         "attempts": 0,
         "last_error": "",
@@ -2378,6 +2468,10 @@ def cmd_compact_self(args: argparse.Namespace) -> int:
         persist(pp, data)
     result["status"] = "planner_compact_queued" if result.get("queued") else "planner_compact_not_queued"
     result["checkpoint"] = str(pp["checkpoint"])
+    # Spawn point (issue #9): only fires for a newly armed record with auto-continue on.
+    result["continue_after_compact"] = spawn_compact_continue_watcher(
+        args, pp, data, result if result.get("queued") else None,
+    )
     output(result)
     return 0 if result.get("queued") else 2
 

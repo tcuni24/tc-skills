@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import stat
 import subprocess
 import tempfile
@@ -69,6 +70,19 @@ if sub == ["notification", "show"]:
         "result": {"type": "notification_show", "shown": True, "reason": "manual"},
     }))
     raise SystemExit(0)
+if sub == ["plugin", "list"] and "--json" in sys.argv[3:]:
+    # Issue #9: the mechanism probe reads <exe>.plugins.json (content: plugins array).
+    plugins_path = Path(sys.argv[0] + ".plugins.json")
+    if not plugins_path.is_file():
+        print(json.dumps({"id": "cli:plugin:list", "result": {"plugins": [], "type": "plugin_list"}}))
+        raise SystemExit(0)
+    try:
+        plugins = json.loads(plugins_path.read_text(encoding="utf-8"))
+    except (ValueError, OSError) as exc:
+        print(json.dumps({"error": {"code": "plugin_list_failed", "message": str(exc)}}))
+        raise SystemExit(1)
+    print(json.dumps({"id": "cli:plugin:list", "result": {"plugins": plugins, "type": "plugin_list"}}))
+    raise SystemExit(0)
 mode = mode_path.read_text(encoding="utf-8").strip() if mode_path.is_file() else "ok"
 if mode == "ok":
     print(json.dumps({
@@ -104,6 +118,30 @@ class PairctlTest(unittest.TestCase):
         self.invoke_ok("init", "--planner-pane", "w1:p1", "--session-id", "session-a")
 
     def tearDown(self) -> None:
+        # Issue #9: any compact-continue watcher this test spawned must be stopped
+        # here, via the pid file pairctl writes; never left running after the test.
+        try:
+            pid = int((self.state / "compact-continue.pid").read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            pid = 0
+        if pid:
+            cmdline = Path(f"/proc/{pid}/cmdline")
+            try:
+                owned = b"watch-compact-continue" in cmdline.read_bytes()
+            except OSError:
+                owned = False
+            if owned:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except OSError:
+                    pass
+                kill_deadline = time.time() + 5
+                while time.time() < kill_deadline and pid:
+                    try:
+                        os.kill(pid, 0)
+                    except OSError:
+                        break
+                    time.sleep(0.05)
         self.tmp.cleanup()
 
     def invoke(
@@ -128,6 +166,20 @@ class PairctlTest(unittest.TestCase):
             capture_output=True,
             check=False,
             env=env,
+        )
+
+    def popen(self, *args: str, extra_env: dict[str, str] | None = None) -> subprocess.Popen[str]:
+        """Start pairctl without waiting, for overlap tests (same environment as invoke)."""
+        cmd = ["python3", str(SCRIPT), *args, "--cwd", str(self.cwd), "--state-dir", str(self.state)]
+        env = os.environ.copy()
+        env["PAIRCTL_STATE_JSON"] = str(self.state / "state.json")
+        env["PAIRCTL_HERDR"] = str(self.herdr)
+        env.pop("PAIRCTL_AUTO_COMPACT", None)
+        env["PAIRCTL_CONTINUE_AFTER_COMPACT"] = "0"
+        if extra_env:
+            env.update(extra_env)
+        return subprocess.Popen(
+            cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
         )
 
     def invoke_ok(self, *args: str, **kwargs: object) -> dict:
@@ -171,7 +223,9 @@ class PairctlTest(unittest.TestCase):
         path.write_text(body, encoding="utf-8")
         return path
 
-    def start_finish(self, n: int) -> tuple[str, subprocess.CompletedProcess[str]]:
+    def start_finish(
+        self, n: int, extra_env: dict[str, str] | None = None,
+    ) -> tuple[str, subprocess.CompletedProcess[str]]:
         contract = self.write_handoff(
             f"start-{n}.md", f"# Round {n}\nComplete contract body {n}\n"
         )
@@ -185,6 +239,7 @@ class PairctlTest(unittest.TestCase):
         proc = self.invoke(
             "finish-round", "--round-id", started["round_id"],
             "--status", "accepted", "--artifacts", f"artifact-{n}", "--notes", f"verified-{n}",
+            extra_env=extra_env,
         )
         return started["round_id"], proc
 
@@ -804,16 +859,18 @@ class PairctlTest(unittest.TestCase):
     def test_watch_compact_continue_prompts_planner_after_idle(self) -> None:
         self.set_kind("cursor")
         for n in range(1, 6):
-            self.start_finish(n)
+            # Record write needs auto-continue on; INTERNAL keeps the test's manual
+            # watch the only wake-up source. deadline 0 => already due.
+            self.start_finish(n, extra_env={
+                **self.RECORD_ENV, "PAIRCTL_RESUME_DEADLINE_S": "0",
+            })
+        # Issue #9: the record-driven watcher only delivers once the epoch advanced.
+        self.invoke_ok("rollover", "--reason", "compact")
         self.clear_calls()
         self.set_status("idle")
         prompted = self.invoke_ok(
             "watch-compact-continue",
-            extra_env={
-                "PAIRCTL_CONTINUE_MIN_DELAY_S": "0",
-                "PAIRCTL_CONTINUE_IDLE_S": "0",
-                "PAIRCTL_CONTINUE_POLL_S": "0.05",
-            },
+            extra_env={"PAIRCTL_CONTINUE_POLL_S": "0.05"},
         )
         self.assertEqual(prompted["status"], "continue_prompted")
         self.assertEqual(prompted["pane"], "w1:p1")
@@ -837,27 +894,29 @@ class PairctlTest(unittest.TestCase):
             "finish-round", "--round-id", started["round_id"], "--status", "accepted", "--artifacts", "artifact", "--notes", "verified",
             extra_env={
                 "PAIRCTL_CONTINUE_AFTER_COMPACT": "1",
-                "PAIRCTL_CONTINUE_MIN_DELAY_S": "0",
-                "PAIRCTL_CONTINUE_IDLE_S": "0",
                 "PAIRCTL_CONTINUE_POLL_S": "0.05",
+                "PAIRCTL_RESUME_DEADLINE_S": "0",
             },
         )
         self.assertEqual(fifth.returncode, 20)
         payload = json.loads(fifth.stdout)
         self.assertTrue(payload["planner_compact"]["queued"])
         self.assertTrue(payload["continue_after_compact"]["spawned"], payload)
+        # The record is armed but the epoch has not advanced: no prompt before rollover.
+        early_until = time.time() + 0.5
+        while time.time() < early_until:
+            self.assertEqual(self.auto_continue_prompts(), [], self.herdr_calls())
+            time.sleep(0.05)
+        self.invoke_ok("rollover", "--reason", "compact")
         deadline = time.time() + 5
         continue_prompts = []
         while time.time() < deadline:
-            continue_prompts = [
-                c for c in self.herdr_calls()
-                if c[:2] == ["agent", "prompt"] and c[2] == "w1:p1"
-                and "auto-continue after compaction" in c[3]
-            ]
+            continue_prompts = self.auto_continue_prompts()
             if continue_prompts:
                 break
             time.sleep(0.05)
         self.assertEqual(len(continue_prompts), 1, self.herdr_calls())
+        self.assertEqual(self.read_state()["resume_pending"]["status"], "delivered")
 
     def test_auto_compact_can_be_disabled_by_env_and_init(self) -> None:
         for n in range(1, 5):
@@ -2098,9 +2157,25 @@ class PairctlTest(unittest.TestCase):
         "mechanism", "deadline", "status", "attempts", "last_error",
     )
 
+    # A record write requires auto-continue on (issue #9). INTERNAL marks the parent as
+    # an internal watcher so pairctl does not spawn one: the test drives watch /
+    # resume-deliver manually and must stay the only wake-up source.
+    RECORD_ENV = {
+        "PAIRCTL_CONTINUE_AFTER_COMPACT": "1",
+        "PAIRCTL_INTERNAL_WATCHER": "1",
+    }
+
+    def auto_continue_prompts(self) -> list[list[str]]:
+        """argv tails of delivered auto-continue prompts on the planner pane."""
+        return [
+            c for c in self.herdr_calls()
+            if c[:2] == ["agent", "prompt"] and c[2] == "w1:p1"
+            and "auto-continue after compaction" in c[3]
+        ]
+
     def arm_and_advance_epoch(self) -> str:
         """Arm the resume record via compact-self, then advance the epoch. Returns armed_at."""
-        queued = self.invoke_ok("compact-self")
+        queued = self.invoke_ok("compact-self", extra_env=self.RECORD_ENV)
         self.assertTrue(queued["queued"], queued)
         armed_at = self.read_state()["resume_pending"]["armed_at"]
         self.invoke_ok("rollover", "--reason", "compact")
@@ -2110,9 +2185,9 @@ class PairctlTest(unittest.TestCase):
         self.assertIsNone(self.read_state().get("resume_pending"))
         self.assertIsNone(self.invoke_ok("status")["resume_pending"])
 
-        queued = self.invoke_ok("compact-self")
+        queued = self.invoke_ok("compact-self", extra_env=self.RECORD_ENV)
         self.assertTrue(queued["queued"], queued)
-        record = self.invoke_ok("status")["resume_pending"]
+        record = self.invoke_ok("status", extra_env=self.RECORD_ENV)["resume_pending"]
         self.assertIsInstance(record, dict)
         for key in self.REQUIRED_RECORD_KEYS:
             self.assertIn(key, record)
@@ -2123,18 +2198,24 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(record["epoch_at_arm"], 0)
         self.assertEqual(record["planner_pane"], "w1:p1")
         self.assertEqual(Path(record["state_dir"]).resolve(), self.state.resolve())
-        armed = dt.datetime.fromisoformat(record["armed_at"])
+        first_armed = record["armed_at"]
+        armed = dt.datetime.fromisoformat(first_armed)
         deadline = dt.datetime.fromisoformat(record["deadline"])
         self.assertEqual(deadline - armed, dt.timedelta(seconds=600))
 
+        # Same epoch requeue (issue #9): armed_at stays, only the deadline moves.
+        requeue_at = time.time()
         requeued = self.invoke_ok(
-            "compact-self", extra_env={"PAIRCTL_RESUME_DEADLINE_S": "30"},
+            "compact-self",
+            extra_env={**self.RECORD_ENV, "PAIRCTL_RESUME_DEADLINE_S": "30"},
         )
         self.assertTrue(requeued["queued"], requeued)
         record = self.read_state()["resume_pending"]
-        armed = dt.datetime.fromisoformat(record["armed_at"])
+        self.assertEqual(record["armed_at"], first_armed)
+        self.assertEqual(record["mechanism"], "watcher")
         deadline = dt.datetime.fromisoformat(record["deadline"])
-        self.assertEqual(deadline - armed, dt.timedelta(seconds=30))
+        self.assertGreaterEqual(deadline.timestamp(), requeue_at + 28)
+        self.assertLessEqual(deadline.timestamp(), time.time() + 31)
 
     def test_rollover_with_active_round_keeps_resume_record(self) -> None:
         for n in range(1, 5):
@@ -2148,7 +2229,7 @@ class PairctlTest(unittest.TestCase):
         self.assertTrue(state["rollover_required"])
         self.assertEqual(state["phase_round_count"], 5)
 
-        armed = self.invoke_ok("compact-self")
+        armed = self.invoke_ok("compact-self", extra_env=self.RECORD_ENV)
         self.assertTrue(armed["queued"], armed)
         armed_at = self.read_state()["resume_pending"]["armed_at"]
 
@@ -2166,7 +2247,7 @@ class PairctlTest(unittest.TestCase):
 
     def test_rollover_after_fifth_finish_keeps_resume_record(self) -> None:
         for n in range(1, 6):
-            _, fifth = self.start_finish(n)
+            _, fifth = self.start_finish(n, extra_env=self.RECORD_ENV)
         self.assertEqual(fifth.returncode, 20, fifth.stderr + fifth.stdout)
         payload = json.loads(fifth.stdout)
         self.assertTrue(payload["planner_compact"]["queued"], payload)
@@ -2194,7 +2275,7 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(payload["reason"], "no_record")
         self.assertEqual(self.herdr_calls(), [])
 
-        self.invoke_ok("compact-self")
+        self.invoke_ok("compact-self", extra_env=self.RECORD_ENV)
         self.clear_calls()
         early = self.invoke("resume-deliver", "--pane", "w1:p1", "--via", "plugin")
         self.assertEqual(early.returncode, 2, early.stderr + early.stdout)
@@ -2308,7 +2389,7 @@ class PairctlTest(unittest.TestCase):
         v1_state = self.legacy_v1_state()
         (self.state / "state.json").write_text(json.dumps(v1_state, indent=2), encoding="utf-8")
 
-        queued = self.invoke_ok("compact-self")
+        queued = self.invoke_ok("compact-self", extra_env=self.RECORD_ENV)
         self.assertTrue(queued["queued"], queued)
         armed_at = self.read_state()["resume_pending"]["armed_at"]
         self.invoke_ok("rollover", "--reason", "compact")
@@ -2329,30 +2410,199 @@ class PairctlTest(unittest.TestCase):
         self.assertTrue(record["cancelled_at"])
 
     def test_resume_prompt_is_identical_to_legacy_watcher(self) -> None:
-        queued = self.invoke_ok("compact-self")
+        queued = self.invoke_ok("compact-self", extra_env={
+            **self.RECORD_ENV, "PAIRCTL_RESUME_DEADLINE_S": "0",
+        })
         self.assertTrue(queued["queued"], queued)
+        # Issue #9: the watch loop delivers only after the epoch advanced.
+        self.invoke_ok("rollover", "--reason", "compact")
         self.set_status("idle")
         self.clear_calls()
         watched = self.invoke_ok(
             "watch-compact-continue",
-            extra_env={
-                "PAIRCTL_CONTINUE_MIN_DELAY_S": "0",
-                "PAIRCTL_CONTINUE_IDLE_S": "0",
-                "PAIRCTL_CONTINUE_POLL_S": "0.05",
-            },
+            extra_env={"PAIRCTL_CONTINUE_POLL_S": "0.05"},
         )
         self.assertEqual(watched["status"], "continue_prompted")
         prompts = [c for c in self.herdr_calls() if c[:2] == ["agent", "prompt"]]
         self.assertEqual(len(prompts), 1, self.herdr_calls())
         legacy_text = prompts[0][3]
 
-        self.invoke_ok("rollover", "--reason", "compact")
+        # The watch path claims through resume-deliver; rewind the record to pending so
+        # the manual deliver below exercises the same prompt text.
+        state_path = self.state / "state.json"
+        doc = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(doc["resume_pending"]["status"], "delivered")
+        doc["resume_pending"]["status"] = "pending"
+        state_path.write_text(json.dumps(doc, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         self.clear_calls()
         delivered = self.invoke_ok("resume-deliver", "--pane", "w1:p1", "--via", "watcher")
         self.assertEqual(delivered["status"], "resume_delivered")
         prompts = [c for c in self.herdr_calls() if c[:2] == ["agent", "prompt"]]
         self.assertEqual(len(prompts), 1, self.herdr_calls())
         self.assertEqual(prompts[0][3], legacy_text)
+
+
+    def test_mechanism_plugin_only_when_linked_enabled_and_claude(self) -> None:
+        # issue #9: mechanism is decided only on a new resume_pending write.
+        plugins = Path(str(self.herdr) + ".plugins.json")
+        linked = [{"plugin_id": "tc.herdr-pair", "enabled": True}]
+        cases = (
+            # (planner kind, plugins.json content, expected mechanism)
+            ("claude", linked, "plugin"),
+            ("claude", [{"plugin_id": "tc.herdr-pair", "enabled": False}], "watcher"),
+            ("claude", [{"plugin_id": "someone.else", "enabled": True}], "watcher"),
+            ("claude", None, "watcher"),                     # file missing -> empty list
+            ("claude", "{not json at all", "watcher"),       # list exits non-zero
+            ("pi", linked, "watcher"),                       # not Claude -> watcher
+        )
+        for index, (kind, content, expected) in enumerate(cases):
+            with self.subTest(kind=kind, content=content, expected=expected):
+                self.set_kind(kind)
+                if content is None:
+                    plugins.unlink(missing_ok=True)
+                elif isinstance(content, str):
+                    plugins.write_text(content, encoding="utf-8")
+                else:
+                    plugins.write_text(json.dumps(content), encoding="utf-8")
+                if index:
+                    # A different epoch => the next arm is a fresh write and re-probes.
+                    self.invoke_ok("rollover", "--reason", "compact")
+                queued = self.invoke_ok("compact-self", extra_env=self.RECORD_ENV)
+                self.assertTrue(queued["queued"], queued)
+                record = self.read_state()["resume_pending"]
+                self.assertEqual(record["mechanism"], expected)
+
+    def test_continue_disabled_skips_record_and_watcher(self) -> None:
+        # invoke() defaults PAIRCTL_CONTINUE_AFTER_COMPACT=0: compact still queues,
+        # but no record is written, no watcher spawns, and no probe runs.
+        self.clear_calls()
+        queued = self.invoke_ok("compact-self")
+        self.assertTrue(queued["queued"], queued)
+        self.assertFalse(queued["continue_after_compact"]["spawned"], queued)
+        self.assertEqual(queued["continue_after_compact"]["reason"], "disabled")
+        self.assertIsNone(self.read_state().get("resume_pending"))
+        self.assertFalse((self.state / "compact-continue.pid").exists())
+        self.assertFalse(
+            [c for c in self.herdr_calls() if c[:2] == ["plugin", "list"]],
+            self.herdr_calls(),
+        )
+
+    def test_same_epoch_requeue_updates_deadline_only(self) -> None:
+        first = self.invoke_ok("compact-self", extra_env=self.RECORD_ENV)
+        self.assertTrue(first["queued"], first)
+        record = self.read_state()["resume_pending"]
+        armed_at = record["armed_at"]
+        mechanism = record["mechanism"]
+        first_deadline = record["deadline"]
+        # Leftover delivery state must survive a same-epoch requeue untouched.
+        state_path = self.state / "state.json"
+        doc = json.loads(state_path.read_text(encoding="utf-8"))
+        doc["resume_pending"]["attempts"] = 1
+        doc["resume_pending"]["last_error"] = "prior failure"
+        state_path.write_text(json.dumps(doc, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+        requeue_at = time.time()
+        requeued = self.invoke_ok(
+            "compact-self",
+            extra_env={**self.RECORD_ENV, "PAIRCTL_RESUME_DEADLINE_S": "30"},
+        )
+        self.assertTrue(requeued["queued"], requeued)
+        record = self.read_state()["resume_pending"]
+        self.assertEqual(record["armed_at"], armed_at)
+        self.assertEqual(record["mechanism"], mechanism)
+        self.assertEqual(record["status"], "pending")
+        self.assertEqual(record["attempts"], 1)
+        self.assertEqual(record["last_error"], "prior failure")
+        self.assertNotEqual(record["deadline"], first_deadline)
+        deadline_ts = dt.datetime.fromisoformat(record["deadline"]).timestamp()
+        self.assertGreaterEqual(deadline_ts, requeue_at + 28)
+        self.assertLessEqual(deadline_ts, time.time() + 31)
+        # A requeue is not a new write: no watcher is spawned for it.
+        self.assertFalse(requeued["continue_after_compact"]["spawned"], requeued)
+        self.assertFalse((self.state / "compact-continue.pid").exists())
+
+    def test_watcher_delivers_once_at_deadline_and_records_mechanism(self) -> None:
+        queued = self.invoke_ok("compact-self", extra_env={
+            "PAIRCTL_CONTINUE_AFTER_COMPACT": "1",
+            "PAIRCTL_RESUME_DEADLINE_S": "0",
+            "PAIRCTL_CONTINUE_POLL_S": "0.05",
+        })
+        self.assertTrue(queued["queued"], queued)
+        self.assertTrue(queued["continue_after_compact"]["spawned"], queued)
+        record = self.read_state()["resume_pending"]
+        self.assertEqual(record["mechanism"], "watcher")
+        self.set_status("idle")
+        # The spawned watcher must stay quiet until the epoch advances.
+        quiet_until = time.time() + 0.5
+        while time.time() < quiet_until:
+            self.assertEqual(self.auto_continue_prompts(), [], self.herdr_calls())
+            time.sleep(0.05)
+        self.invoke_ok("rollover", "--reason", "compact")
+        deadline = time.time() + 5
+        prompts: list[list[str]] = []
+        while time.time() < deadline:
+            prompts = self.auto_continue_prompts()
+            if prompts:
+                break
+            time.sleep(0.05)
+        self.assertEqual(len(prompts), 1, self.herdr_calls())
+        time.sleep(0.3)
+        self.assertEqual(len(self.auto_continue_prompts()), 1, self.herdr_calls())
+        record = self.read_state()["resume_pending"]
+        self.assertEqual(record["status"], "delivered")
+        self.assertEqual(record["mechanism"], "watcher")
+
+    def test_concurrent_resume_deliver_single_prompt(self) -> None:
+        queued = self.invoke_ok("compact-self", extra_env=self.RECORD_ENV)
+        self.assertTrue(queued["queued"], queued)
+        # The test drives delivery manually: pairctl must not spawn a watcher too.
+        self.assertFalse(queued["continue_after_compact"]["spawned"], queued)
+        self.invoke_ok("rollover", "--reason", "compact")
+        self.set_status("idle")
+        self.clear_calls()
+        first = self.popen("resume-deliver", "--pane", "w1:p1", "--via", "watcher")
+        second = self.popen("resume-deliver", "--pane", "w1:p1", "--via", "plugin")
+        outputs = []
+        for proc in (first, second):
+            out, err = proc.communicate(timeout=30)
+            outputs.append((proc.returncode, out, err))
+        delivered = [
+            o for o in outputs
+            if o[0] == 0 and json.loads(o[1]).get("status") == "resume_delivered"
+        ]
+        rejected = [
+            o for o in outputs
+            if o[0] == 2 and json.loads(o[1]).get("status") == "rejected"
+        ]
+        self.assertEqual(len(delivered), 1, outputs)
+        self.assertEqual(len(rejected), 1, outputs)
+        self.assertEqual(json.loads(rejected[0][1])["reason"], "not_claimable")
+        prompts = [c for c in self.herdr_calls() if c[:2] == ["agent", "prompt"]]
+        self.assertEqual(len(prompts), 1, self.herdr_calls())
+        self.assertEqual(self.read_state()["resume_pending"]["status"], "delivered")
+
+    def test_watcher_child_env_uses_internal_marker(self) -> None:
+        queued = self.invoke_ok("compact-self", extra_env={
+            "PAIRCTL_CONTINUE_AFTER_COMPACT": "1",
+            "PAIRCTL_RESUME_DEADLINE_S": "0",
+            "PAIRCTL_CONTINUE_POLL_S": "0.05",
+        })
+        self.assertTrue(queued["queued"], queued)
+        self.assertTrue(queued["continue_after_compact"]["spawned"], queued)
+        pid = int((self.state / "compact-continue.pid").read_text(encoding="utf-8").strip())
+        # Retry briefly: /proc/<pid>/environ shows the parent env until exec completes.
+        environ = b""
+        read_deadline = time.time() + 5
+        while time.time() < read_deadline:
+            try:
+                environ = Path(f"/proc/{pid}/environ").read_bytes()
+            except OSError:
+                environ = b""
+            if b"PAIRCTL_INTERNAL_WATCHER=1" in environ:
+                break
+            time.sleep(0.05)
+        self.assertIn(b"PAIRCTL_INTERNAL_WATCHER=1", environ)
+        self.assertNotIn(b"PAIRCTL_CONTINUE_AFTER_COMPACT=0", environ)
 
 
 if __name__ == "__main__":

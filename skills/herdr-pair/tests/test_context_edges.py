@@ -128,7 +128,16 @@ class ContextEdgesTest(unittest.TestCase):
         source = h.cwd / "input.txt"
         source.write_text("before dispatch\n", encoding="utf-8")
         handoff = h.write_handoff("active.md", "[可以改] input.txt\n[可以新建] report.md\n[报告] report.md\n")
-        sent = h.invoke_ok("send-round", "--target", "w1:p2", "--file", str(handoff), "--no-fresh")
+        sent = h.invoke_ok(
+            "send-round", "--target", "w1:p2", "--file", str(handoff), "--no-fresh",
+            extra_env={
+                # Record write needs auto-continue; INTERNAL keeps this test's manual
+                # watch the only wake-up source; deadline 0 => due immediately.
+                "PAIRCTL_CONTINUE_AFTER_COMPACT": "1",
+                "PAIRCTL_INTERNAL_WATCHER": "1",
+                "PAIRCTL_RESUME_DEADLINE_S": "0",
+            },
+        )
         self.assertTrue(sent["planner_compact"]["queued"])
         manifest = Path(sent["snapshot"]["manifest"])
         self.assertEqual((manifest.parent / "files" / "input.txt").read_text(), "before dispatch\n")
@@ -147,9 +156,12 @@ class ContextEdgesTest(unittest.TestCase):
         # state selection, even though the five-round boundary is not reached.
         report = h.cwd / "report.md"
         report.write_text("executor finished during compaction\n", encoding="utf-8")
+        # Issue #9: the record-driven watch delivers after deadline 0 plus an epoch
+        # advance, instead of sleeping out the 600 s default deadline.
+        recovered = h.invoke_ok("rollover", "--reason", "compact", "--new-session-id", "session-a")
+        self.assertFalse(recovered["phase_advanced"])
         watched = h.invoke_ok("watch-compact-continue", extra_env={
-            "PAIRCTL_CONTINUE_MIN_DELAY_S": "0", "PAIRCTL_CONTINUE_IDLE_S": "0",
-            "PAIRCTL_CONTINUE_POLL_S": "0.05", "PAIRCTL_CONTINUE_TIMEOUT_S": "1",
+            "PAIRCTL_CONTINUE_POLL_S": "0.05",
         })
         self.assertEqual(watched["status"], "continue_prompted")
         prompt = h.herdr_log()["argv"][4]
@@ -157,6 +169,4 @@ class ContextEdgesTest(unittest.TestCase):
         self.assertIn(str(report), prompt)
         self.assertIn("--state-dir " + str(h.state), prompt)
         self.assertIn("--cwd " + str(h.cwd), prompt)
-        recovered = h.invoke_ok("rollover", "--reason", "compact", "--new-session-id", "session-a")
-        self.assertFalse(recovered["phase_advanced"])
         self.assertEqual(h.invoke_ok("status")["active_rounds"], [sent["round_id"]])
