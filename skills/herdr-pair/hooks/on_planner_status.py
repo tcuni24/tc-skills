@@ -10,9 +10,19 @@ the pairctl pane index ($XDG_STATE_HOME/herdr-pair/panes/<pane_id>.json) and run
         --cwd <index cwd> --state-dir <index state_dir>
 
 exactly once when this pane is the recorded planner of a live pair state whose
-compaction epoch has advanced. Contractual rules:
+compaction epoch has advanced. An executor-pane edge instead runs
+
+    python3 <pairctl> executor-event --pane <pane_id> --status <agent_status> \
+        --cwd <index cwd> --state-dir <index state_dir>
+
+and never reaches resume-deliver (issue #12); pairctl owns every further
+decision there (dedupe, hold, interval, ignore). Contractual rules:
 
 * only pane.agent_status_changed; agent_status must be idle or done;
+* executor routing fires only for a fresh executor entry whose state holds a
+  live delivered round executed by this pane; everything else falls through to
+  the planner checks below, so an executor-role hit with no live round makes
+  no pairctl call at all;
 * stale entries are dropped (PAIRCTL_SESSION_STALE_HOURS, default 12 h);
 * candidates = fresh planner entries whose resume_pending names this pane,
   is pending/uncertain, and has compaction_epoch > epoch_at_arm;
@@ -135,6 +145,54 @@ def select_candidate(pane_id: str) -> dict | None:
     return top[0]
 
 
+# Statuses this hook forwards for an executor pane (issue #12); anything else
+# falls through to the planner path, which filters it out silently.
+EXECUTOR_OK_STATUS = {"done", "blocked", "idle", "working", "unknown"}
+
+
+def select_executor_entry(pane_id: str) -> dict | None:
+    """Newest fresh executor entry whose pair state is live on this pane.
+
+    Returns None on zero hit, stale entries, or a state without an active
+    delivered round executed by this pane - the hook never forwards a status
+    pairctl would only have to ignore, so a stale executor-role hit stays
+    completely silent. An ambiguous newest stamp shared by two state dirs is
+    logged and not forwarded, mirroring select_candidate.
+    """
+    limit = dt.timedelta(hours=stale_hours())
+    now = dt.datetime.now(dt.timezone.utc)
+    candidates: list[tuple[dict, dt.datetime]] = []
+    for entry in load_entries(pane_id):
+        if entry.get("role") != "executor":
+            continue
+        stamp = parse_stamp(entry.get("recorded_at"))
+        if stamp is None or now - stamp > limit:
+            continue
+        state = load_state(str(entry.get("state_dir") or ""))
+        live = any(
+            str(r.get("status") or "") == "active"
+            and str(r.get("executor") or "") == pane_id
+            and str(r.get("dispatch_status") or "") == "delivered"
+            for r in state.get("rounds") or []
+            if isinstance(r, dict)
+        )
+        if not live:
+            continue
+        candidates.append((entry, stamp))
+    if not candidates:
+        return None
+    newest = max(stamp for _, stamp in candidates)
+    top = [entry for entry, stamp in candidates if stamp == newest]
+    state_dirs = sorted({str(entry.get("state_dir") or "") for entry in top})
+    if len(state_dirs) > 1:
+        append_log(
+            f"ambiguous_pane pane={pane_id} recorded_at={newest.isoformat()} "
+            f"state_dirs={','.join(state_dirs)}: no executor-event"
+        )
+        return None
+    return top[0]
+
+
 def main() -> int:
     if os.environ.get("HERDR_PLUGIN_EVENT", "") != EVENT_NAME:
         return 0
@@ -147,14 +205,34 @@ def main() -> int:
     pane_id = str(payload.get("pane_id") or "")
     if not pane_id:
         return 0
-    if str(payload.get("agent_status") or "") not in FRESH_OK_STATUS:
+    agent_status = str(payload.get("agent_status") or "")
+    pairctl = os.environ.get("PAIRCTL") or str(
+        Path(__file__).resolve().parent.parent / "scripts" / "pairctl.py"
+    )
+    # Issue #12: an executor-pane edge goes to executor-event, never
+    # resume-deliver. Only a fresh entry naming a live delivered round for this
+    # pane counts; otherwise fall through, where the planner filters keep the
+    # hook silent (an executor-role hit with no live round makes no call).
+    if agent_status in EXECUTOR_OK_STATUS:
+        exec_entry = select_executor_entry(pane_id)
+        if exec_entry is not None:
+            argv = [
+                "executor-event",
+                "--pane", pane_id,
+                "--status", agent_status,
+                "--cwd", str(exec_entry.get("cwd") or ""),
+                "--state-dir", str(exec_entry.get("state_dir") or ""),
+            ]
+            ok, detail = run_pairctl(pairctl, argv)
+            if not ok:
+                notify_pairctl_failed(pane_id, pairctl, detail)
+                return 1
+            return 0
+    if agent_status not in FRESH_OK_STATUS:
         return 0
     entry = select_candidate(pane_id)
     if entry is None:
         return 0
-    pairctl = os.environ.get("PAIRCTL") or str(
-        Path(__file__).resolve().parent.parent / "scripts" / "pairctl.py"
-    )
     argv = [
         "resume-deliver",
         "--pane", pane_id, "--via", "plugin",

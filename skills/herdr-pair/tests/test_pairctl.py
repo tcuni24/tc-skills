@@ -2968,7 +2968,7 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(manifest.get("platforms"), ["linux", "macos"])
         events = manifest.get("events")
         self.assertIsInstance(events, list)
-        self.assertEqual(len(events), 1, events)
+        self.assertEqual(len(events), 2, events)
         self.assertEqual(events[0].get("on"), "pane.agent_status_changed")
         command = events[0].get("command")
         self.assertIsInstance(command, list)
@@ -2978,6 +2978,16 @@ class PairctlTest(unittest.TestCase):
         resolved = (manifest_path.parent / hook_args[0]).resolve()
         self.assertEqual(resolved, PLUGIN_HOOK.resolve())
         self.assertTrue(resolved.is_file())
+        # issue #12: the second subscription is the pane-exit hook.
+        self.assertEqual(events[1].get("on"), "pane.exited")
+        exited_command = events[1].get("command")
+        self.assertIsInstance(exited_command, list)
+        self.assertTrue(exited_command, exited_command)
+        exited_args = [part for part in exited_command if part.endswith("on_pane_exited.py")]
+        self.assertEqual(len(exited_args), 1, exited_command)
+        exited_resolved = (manifest_path.parent / exited_args[0]).resolve()
+        self.assertEqual(exited_resolved, self.PANE_EXITED_HOOK.resolve())
+        self.assertTrue(exited_resolved.is_file())
         for forbidden in ("actions", "panes", "startup"):
             self.assertNotIn(forbidden, manifest)
 
@@ -3380,6 +3390,473 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(
             notices[0]["dedupe_key"], f"dispatch-stale:p01-r008:{created}",
         )
+
+
+    # --- executor reports, pane exits, executor-event (issue #12) ----------------------
+
+    PANE_EXITED_HOOK = Path(__file__).resolve().parents[1] / "hooks" / "on_pane_exited.py"
+    # Consecutive notices of one round are normally at least 60 s apart; the cases
+    # that deliberately push several times shrink the interval to zero.
+    ZERO_INTERVAL = {"PAIRCTL_EXECUTOR_NOTICE_MIN_S": "0"}
+
+    def executor_event(
+        self, status: str, *, pane: str = "w1:p2", extra_env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        return self.invoke(
+            "executor-event", "--pane", pane, "--status", status, extra_env=extra_env,
+        )
+
+    def executor_prompts(self) -> list[list[str]]:
+        """argv tails of every short report pairctl sent to the planner pane."""
+        return [
+            c for c in self.herdr_calls()
+            if c[:2] == ["agent", "prompt"] and len(c) > 3
+            and str(c[3]).startswith("herdr-pair executor")
+        ]
+
+    def run_exited_hook(
+        self, *, pane_id: str = "w1:p2", extra_env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        env = os.environ.copy()
+        env["XDG_STATE_HOME"] = str(self.state_home)
+        env["PAIRCTL_HERDR"] = str(self.herdr)
+        env.pop("PAIRCTL", None)
+        env.pop("HERDR_PLUGIN_STATE_DIR", None)
+        env["HERDR_PLUGIN_EVENT"] = "pane.exited"
+        env["HERDR_PLUGIN_EVENT_JSON"] = json.dumps({
+            "pane_id": pane_id,
+            "workspace_id": "ws-1",
+        })
+        if extra_env:
+            env.update(extra_env)
+        return subprocess.run(
+            ["python3", str(self.PANE_EXITED_HOOK)],
+            text=True, capture_output=True, check=False, env=env,
+        )
+
+    def clear_stub_calls(self) -> None:
+        path = self.root / self.PLUGIN_STUB_NAME
+        if path.exists():
+            path.unlink()
+
+    def test_executor_done_and_blocked_prompt_and_notice(self) -> None:
+        sent = self.send_round(1)
+        round_id = sent["round_id"]
+        self.clear_calls()
+
+        done = self.executor_event("done", extra_env=self.ZERO_INTERVAL)
+        self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+        self.assertEqual(json.loads(done.stdout)["status"], "notice_sent")
+        prompts = self.executor_prompts()
+        self.assertEqual(len(prompts), 1, self.herdr_calls())
+        self.assertEqual(prompts[0][2], "w1:p1")  # the short report reaches the planner
+        self.assertEqual(
+            prompts[0][3].splitlines()[0],
+            f"herdr-pair executor done round {round_id} revision 1",
+        )
+        notes = self.notification_calls()
+        self.assertEqual(len(notes), 1, self.herdr_calls())
+        self.assertEqual(notes[0][2], "herdr-pair executor done")
+        self.assertEqual(notes[0][-2:], ["--sound", "done"])
+        state = self.read_state()
+        self.assertEqual(len(state["notices"]), 1, state["notices"])
+        record = state["notices"][0]
+        self.assertEqual(record["title"], "herdr-pair executor done")
+        self.assertEqual(record["dedupe_key"], f"executor:{round_id}:1:done:")
+        self.assertTrue(record["body"])
+
+        blocked = self.executor_event("blocked", extra_env=self.ZERO_INTERVAL)
+        self.assertEqual(blocked.returncode, 0, blocked.stderr + blocked.stdout)
+        self.assertEqual(json.loads(blocked.stdout)["status"], "notice_sent")
+        prompts = self.executor_prompts()
+        self.assertEqual(len(prompts), 2, self.herdr_calls())
+        self.assertEqual(
+            prompts[1][3].splitlines()[0],
+            f"herdr-pair executor blocked round {round_id} revision 1",
+        )
+        notes = self.notification_calls()
+        self.assertEqual(len(notes), 2, self.herdr_calls())
+        self.assertEqual(notes[1][2], "herdr-pair executor blocked")
+        self.assertEqual(notes[1][-2:], ["--sound", "request"])
+        state = self.read_state()
+        self.assertEqual(len(state["notices"]), 2, state["notices"])
+        self.assertEqual(
+            state["notices"][1]["dedupe_key"], f"executor:{round_id}:1:blocked:",
+        )
+        # the pane binding is untouched by a status report
+        self.assertEqual(state["rounds"][0]["executor"], "w1:p2")
+        self.assertNotIn("executor_pane_gone_at", state["rounds"][0])
+
+    def test_executor_idle_pushes_only_when_report_changes(self) -> None:
+        sent = self.send_round(1, body=(
+            "[轮次] round_id=<unique-id>\n"
+            "[报告] reports/executor-report.md\n"
+            "produce that report file\n"
+        ))
+        round_id = sent["round_id"]
+        report = Path(sent["report"])
+        self.assertEqual(report, self.cwd.resolve() / "reports" / "executor-report.md")
+        self.clear_calls()
+
+        # No report file yet: an idle edge says nothing the planner needs.
+        missing = self.executor_event("idle", extra_env=self.ZERO_INTERVAL)
+        self.assertEqual(missing.returncode, 0, missing.stderr + missing.stdout)
+        self.assertEqual(json.loads(missing.stdout)["status"], "ignored")
+        self.assertEqual(self.herdr_calls(), [])
+        self.assertEqual(self.read_state()["notices"], [])
+
+        # The file appearing is news: one push, no sound, hash remembered.
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_text("version one\n", encoding="utf-8")
+        first = self.executor_event("idle", extra_env=self.ZERO_INTERVAL)
+        self.assertEqual(first.returncode, 0, first.stderr + first.stdout)
+        self.assertEqual(json.loads(first.stdout)["status"], "notice_sent")
+        prompts = self.executor_prompts()
+        self.assertEqual(len(prompts), 1, self.herdr_calls())
+        self.assertEqual(
+            prompts[0][3].splitlines()[0],
+            f"herdr-pair executor idle round {round_id} revision 1",
+        )
+        notes = self.notification_calls()
+        self.assertEqual(len(notes), 1, self.herdr_calls())
+        self.assertEqual(notes[0][2], "herdr-pair executor idle")
+        self.assertNotIn("--sound", notes[0])
+        state = self.read_state()
+        self.assertEqual(len(state["notices"]), 1, state["notices"])
+        self.assertEqual(
+            state["rounds"][0]["last_executor_report_hash"],
+            hashlib.sha256(b"version one\n").hexdigest(),
+        )
+
+        # Same bytes again: the report hash is unchanged, so nothing is pushed.
+        self.clear_calls()
+        unchanged = self.executor_event("idle", extra_env=self.ZERO_INTERVAL)
+        self.assertEqual(unchanged.returncode, 0, unchanged.stderr + unchanged.stdout)
+        self.assertEqual(json.loads(unchanged.stdout)["status"], "ignored")
+        self.assertEqual(self.herdr_calls(), [])
+        self.assertEqual(len(self.read_state()["notices"]), 1)
+
+        # Changed bytes are news again: exactly one more push. (clear_calls above
+        # reset the transcript, so this push is the only prompt in it; the
+        # notices list in state is cumulative and reaches two.)
+        report.write_text("version two\n", encoding="utf-8")
+        changed = self.executor_event("idle", extra_env=self.ZERO_INTERVAL)
+        self.assertEqual(changed.returncode, 0, changed.stderr + changed.stdout)
+        self.assertEqual(json.loads(changed.stdout)["status"], "notice_sent")
+        self.assertEqual(len(self.executor_prompts()), 1, self.herdr_calls())
+        state = self.read_state()
+        self.assertEqual(len(state["notices"]), 2, state["notices"])
+        self.assertEqual(
+            state["rounds"][0]["last_executor_report_hash"],
+            hashlib.sha256(b"version two\n").hexdigest(),
+        )
+
+    def test_executor_event_ignores_working_and_unknown(self) -> None:
+        self.send_round(1)
+        self.clear_calls()
+        before = (self.state / "state.json").read_bytes()
+        for status in ("working", "unknown"):
+            proc = self.executor_event(status, extra_env=self.ZERO_INTERVAL)
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            payload = json.loads(proc.stdout)
+            self.assertEqual(payload["status"], "ignored", payload)
+            self.assertEqual(self.herdr_calls(), [], status)
+        self.assertEqual(self.read_state()["notices"], [])
+        self.assertEqual((self.state / "state.json").read_bytes(), before)
+
+    def test_executor_event_dedupes_and_respects_min_interval(self) -> None:
+        sent = self.send_round(1)
+        round_id = sent["round_id"]
+        self.clear_calls()
+
+        first = self.executor_event("done", extra_env=self.ZERO_INTERVAL)
+        self.assertEqual(json.loads(first.stdout)["status"], "notice_sent")
+        self.assertEqual(len(self.read_state()["notices"]), 1)
+
+        # Same round, revision, status and report hash: one key, one notice.
+        self.clear_calls()
+        duplicate = self.executor_event("done", extra_env=self.ZERO_INTERVAL)
+        self.assertEqual(duplicate.returncode, 0, duplicate.stderr + duplicate.stdout)
+        self.assertEqual(json.loads(duplicate.stdout)["status"], "ignored")
+        self.assertEqual(self.herdr_calls(), [])
+        self.assertEqual(len(self.read_state()["notices"]), 1)
+        self.assertEqual(self.read_state()["deferred_notices"], [])
+
+        # A new status inside PAIRCTL_EXECUTOR_NOTICE_MIN_S is deferred, not sent.
+        self.clear_calls()
+        held = self.executor_event(
+            "blocked", extra_env={"PAIRCTL_EXECUTOR_NOTICE_MIN_S": "60"},
+        )
+        self.assertEqual(held.returncode, 0, held.stderr + held.stdout)
+        self.assertEqual(json.loads(held.stdout)["status"], "notice_deferred")
+        self.assertEqual(self.herdr_calls(), [])
+        state = self.read_state()
+        self.assertEqual(len(state["notices"]), 1, state["notices"])
+        deferred = state["deferred_notices"]
+        self.assertEqual(len(deferred), 1, deferred)
+        self.assertEqual(deferred[0]["title"], "herdr-pair executor blocked")
+        self.assertEqual(deferred[0]["dedupe_key"], f"executor:{round_id}:1:blocked:")
+
+        # The next event whose interval has already elapsed emits it after all.
+        self.clear_calls()
+        resent = self.executor_event("blocked", extra_env=self.ZERO_INTERVAL)
+        self.assertEqual(resent.returncode, 0, resent.stderr + resent.stdout)
+        self.assertEqual(json.loads(resent.stdout)["status"], "notice_sent")
+        prompts = self.executor_prompts()
+        self.assertEqual(len(prompts), 1, self.herdr_calls())  # sent once, not twice
+        self.assertEqual(
+            prompts[0][3].splitlines()[0],
+            f"herdr-pair executor blocked round {round_id} revision 1",
+        )
+        state = self.read_state()
+        self.assertEqual(len(state["notices"]), 2, state["notices"])
+        self.assertEqual(state["deferred_notices"], [])
+
+        # A deferred notice for another status flushes with the next pushed event.
+        self.clear_calls()
+        held_exit = self.executor_event(
+            "exited", extra_env={"PAIRCTL_EXECUTOR_NOTICE_MIN_S": "60"},
+        )
+        self.assertEqual(json.loads(held_exit.stdout)["status"], "notice_deferred")
+        self.assertEqual(self.herdr_calls(), [])
+        self.assertEqual(len(self.read_state()["deferred_notices"]), 1)
+
+        report = self.cwd / "flush-report.md"
+        report.write_text("flush me\n", encoding="utf-8")
+        state = self.read_state()
+        state["rounds"][0]["report"] = str(report)
+        self.write_state(state)
+        self.clear_calls()
+        flushed = self.executor_event("idle", extra_env=self.ZERO_INTERVAL)
+        self.assertEqual(flushed.returncode, 0, flushed.stderr + flushed.stdout)
+        self.assertEqual(json.loads(flushed.stdout)["status"], "notice_sent")
+        titles = sorted(n["title"] for n in self.read_state()["notices"])
+        self.assertEqual(titles, [
+            "herdr-pair executor blocked",
+            "herdr-pair executor done",
+            "herdr-pair executor exited",
+            "herdr-pair executor idle",
+        ], titles)
+        self.assertEqual(self.read_state()["deferred_notices"], [])
+        # the flushed short report and the current one both reached the planner
+        prompt_titles = [p[3].splitlines()[0] for p in self.executor_prompts()]
+        self.assertEqual(len(prompt_titles), 2, prompt_titles)
+        self.assertTrue(prompt_titles[0].startswith("herdr-pair executor exited"), prompt_titles)
+        self.assertTrue(prompt_titles[1].startswith("herdr-pair executor idle"), prompt_titles)
+
+    def test_executor_notices_deferred_while_compact_queued(self) -> None:
+        sent = self.send_round(1)
+        round_id = sent["round_id"]
+        # Arming the resume writes compact_queued as well: both are hold reasons.
+        armed = self.invoke_ok("compact-self", extra_env=self.RECORD_ENV)
+        self.assertTrue(armed["queued"], armed)
+        self.clear_calls()
+
+        held = self.executor_event("done", extra_env=self.ZERO_INTERVAL)
+        self.assertEqual(held.returncode, 0, held.stderr + held.stdout)
+        self.assertEqual(json.loads(held.stdout)["status"], "notice_deferred")
+        self.assertEqual(self.herdr_calls(), [])  # nothing queued behind /compact
+        state = self.read_state()
+        self.assertEqual(state["notices"], [])
+        deferred = state["deferred_notices"]
+        self.assertEqual(len(deferred), 1, deferred)
+        self.assertEqual(deferred[0]["title"], "herdr-pair executor done")
+        self.assertEqual(deferred[0]["dedupe_key"], f"executor:{round_id}:1:done:")
+
+        # The resume prompt carries the withheld titles and clears the queue.
+        self.invoke_ok("rollover", "--reason", "compact")
+        self.set_status("idle")
+        self.clear_calls()
+        delivered = self.invoke_ok("resume-deliver", "--pane", "w1:p1", "--via", "plugin")
+        self.assertEqual(delivered["status"], "resume_delivered", delivered)
+        prompts = self.auto_continue_prompts()
+        self.assertEqual(len(prompts), 1, self.herdr_calls())
+        self.assertIn("Deferred executor notices:", prompts[0][3])
+        section = prompts[0][3].split("Deferred executor notices:")[1]
+        self.assertIn("herdr-pair executor done", section)
+        state = self.read_state()
+        self.assertEqual(state["deferred_notices"], [])
+        self.assertEqual(state["resume_pending"]["status"], "delivered")
+
+    def test_executor_pane_exit_records_time_and_blocks_next_fresh_send(self) -> None:
+        sent = self.send_round(1)
+        round_id = sent["round_id"]
+        self.clear_calls()
+
+        gone = self.executor_event("exited", extra_env=self.ZERO_INTERVAL)
+        self.assertEqual(gone.returncode, 0, gone.stderr + gone.stdout)
+        self.assertEqual(json.loads(gone.stdout)["status"], "notice_sent")
+        state = self.read_state()
+        round_item = state["rounds"][0]
+        stamp = dt.datetime.fromisoformat(round_item["executor_pane_gone_at"])
+        self.assertEqual(stamp.tzinfo, dt.timezone.utc)
+        # the bindings themselves are not rewritten by an exit
+        self.assertEqual(round_item["executor"], "w1:p2")
+        self.assertEqual(state["planner_pane"], "w1:p1")
+        prompts = self.executor_prompts()
+        self.assertEqual(len(prompts), 1, self.herdr_calls())
+        self.assertEqual(prompts[0][2], "w1:p1")
+        self.assertEqual(
+            prompts[0][3].splitlines()[0],
+            f"herdr-pair executor exited round {round_id} revision 1",
+        )
+        notes = self.notification_calls()
+        self.assertEqual(len(notes), 1, self.herdr_calls())
+        self.assertEqual(notes[0][2], "herdr-pair executor exited")
+        self.assertEqual(notes[0][-2:], ["--sound", "request"])
+        self.assertEqual(len(state["notices"]), 1)
+
+        # The next dispatch to this pane fails before freshen_executor runs.
+        self.clear_calls()
+        handoff = self.write_handoff(
+            "handoff-gone.md", "[轮次] round_id=<unique-id>\nnext round body\n",
+        )
+        failed = self.invoke(
+            "send-round", "--target", "w1:p2", "--file", str(handoff),
+            "--herdr", str(self.herdr), "--scope", "file-2", "--acceptance", "test-2 exit 0",
+        )
+        self.assertEqual(failed.returncode, 2, failed.stdout)
+        self.assertIn("executor_pane_gone", failed.stderr)
+        self.assertEqual(self.herdr_calls(), [])
+        after = self.read_state()
+        self.assertEqual(len(after["rounds"]), 1)
+        self.assertIsNone(after["pending_dispatch"])
+
+    def test_planner_pane_exit_expires_resume(self) -> None:
+        self.arm_and_advance_epoch()
+        self.assertEqual(self.read_state()["resume_pending"]["status"], "pending")
+        self.clear_calls()
+
+        gone = self.executor_event("exited", pane="w1:p1")
+        self.assertEqual(gone.returncode, 0, gone.stderr + gone.stdout)
+        state = self.read_state()
+        record = state["resume_pending"]
+        self.assertEqual(record["status"], "expired")
+        self.assertEqual(record["last_error"], "planner_gone")
+        # human notification only: the planner is gone, so there is no short report
+        notes = self.notification_calls()
+        self.assertEqual(len(notes), 1, self.herdr_calls())
+        self.assertEqual(notes[0][2], "herdr-pair planner exited")
+        self.assertNotIn("--sound", notes[0])
+        self.assertEqual(self.executor_prompts(), [])
+        self.assertEqual(state["notices"][0]["title"], "herdr-pair planner exited")
+        # no active round in this case: nothing about a round is written
+        self.assertEqual(state["rounds"], [])
+
+        # Without a resume record the notification still goes out; no record is created.
+        state["resume_pending"] = None
+        self.write_state(state)
+        self.clear_calls()
+        again = self.executor_event("exited", pane="w1:p1")
+        self.assertEqual(again.returncode, 0, again.stderr + again.stdout)
+        notes = self.notification_calls()
+        self.assertEqual(len(notes), 1, self.herdr_calls())
+        self.assertEqual(notes[0][2], "herdr-pair planner exited")
+        state = self.read_state()
+        self.assertIsNone(state["resume_pending"])
+        self.assertEqual(len(state["notices"]), 2, state["notices"])
+
+    def test_executor_event_silent_without_delivered_round(self) -> None:
+        def assert_ignored(proc: subprocess.CompletedProcess[str], why: str) -> None:
+            self.assertEqual(proc.returncode, 0, f"{why}: {proc.stderr}{proc.stdout}")
+            payload = json.loads(proc.stdout)
+            self.assertEqual(payload["status"], "ignored", f"{why}: {payload}")
+            self.assertEqual(self.herdr_calls(), [], why)
+
+        # no active round at all
+        self.clear_calls()
+        before = (self.state / "state.json").read_bytes()
+        assert_ignored(self.executor_event("done"), "no active round")
+        self.assertEqual((self.state / "state.json").read_bytes(), before)
+
+        # an active round whose dispatch is not delivered
+        self.send_round(1)
+        state = self.read_state()
+        state["rounds"][0]["dispatch_status"] = "pending"
+        self.write_state(state)
+        self.clear_calls()
+        before = (self.state / "state.json").read_bytes()
+        assert_ignored(self.executor_event("done"), "dispatch not delivered")
+        self.assertEqual((self.state / "state.json").read_bytes(), before)
+
+        # a delivered round, but this pane is neither its executor nor the planner
+        state = self.read_state()
+        state["rounds"][0]["dispatch_status"] = "delivered"
+        self.write_state(state)
+        self.clear_calls()
+        before = (self.state / "state.json").read_bytes()
+        assert_ignored(self.executor_event("blocked", pane="w9:p9"), "foreign pane")
+        assert_ignored(self.executor_event("exited", pane="w9:p9"), "foreign pane exit")
+        self.assertEqual((self.state / "state.json").read_bytes(), before)
+        self.assertEqual(self.read_state()["notices"], [])
+
+    def test_pane_exited_hook_routes_through_executor_event(self) -> None:
+        self.send_round(1)
+        self.clear_calls()
+        stub = self.write_pairctl_stub()
+        plugin_state = self.root / "plugin-state-exited"
+        env = {"PAIRCTL": str(stub), "HERDR_PLUGIN_STATE_DIR": str(plugin_state)}
+
+        hook = self.run_exited_hook(pane_id="w1:p2", extra_env=env)
+        self.assertEqual(hook.returncode, 0, hook.stderr)
+        self.assertEqual(hook.stdout, "")
+        self.assertEqual(hook.stderr, "")
+        calls = self.stub_calls()
+        self.assertEqual(calls, [[
+            "executor-event", "--pane", "w1:p2", "--status", "exited",
+            "--cwd", str(self.cwd.resolve()),
+            "--state-dir", str(self.state.resolve()),
+        ]], calls)
+        state = self.read_state()
+        self.assertTrue(state["rounds"][0].get("executor_pane_gone_at"), state["rounds"][0])
+        notes = [n for n in state["notices"] if n["title"] == "herdr-pair executor exited"]
+        self.assertEqual(len(notes), 1, state["notices"])
+
+        # zero hit: a pane this pairing never indexed stays completely silent
+        self.clear_stub_calls()
+        self.clear_calls()
+        miss = self.run_exited_hook(pane_id="wZ:zz", extra_env=env)
+        self.assertEqual(miss.returncode, 0, miss.stderr)
+        self.assertEqual(miss.stdout, "")
+        self.assertEqual(miss.stderr, "")
+        self.assertEqual(self.stub_calls(), [])
+        self.assertEqual(self.herdr_calls(), [])
+
+        # the planner pane exits: the hook still only resolves the index and calls pairctl
+        self.arm_and_advance_epoch()
+        self.clear_stub_calls()
+        self.clear_calls()
+        planner = self.run_exited_hook(pane_id="w1:p1", extra_env=env)
+        self.assertEqual(planner.returncode, 0, planner.stderr)
+        self.assertEqual(planner.stdout, "")
+        self.assertEqual(planner.stderr, "")
+        calls = self.stub_calls()
+        self.assertEqual(len(calls), 1, calls)
+        self.assertEqual(calls[0][0:5], [
+            "executor-event", "--pane", "w1:p1", "--status", "exited",
+        ])
+        self.assertEqual(self.read_state()["resume_pending"]["status"], "expired")
+
+    def test_planner_status_hook_routes_executor_to_executor_event(self) -> None:
+        self.send_round(1)
+        self.clear_calls()
+        stub = self.write_pairctl_stub()
+        env = {"PAIRCTL": str(stub), "PAIRCTL_EXECUTOR_NOTICE_MIN_S": "0"}
+
+        hook = self.run_resume_hook(pane_id="w1:p2", agent_status="done", extra_env=env)
+        self.assertEqual(hook.returncode, 0, hook.stderr)
+        self.assertEqual(hook.stdout, "")
+        self.assertEqual(hook.stderr, "")
+        calls = self.stub_calls()
+        self.assertEqual(calls, [[
+            "executor-event", "--pane", "w1:p2", "--status", "done",
+            "--cwd", str(self.cwd.resolve()),
+            "--state-dir", str(self.state.resolve()),
+        ]], calls)
+        # executor events never take the resume-deliver path
+        self.assertEqual(self.auto_continue_prompts(), [], self.herdr_calls())
+        notes = [n for n in self.read_state()["notices"] if n["title"] == "herdr-pair executor done"]
+        self.assertEqual(len(notes), 1, notes)
 
 
 if __name__ == "__main__":

@@ -129,6 +129,22 @@ DEFAULT_DISPATCH_STALE_S = 900.0
 STALE_DISPATCH_TITLE = "herdr-pair dispatch stale"
 # Written verbatim (no trailing newline, no sort_keys) on a bounded lock timeout.
 LOCK_TIMEOUT_PAYLOAD = '{"status":"rejected","reason":"lock_timeout"}'
+# Issue #12: executor status reports become a short report to the planner plus a
+# host notification, deduplicated per round / revision / status / report hash and
+# rate-limited to one push per PAIRCTL_EXECUTOR_NOTICE_MIN_S seconds per round.
+DEFAULT_EXECUTOR_NOTICE_MIN_S = 60.0
+# `herdr notification show --sound` per status; idle deliberately stays silent.
+EXECUTOR_NOTICE_SOUNDS = {"done": "done", "blocked": "request", "exited": "request"}
+# What the planner should do next, appended to the short report per status.
+EXECUTOR_NOTICE_NEXT = {
+    "done": " Verify the artifacts before accepting: a notification is not evidence.",
+    "idle": " Check whether the Report file changed: a notification is not evidence.",
+    "blocked": " Unblock it or re-cut the round: a notification is not evidence.",
+    "exited": (
+        " Re-resolve the executor before the next dispatch: send-round to this pane "
+        "fails with executor_pane_gone."
+    ),
+}
 
 
 class FreshError(ValueError):
@@ -285,6 +301,8 @@ def load(path: Path, cwd: str) -> dict[str, Any]:
         raise ValueError(f"state cwd mismatch: {data.get('cwd')!r} != {cwd!r}")
     # Issue #11: states written before notices existed gain the array on load.
     data.setdefault("notices", [])
+    # Issue #12: executor notices withheld during compaction queue up here.
+    data.setdefault("deferred_notices", [])
     ver = data.get("version")
     if ver == 1:
         data["version"] = 2
@@ -356,6 +374,7 @@ def record_notice(
     title: str,
     body: str,
     dedupe_key: str = "",
+    sound: str = "",
 ) -> bool:
     """Show one host notification and record its outcome in state (issue #11).
 
@@ -366,7 +385,9 @@ def record_notice(
     non-empty dedupe_key that already exists skips the herdr call and the
     second record entirely. Returns True exactly when a NEW notice was
     appended - the caller asks "was anything notified", not "did the host
-    toast appear", so a rate-limited delivery still counts.
+    toast appear", so a rate-limited delivery still counts. `sound` (issue #12)
+    is passed to the host as `--sound <value>` only when set, so the recorded
+    notice keeps its exact seven-field shape whatever sound it played.
     """
     notices = data.setdefault("notices", [])
     if dedupe_key and any(
@@ -377,7 +398,9 @@ def record_notice(
     shown = True
     try:
         code, out, err, payload = run_herdr(
-            args, ["notification", "show", title, "--body", body]
+            args,
+            ["notification", "show", title, "--body", body]
+            + (["--sound", sound] if sound else []),
         )
     except ValueError:
         reason, shown = "herdr_failed", False  # herdr missing or timed out
@@ -405,6 +428,167 @@ def record_notice(
     })
     persist(pp, data)
     return True  # a new notice exists, whatever the host did with it
+
+
+def executor_notice_min_s() -> float:
+    """PAIRCTL_EXECUTOR_NOTICE_MIN_S seconds (issue #12); unset/invalid falls back to 60."""
+    raw = (os.environ.get("PAIRCTL_EXECUTOR_NOTICE_MIN_S") or "").strip()
+    if not raw:
+        return DEFAULT_EXECUTOR_NOTICE_MIN_S
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_EXECUTOR_NOTICE_MIN_S
+    # `value >= 0` also rejects NaN, which would otherwise never read as elapsed.
+    return value if value >= 0 else DEFAULT_EXECUTOR_NOTICE_MIN_S
+
+
+def executor_notice_hold(data: dict[str, Any]) -> str:
+    """Why executor notices must wait ("" = they may go out now) (issue #12).
+
+    A queued compaction, or a resume still owed to the planner, means the next
+    prompt would land behind `/compact` - before the summary exists - or before
+    the pairing resumed at all. Those notices queue in deferred_notices and ride
+    the resume prompt instead of racing it.
+    """
+    if data.get("compact_queued"):
+        return "compact_queued"
+    record = data.get("resume_pending")
+    if isinstance(record, dict) and str(record.get("status") or "") in RESUME_CLAIMABLE:
+        return "resume_pending"
+    return ""
+
+
+def round_report_hash(round_item: dict[str, Any], cwd: str) -> tuple[bool, str]:
+    """(report file exists, sha256 hexdigest of its bytes) for this round (issue #12).
+
+    No report recorded, an unresolvable path or a missing file all answer
+    (False, "") - the empty string is the hash of "there is no file".
+    """
+    report = str(round_item.get("report") or "")
+    if not report:
+        return False, ""
+    path = Path(report).expanduser()
+    if not path.is_absolute():
+        path = Path(cwd) / path
+    if not path.is_file():
+        return False, ""
+    return True, file_sha256(path)
+
+
+def executor_notice_entry(
+    pp: dict[str, Path],
+    data: dict[str, Any],
+    round_item: dict[str, Any],
+    status: str,
+    *,
+    report_hash: str,
+    reason: str,
+) -> dict[str, Any]:
+    """One executor short report + host notification, deferrable as a unit (issue #12).
+
+    The first prompt line is the fixed contract string
+    `herdr-pair executor <status> round <round_id> revision <revision>`; the
+    notification title is `herdr-pair executor <status>`; the dedupe key is
+    `executor:<round_id>:<revision>:<status>:<report_hash>`.
+    """
+    round_id = str(round_item.get("round_id") or "")
+    revision = int(round_item.get("current_revision", 1) or 1)
+    head = f"herdr-pair executor {status} round {round_id} revision {revision}"
+    report = str(round_item.get("report") or "")
+    prompt = (
+        f"{head}\n"
+        f"Working directory: {data['cwd']}\n"
+        f"State directory: {pp['root']}\n"
+        f"Executor pane: {round_item.get('executor') or 'unknown'}\n"
+        f"Report: {report or 'not written yet'}\n"
+        f"Next:{EXECUTOR_NOTICE_NEXT.get(status, '')}"
+    )
+    body = (
+        f"{head}; executor pane {round_item.get('executor') or 'unknown'}; report "
+        f"{report or 'not written yet'}; state_dir={pp['root']}. Verify by artifact: "
+        "a notification is not evidence."
+    )
+    return {
+        "kind": "executor",
+        "title": f"herdr-pair executor {status}",
+        "prompt": prompt,
+        "body": body,
+        "sound": EXECUTOR_NOTICE_SOUNDS.get(status, ""),
+        "dedupe_key": f"executor:{round_id}:{revision}:{status}:{report_hash}",
+        "round_id": round_id,
+        "revision": revision,
+        "status": status,
+        "report_hash": report_hash,
+        "reason": reason,
+        "at": now(),
+    }
+
+
+def issue_executor_notice(
+    args: argparse.Namespace,
+    pp: dict[str, Path],
+    data: dict[str, Any],
+    entry: dict[str, Any],
+) -> bool:
+    """Deliver one executor notice: short-report the planner, then notify the human.
+
+    Returns True when a NEW notice record was appended (record_notice's contract).
+    A dedupe key that is already recorded skips both calls: that notice went out
+    earlier and the planner must never be prompted twice for the same event.
+    """
+    key = str(entry.get("dedupe_key") or "")
+    notices = data.setdefault("notices", [])
+    if key and any(str(n.get("dedupe_key") or "") == key for n in notices):
+        return False
+    planner = str(data.get("planner_pane") or "")
+    prompt = str(entry.get("prompt") or "")
+    prompted = False
+    if planner and prompt:
+        try:
+            code, _, _, payload = run_herdr(args, ["agent", "prompt", planner, prompt])
+            prompted = code == 0 and is_agent_prompted(payload)
+        except ValueError:
+            prompted = False  # herdr unusable: the notice record still must exist
+    entry["prompted"] = prompted
+    return record_notice(
+        args,
+        pp,
+        data,
+        title=str(entry.get("title") or ""),
+        body=str(entry.get("body") or ""),
+        dedupe_key=key,
+        sound=str(entry.get("sound") or ""),
+    )
+
+
+def flush_executor_notices(
+    args: argparse.Namespace,
+    pp: dict[str, Path],
+    data: dict[str, Any],
+    round_item: dict[str, Any],
+) -> int:
+    """Emit the withheld executor notices once nothing holds them back (issue #12).
+
+    Called only from the path that is about to push a fresh notice, so a hold or
+    a dedupe can never trigger a flush by itself. Returns how many new notices
+    were recorded while emptying deferred_notices.
+    """
+    entries = data.get("deferred_notices") or []
+    if not entries:
+        return 0
+    data["deferred_notices"] = []
+    sent = 0
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if issue_executor_notice(args, pp, data, entry):
+            sent += 1
+        if str(entry.get("round_id") or "") == str(round_item.get("round_id") or ""):
+            round_item["last_executor_notice_at"] = now()
+            if entry.get("report_hash"):
+                round_item["last_executor_report_hash"] = str(entry["report_hash"])
+    return sent
 
 
 def dispatch_stale_threshold_s() -> float:
@@ -1195,6 +1379,19 @@ def compact_continue_prompt(pp: dict[str, Path], data: dict[str, Any]) -> str:
         f"{item.get('report') or 'read the contract for the report path'}"
         for item in data.get("rounds", []) if item.get("status") == "active"
     ) or "no active rounds recorded"
+    # Issue #12: executor notices withheld while compaction was queued are listed
+    # here by title, so the planner learns what happened during the blackout. The
+    # resume-deliver command clears deferred_notices once this prompt is sent.
+    deferred = [item for item in (data.get("deferred_notices") or []) if isinstance(item, dict)]
+    withheld = ""
+    if deferred:
+        withheld = (
+            "\nDeferred executor notices:\n"
+            + "\n".join(
+                f"- {item.get('title') or 'herdr-pair executor notice'}" for item in deferred
+            )
+            + "\n"
+        )
     return (
         "herdr-pair auto-continue after compaction. Do not wait for the user to say 继续.\n"
         f"Working directory: {data['cwd']}\n"
@@ -1210,6 +1407,7 @@ def compact_continue_prompt(pp: dict[str, Path], data: dict[str, Any]) -> str:
         "5. Continue the pairing immediately: independently verify any outstanding "
         "executor report, or dispatch the next prepared handoff. Do not ask the user "
         "to confirm."
+        + withheld
     )
 
 
@@ -1948,6 +2146,20 @@ def cmd_send_round(args: argparse.Namespace) -> int:
     text = handoff.read_text(encoding="utf-8")
     with locked(pp["root"], pp["lock"]):
         data = load_ready(pp, cwd)
+        # Issue #12: a pane that exited during a round must not be freshened or
+        # prompted into a dead target. Checked before any dispatch bookkeeping so
+        # a refusal consumes no round and leaves pending_dispatch untouched.
+        target = str(args.target or "").strip()
+        for item in data.get("rounds", []):
+            if (
+                str(item.get("executor") or "").strip() == target
+                and item.get("executor_pane_gone_at")
+            ):
+                raise ValueError(
+                    "executor_pane_gone: "
+                    f"pane {target} exited at {item['executor_pane_gone_at']} "
+                    f"during round {item.get('round_id')}; re-dispatch to a live pane"
+                )
         if data["rollover_required"]:
             return emit_rollover_block(pp, data, "round limit reached", args)
         if compact_pending(data):
@@ -2109,6 +2321,7 @@ def cmd_send_round(args: argparse.Namespace) -> int:
         "work_status": "pending_acceptance",
         "contract_hash": contract_hash,
         "contract_path": contract_path,
+        "report": parse_report_path(text, cwd),
         "snapshot": snapshot,
         "warnings": warnings,
         "context_usage": usage,
@@ -2863,6 +3076,9 @@ def cmd_resume_deliver(args: argparse.Namespace) -> int:
         if delivered:
             record["status"] = "delivered"
             record["last_error"] = ""
+            # The prompt body carried the deferred executor notices section, so the
+            # delivered prompt consumed them; drop them from state.
+            data["deferred_notices"] = []
             persist(pp, data)
             output({"status": "resume_delivered", **result, "record": record})
             return 0
@@ -2886,6 +3102,140 @@ def cmd_resume_deliver(args: argparse.Namespace) -> int:
         record["status"] = "uncertain"
         persist(pp, data)
         output({"status": "resume_uncertain", **result, "record": record})
+        return 0
+
+
+def cmd_executor_event(args: argparse.Namespace) -> int:
+    """Absorb one executor status edge: short-report, defer, or stay silent (issue #12).
+
+    Always answers JSON on stdout: `notice_sent`, `notice_deferred`,
+    `planner_exited_notified`, or `ignored` (+reason). Gates run in order, first
+    hit wins: planner exit (needs no round) -> active round -> delivered dispatch
+    -> pane match -> working/unknown -> exited stamp -> idle report hash ->
+    dedupe -> hold -> min interval -> flush earlier deferred notices, then push
+    this one. Uses load(), not load_ready(): a pending dispatch must not turn a
+    status edge into a PendingDispatchError.
+    """
+    pp = paths(args)
+    cwd = canonical_cwd(args.cwd)
+    status = args.status
+    pane = args.pane
+    with locked(pp["root"], pp["lock"]):
+        data = load(pp["state"], cwd)
+        if status == "exited" and pane == str(data.get("planner_pane") or ""):
+            # The planner is gone: no short report can land there, so only the
+            # human hears it and an owed resume dies. No hold and no interval
+            # gate: a repeated exit is a repeated event, not a duplicate.
+            record = data.get("resume_pending")
+            if isinstance(record, dict) and record:
+                record["status"] = "expired"
+                record["last_error"] = "planner_gone"
+            record_notice(
+                args,
+                pp,
+                data,
+                title="herdr-pair planner exited",
+                body=(
+                    f"planner pane {pane} exited; state_dir={pp['root']}. A queued "
+                    "resume, if any, is expired, not pending."
+                ),
+                dedupe_key=(
+                    f"planner-exited:"
+                    f"{dt.datetime.now(dt.timezone.utc).isoformat()}"
+                ),
+            )
+            output({"status": "planner_exited_notified", "pane": pane})
+            return 0
+        active = next(
+            (r for r in data.get("rounds", []) if str(r.get("status") or "") == "active"),
+            None,
+        )
+        if active is None:
+            output({"status": "ignored", "reason": "no_active_round"})
+            return 0
+        if str(active.get("dispatch_status") or "") != "delivered":
+            output({"status": "ignored", "reason": "dispatch_not_delivered"})
+            return 0
+        executor = str(active.get("executor") or "")
+        planner = str(data.get("planner_pane") or "")
+        if pane != executor and pane != planner:
+            output({"status": "ignored", "reason": "pane_mismatch", "pane": pane})
+            return 0
+        if status in ("working", "unknown"):
+            output({"status": "ignored", "reason": "status_ignored"})
+            return 0
+        if status == "exited":
+            # Recorded before any notice gate: a vanished pane is a fact even
+            # when its notice is held back; send-round refuses this target later.
+            active["executor_pane_gone_at"] = now()
+            persist(pp, data)
+        exists, report_hash = round_report_hash(active, cwd)
+        if status == "idle":
+            if not exists:
+                output({"status": "ignored", "reason": "report_missing"})
+                return 0
+            if report_hash == str(active.get("last_executor_report_hash") or ""):
+                output({"status": "ignored", "reason": "report_unchanged"})
+                return 0
+        entry = executor_notice_entry(
+            pp, data, active, status, report_hash=report_hash, reason="executor_event"
+        )
+        key = str(entry["dedupe_key"])
+        if any(
+            str(n.get("dedupe_key") or "") == key
+            for n in data.setdefault("notices", [])
+        ):
+            output({"status": "ignored", "reason": "already_notified"})
+            return 0
+        deferred = data.setdefault("deferred_notices", [])
+        already_deferred = any(
+            isinstance(d, dict) and str(d.get("dedupe_key") or "") == key
+            for d in deferred
+        )
+
+        def hold(reason: str) -> int:
+            if already_deferred:
+                output({"status": "ignored", "reason": "already_deferred"})
+                return 0
+            entry["reason"] = reason
+            deferred.append(entry)
+            persist(pp, data)
+            output({"status": "notice_deferred", "reason": reason, "dedupe_key": key})
+            return 0
+
+        hold_reason = executor_notice_hold(data)
+        if hold_reason:
+            return hold(hold_reason)
+        min_s = executor_notice_min_s()
+        last = str(active.get("last_executor_notice_at") or "")
+        if last and min_s > 0:
+            try:
+                elapsed = (
+                    dt.datetime.now(dt.timezone.utc)
+                    - dt.datetime.fromisoformat(last)
+                ).total_seconds()
+            except ValueError:
+                elapsed = min_s  # unparsable stamp cannot throttle: let it through
+            if elapsed < min_s:
+                return hold("min_interval")
+        # Nothing holds it back: drop this key's own deferred twin (a resend),
+        # flush the rest oldest-first, then push the current notice.
+        data["deferred_notices"] = [
+            d
+            for d in deferred
+            if not (isinstance(d, dict) and str(d.get("dedupe_key") or "") == key)
+        ]
+        flush_executor_notices(args, pp, data, active)
+        issue_executor_notice(args, pp, data, entry)
+        active["last_executor_notice_at"] = now()
+        if status == "idle" and report_hash:
+            active["last_executor_report_hash"] = report_hash
+        persist(pp, data)
+        output({
+            "status": "notice_sent",
+            "dedupe_key": key,
+            "round_id": entry.get("round_id"),
+        })
         return 0
 
 
@@ -3053,6 +3403,15 @@ def parser() -> argparse.ArgumentParser:
         help="wake-up point that ran this check (recorded in the output)",
     )
     p.set_defaults(func=cmd_wake)
+
+    p = sub.add_parser("executor-event", parents=[common])
+    p.add_argument("--pane", required=True, help="pane this status edge came from")
+    p.add_argument(
+        "--status", required=True,
+        choices=("done", "blocked", "idle", "working", "unknown", "exited"),
+        help="executor status edge (issue #12); working/unknown are always ignored",
+    )
+    p.set_defaults(func=cmd_executor_event)
     return ap
 
 

@@ -1,9 +1,10 @@
-"""pairctl subprocess runner and failure notification for the status hook.
+"""pairctl subprocess runner and failure notification for the plugin hooks.
 
-Shared by `on_planner_status.py` (issue #11). This module never imports
-pairctl.py: it spawns the script as a child process, so a pairctl import error
-cannot take the hook down with it. The only host call here is the one-time
-`herdr notification show` announcing that pairctl failed.
+Shared by `on_planner_status.py` (issue #11) and `on_pane_exited.py`
+(issue #12). This module never imports pairctl.py: it spawns the script as a
+child process, so a pairctl import error cannot take the hook down with it.
+The only host call here is the one-time `herdr notification show` announcing
+that pairctl failed.
 """
 
 from __future__ import annotations
