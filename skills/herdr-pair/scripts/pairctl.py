@@ -131,6 +131,16 @@ def default_root(cwd: str) -> Path:
     return base / "herdr-pair" / key
 
 
+def pane_index_path(pane_id: str) -> Path:
+    """Per-pane index file: $XDG_STATE_HOME/herdr-pair/panes/<pane_id>.json (issue #10).
+
+    Shared by every pair state directory, so it lives outside any single state root
+    and is never protected by a state lock.
+    """
+    base = Path(os.environ.get("XDG_STATE_HOME", "~/.local/state")).expanduser()
+    return base / "herdr-pair" / "panes" / f"{pane_id}.json"
+
+
 def paths(args: argparse.Namespace) -> dict[str, Path]:
     cwd = canonical_cwd(args.cwd)
     root = Path(args.state_dir).expanduser().resolve() if args.state_dir else default_root(cwd)
@@ -181,6 +191,41 @@ def atomic_text(path: Path, text: str) -> None:
     finally:
         if os.path.exists(tmp_name):
             os.unlink(tmp_name)
+
+
+def record_pane(pane_id: str, state_dir: str, cwd: str, role: str) -> None:
+    """Index which pair state directory a pane belongs to (issue #10).
+
+    The file is a JSON array of {state_dir, cwd, role, recorded_at} elements keyed
+    by state_dir + role: rewriting one refreshes recorded_at in place and moves the
+    element to the end of the array instead of appending a duplicate. An empty
+    pane id writes nothing. The index only feeds the plugin resume hook, so
+    state.json stays the single source of truth: a corrupt file restarts the
+    array and an unwritable location never fails the command it decorates.
+    """
+    if not pane_id:
+        return
+    path = pane_index_path(pane_id)
+    raw: Any = None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raw = None  # missing or corrupt: rebuild from this write
+    entries: list[dict[str, str]] = (
+        [e for e in raw if isinstance(e, dict)] if isinstance(raw, list) else []
+    )
+    key = (state_dir, role)
+    entries = [
+        e for e in entries
+        if (str(e.get("state_dir") or ""), str(e.get("role") or "")) != key
+    ]
+    entries.append({
+        "state_dir": state_dir, "cwd": cwd, "role": role, "recorded_at": now(),
+    })
+    try:
+        atomic_text(path, json.dumps(entries, ensure_ascii=False, indent=2) + "\n")
+    except OSError:
+        pass  # best-effort cache; the state machine does not depend on it
 
 
 def load(path: Path, cwd: str) -> dict[str, Any]:
@@ -1487,6 +1532,8 @@ def cmd_init(args: argparse.Namespace) -> int:
         ):
             planner_compact = queue_budget_compact(args, pp, data, "init_context_budget")
         persist(pp, data)
+        # Pane index, write point 1: init's --planner-pane.
+        record_pane(args.planner_pane or "", str(pp["root"]), cwd, "planner")
     continue_after = spawn_compact_continue_watcher(args, pp, data, planner_compact) if planner_compact else None
     payload = {
         "status": "CONTEXT_COMPACT_QUEUED" if planner_compact and planner_compact.get("queued") else "initialized",
@@ -1524,6 +1571,8 @@ def cmd_note_session(args: argparse.Namespace) -> int:
                 output({"status": "session_ignored", "reason": "pane_unknown"})
                 return 0
         atomic_text(pp["planner_session"], json.dumps(record, indent=2, sort_keys=True) + "\n")
+        # Pane index, write point 2: note-session's --pane.
+        record_pane(args.pane or "", str(pp["root"]), cwd, "planner")
     output({"status": "session_noted", "planner_session": str(pp["planner_session"])})
     return 0
 
@@ -1778,6 +1827,8 @@ def cmd_send_round(args: argparse.Namespace) -> int:
         if usage.get("status") == "ok" and usage.get("over_budget") and auto_compact_enabled(data):
             planner_compact = queue_budget_compact(args, pp, data, "post_dispatch_budget")
         persist(pp, data)
+        # Pane index, write point 3: send-round's --target, bound as the executor.
+        record_pane(args.target, str(pp["root"]), cwd, "executor")
     continue_after = spawn_compact_continue_watcher(args, pp, data, planner_compact) if planner_compact else None
     result = {
         "status": "round_sent",
@@ -2436,6 +2487,8 @@ def cmd_rollover(args: argparse.Namespace) -> int:
             data["rollover_required"] = False
         data["compact_queued"] = None
         persist(pp, data)
+        # Pane index, write point 4: rollover's planner_pane.
+        record_pane(str(data.get("planner_pane") or ""), str(pp["root"]), cwd, "planner")
     output({
         "status": "rollover_recorded",
         "phase": data["phase"],
@@ -2466,6 +2519,9 @@ def cmd_compact_self(args: argparse.Namespace) -> int:
         if result.get("queued"):
             write_checkpoint(pp["checkpoint"], data, f"planner {args.mode} queued")
         persist(pp, data)
+        # Pane index, write point 5: the planner pane compact-self actually used
+        # (--planner-pane wins above, otherwise the state's planner_pane).
+        record_pane(str(data.get("planner_pane") or ""), str(pp["root"]), cwd, "planner")
     result["status"] = "planner_compact_queued" if result.get("queued") else "planner_compact_not_queued"
     result["checkpoint"] = str(pp["checkpoint"])
     # Spawn point (issue #9): only fires for a newly armed record with auto-continue on.

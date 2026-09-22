@@ -13,11 +13,13 @@ import stat
 import subprocess
 import tempfile
 import time
+import tomllib
 import unittest
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "pairctl.py"
 HOOK = Path(__file__).resolve().parents[1] / "scripts" / "claude_session_start_hook.py"
+PLUGIN_HOOK = Path(__file__).resolve().parents[1] / "hooks" / "on_planner_status.py"
 FAKE_HERDR = r'''#!/usr/bin/env python3
 import json
 import os
@@ -112,6 +114,10 @@ class PairctlTest(unittest.TestCase):
         self.cwd = self.root / "project"
         self.cwd.mkdir()
         self.state = self.root / "state"
+        # Issue #10: invoke() pins XDG_STATE_HOME into the case's own temporary
+        # directory so the pane index (and default state root) never touch the
+        # user's real ~/.local/state.
+        self.state_home = self.root / "xdg-state"
         self.herdr = self.root / "fake-herdr"
         self.herdr.write_text(FAKE_HERDR, encoding="utf-8")
         os.chmod(self.herdr, 0o755)
@@ -154,6 +160,7 @@ class PairctlTest(unittest.TestCase):
         if use_state_dir:
             cmd += ["--state-dir", str(self.state)]
         env = os.environ.copy()
+        env["XDG_STATE_HOME"] = str(self.state_home)
         env["PAIRCTL_STATE_JSON"] = str(self.state / "state.json")
         env["PAIRCTL_HERDR"] = str(self.herdr)
         env.pop("PAIRCTL_AUTO_COMPACT", None)
@@ -172,6 +179,7 @@ class PairctlTest(unittest.TestCase):
         """Start pairctl without waiting, for overlap tests (same environment as invoke)."""
         cmd = ["python3", str(SCRIPT), *args, "--cwd", str(self.cwd), "--state-dir", str(self.state)]
         env = os.environ.copy()
+        env["XDG_STATE_HOME"] = str(self.state_home)
         env["PAIRCTL_STATE_JSON"] = str(self.state / "state.json")
         env["PAIRCTL_HERDR"] = str(self.herdr)
         env.pop("PAIRCTL_AUTO_COMPACT", None)
@@ -916,7 +924,16 @@ class PairctlTest(unittest.TestCase):
                 break
             time.sleep(0.05)
         self.assertEqual(len(continue_prompts), 1, self.herdr_calls())
-        self.assertEqual(self.read_state()["resume_pending"]["status"], "delivered")
+        # The watcher records `delivered` right after the prompt lands in herdr;
+        # poll for it like test_watcher_delivers_once does instead of racing it.
+        status = ""
+        settle_until = time.time() + 5
+        while time.time() < settle_until:
+            status = self.read_state()["resume_pending"]["status"]
+            if status == "delivered":
+                break
+            time.sleep(0.05)
+        self.assertEqual(status, "delivered")
 
     def test_auto_compact_can_be_disabled_by_env_and_init(self) -> None:
         for n in range(1, 5):
@@ -2603,6 +2620,350 @@ class PairctlTest(unittest.TestCase):
             time.sleep(0.05)
         self.assertIn(b"PAIRCTL_INTERNAL_WATCHER=1", environ)
         self.assertNotIn(b"PAIRCTL_CONTINUE_AFTER_COMPACT=0", environ)
+
+
+    # --- pane index + plugin resume hook (issue #10) ----------------------------------
+
+    PLUGIN_STUB_NAME = "pairctl-stub.log.jsonl"
+
+    def pane_index_path(self, pane_id: str) -> Path:
+        return self.state_home / "herdr-pair" / "panes" / f"{pane_id}.json"
+
+    def read_pane_index(self, pane_id: str) -> list[dict]:
+        return json.loads(self.pane_index_path(pane_id).read_text(encoding="utf-8"))
+
+    def write_pane_index(self, pane_id: str, entries: list[dict]) -> None:
+        path = self.pane_index_path(pane_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(entries, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+
+    def fresh_stamp(self, hours: float = 0.0, seconds: float = 0.0) -> str:
+        stamp = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=hours, seconds=seconds)
+        return stamp.replace(microsecond=0).isoformat()
+
+    def write_pairctl_stub(self) -> Path:
+        """PAIRCTL target for the plugin hook: record the exact resume-deliver argv,
+        then exec the real pairctl so the delivery path still runs end to end."""
+        stub = self.root / "pairctl-stub.py"
+        stub.write_text(
+            "import json, os, sys\n"
+            f"log = {str(self.root / self.PLUGIN_STUB_NAME)!r}\n"
+            "with open(log, 'a', encoding='utf-8') as handle:\n"
+            "    handle.write(json.dumps(sys.argv[1:], ensure_ascii=False) + '\\n')\n"
+            f"os.execv(sys.executable, [sys.executable, {str(SCRIPT)!r}] + sys.argv[1:])\n",
+            encoding="utf-8",
+        )
+        return stub
+
+    def stub_calls(self) -> list[list[str]]:
+        path = self.root / self.PLUGIN_STUB_NAME
+        if not path.exists():
+            return []
+        return [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines() if line.strip()
+        ]
+
+    def run_resume_hook(
+        self,
+        *,
+        pane_id: str = "w1:p1",
+        agent_status: str = "idle",
+        event: str = "pane.agent_status_changed",
+        extra_env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        env = os.environ.copy()
+        env["XDG_STATE_HOME"] = str(self.state_home)
+        env["PAIRCTL_HERDR"] = str(self.herdr)
+        env.pop("PAIRCTL", None)
+        env.pop("PAIRCTL_SESSION_STALE_HOURS", None)
+        env.pop("HERDR_PLUGIN_STATE_DIR", None)
+        env["HERDR_PLUGIN_EVENT"] = event
+        env["HERDR_PLUGIN_EVENT_JSON"] = json.dumps({
+            "pane_id": pane_id,
+            "workspace_id": "ws-1",
+            "agent_status": agent_status,
+        })
+        if extra_env:
+            env.update(extra_env)
+        return subprocess.run(
+            ["python3", str(PLUGIN_HOOK)],
+            text=True, capture_output=True, check=False, env=env,
+        )
+
+    def test_pane_index_five_write_points_include_custom_state_dir(self) -> None:
+        # setUp already ran `init --planner-pane w1:p1 --state-dir self.state`.
+        entries = self.read_pane_index("w1:p1")
+        self.assertEqual(len(entries), 1, entries)
+        self.assertEqual(
+            set(entries[0]), {"state_dir", "cwd", "role", "recorded_at"}, entries[0]
+        )
+        self.assertEqual(entries[0]["state_dir"], str(self.state.resolve()))
+        self.assertEqual(entries[0]["cwd"], str(self.cwd.resolve()))
+        self.assertEqual(entries[0]["role"], "planner")
+        initial_stamp = dt.datetime.fromisoformat(entries[0]["recorded_at"])
+
+        # write point 2: note-session --pane refreshes the same state_dir + role
+        self.invoke_ok(
+            "note-session", "--session-id", "sess-index", "--kind", "claude",
+            "--source", "test", "--pane", "w1:p1",
+        )
+        entries = self.read_pane_index("w1:p1")
+        self.assertEqual(len(entries), 1, entries)  # updated in place, not appended
+
+        # write point 4 (runs before 3: a queued compact would block send-round):
+        # send-round --target binds the executor pane
+        sent = self.send_round(1)
+        self.assertEqual(sent["status"], "round_sent")
+        executor_entries = self.read_pane_index("w1:p2")
+        self.assertEqual(len(executor_entries), 1, executor_entries)
+        self.assertEqual(executor_entries[0]["role"], "executor")
+        self.assertEqual(executor_entries[0]["state_dir"], str(self.state.resolve()))
+        self.assertEqual(executor_entries[0]["cwd"], str(self.cwd.resolve()))
+
+        # write point 3: compact-self records the planner pane it actually used
+        queued = self.invoke_ok("compact-self")
+        self.assertTrue(queued["queued"], queued)
+        entries = self.read_pane_index("w1:p1")
+        self.assertEqual(len(entries), 1, entries)
+        self.assertEqual(entries[0]["role"], "planner")
+        self.assertGreaterEqual(
+            dt.datetime.fromisoformat(entries[0]["recorded_at"]), initial_stamp
+        )
+
+        # write point 5: rollover records the state's planner_pane
+        rolled = self.invoke_ok("rollover", "--reason", "compact")
+        self.assertEqual(rolled["compaction_epoch"], 1)
+        entries = self.read_pane_index("w1:p1")
+        self.assertEqual(len(entries), 1, entries)
+
+        # a custom --state-dir is its own entry, keyed by state_dir + role
+        custom = self.root / "custom-state"
+        self.invoke_ok(
+            "init", "--planner-pane", "w1:p1", "--state-dir", str(custom),
+            use_state_dir=False,
+        )
+        entries = self.read_pane_index("w1:p1")
+        self.assertEqual(
+            sorted(e["state_dir"] for e in entries),
+            sorted([str(self.state.resolve()), str(custom.resolve())]),
+        )
+        # rewriting the default entry moves it to the end instead of adding a third
+        self.invoke_ok(
+            "note-session", "--session-id", "sess-index-2", "--kind", "claude",
+            "--source", "test", "--pane", "w1:p1",
+        )
+        entries = self.read_pane_index("w1:p1")
+        self.assertEqual(len(entries), 2, entries)
+        self.assertEqual(entries[-1]["state_dir"], str(self.state.resolve()))
+        self.assertEqual(entries[0]["state_dir"], str(custom.resolve()))
+
+        # an empty pane id writes nothing at all
+        panes_dir = self.state_home / "herdr-pair" / "panes"
+        before = sorted(p.name for p in panes_dir.iterdir())
+        self.invoke_ok(
+            "init", "--state-dir", str(self.root / "paneless-state"),
+            use_state_dir=False,
+        )
+        self.assertEqual(sorted(p.name for p in panes_dir.iterdir()), before)
+
+    def test_pane_index_entry_expires_after_stale_hours(self) -> None:
+        self.arm_and_advance_epoch()
+        self.set_status("idle")
+        stub = self.write_pairctl_stub()
+
+        # Age the planner entry past DEFAULT_STALE_HOURS (12 h): treated as absent.
+        entries = self.read_pane_index("w1:p1")
+        entries[0]["recorded_at"] = self.fresh_stamp(hours=13)
+        self.write_pane_index("w1:p1", entries)
+        hook = self.run_resume_hook(extra_env={"PAIRCTL": str(stub)})
+        self.assertEqual(hook.returncode, 0, hook.stderr)
+        self.assertEqual(hook.stdout, "")
+        self.assertEqual(hook.stderr, "")
+        self.assertEqual(self.stub_calls(), [])
+
+        # PAIRCTL_SESSION_STALE_HOURS narrows the window: 3 h old with a 1 h limit expires.
+        entries[0]["recorded_at"] = self.fresh_stamp(hours=3)
+        self.write_pane_index("w1:p1", entries)
+        hook = self.run_resume_hook(
+            extra_env={"PAIRCTL": str(stub), "PAIRCTL_SESSION_STALE_HOURS": "1"}
+        )
+        self.assertEqual(hook.returncode, 0, hook.stderr)
+        self.assertEqual(hook.stdout, "")
+        self.assertEqual(hook.stderr, "")
+        self.assertEqual(self.stub_calls(), [])
+
+        # A fresh rewrite (note-session) makes the same idle event deliverable again.
+        self.invoke_ok(
+            "note-session", "--session-id", "sess-stale", "--kind", "claude",
+            "--source", "test", "--pane", "w1:p1",
+        )
+        hook = self.run_resume_hook(extra_env={"PAIRCTL": str(stub)})
+        self.assertEqual(hook.returncode, 0, hook.stderr)
+        calls = self.stub_calls()
+        self.assertEqual(len(calls), 1, calls)
+        self.assertEqual(calls[0][0], "resume-deliver")
+        self.assertEqual(self.read_state()["resume_pending"]["status"], "delivered")
+
+    def test_resume_hook_calls_resume_deliver_once_when_idle_after_epoch(self) -> None:
+        self.arm_and_advance_epoch()
+        self.set_status("idle")
+        self.clear_calls()
+        stub = self.write_pairctl_stub()
+        plugin_state = self.root / "plugin-state"
+        env = {"PAIRCTL": str(stub), "HERDR_PLUGIN_STATE_DIR": str(plugin_state)}
+
+        hook = self.run_resume_hook(extra_env=env)
+        self.assertEqual(hook.returncode, 0, hook.stderr)
+        self.assertEqual(hook.stdout, "")
+        self.assertEqual(hook.stderr, "")
+        calls = self.stub_calls()
+        self.assertEqual(len(calls), 1, calls)
+        self.assertEqual(calls[0], [
+            "resume-deliver", "--pane", "w1:p1", "--via", "plugin",
+            "--cwd", str(self.cwd.resolve()),
+            "--state-dir", str(self.state.resolve()),
+        ])
+        # The stub exec'd the real pairctl: exactly one resume prompt reached herdr.
+        prompts = self.auto_continue_prompts()
+        self.assertEqual(len(prompts), 1, self.herdr_calls())
+        self.assertEqual(prompts[0][2], "w1:p1")
+        self.assertEqual(self.read_state()["resume_pending"]["status"], "delivered")
+
+        # The next idle edge after delivery is a no-op: still exactly one call.
+        hook = self.run_resume_hook(extra_env=env)
+        self.assertEqual(hook.returncode, 0, hook.stderr)
+        self.assertEqual(hook.stdout, "")
+        self.assertEqual(hook.stderr, "")
+        self.assertEqual(len(self.stub_calls()), 1)
+
+    def test_resume_hook_silent_on_miss_and_mismatch(self) -> None:
+        stub = self.write_pairctl_stub()
+        plugin_state = self.root / "plugin-state-silent"
+        env = {"PAIRCTL": str(stub), "HERDR_PLUGIN_STATE_DIR": str(plugin_state)}
+
+        def assert_silent(hook: subprocess.CompletedProcess[str], why: str) -> None:
+            self.assertEqual(hook.returncode, 0, f"{why}: {hook.stderr}")
+            self.assertEqual(hook.stdout, "", why)
+            self.assertEqual(hook.stderr, "", why)
+            self.assertEqual(self.stub_calls(), [], why)
+
+        # zero hit: this pane was never recorded
+        assert_silent(self.run_resume_hook(pane_id="wZ:zz", extra_env=env), "zero hit")
+        # wrong event name
+        assert_silent(self.run_resume_hook(event="pane.exited", extra_env=env), "wrong event")
+        # agent_status outside idle/done
+        assert_silent(self.run_resume_hook(agent_status="working", extra_env=env), "busy")
+        # index hit but no resume record at all
+        assert_silent(self.run_resume_hook(extra_env=env), "no record")
+        # armed record whose epoch has not advanced yet
+        armed = self.invoke_ok("compact-self", extra_env=self.RECORD_ENV)
+        self.assertTrue(armed["queued"], armed)
+        assert_silent(self.run_resume_hook(extra_env=env), "epoch not advanced")
+
+        self.invoke_ok("rollover", "--reason", "compact")
+        # planner-role entry pointing at a state whose resume names another pane
+        self.write_pane_index("w1:p9", [{
+            "state_dir": str(self.state.resolve()),
+            "cwd": str(self.cwd.resolve()),
+            "role": "planner",
+            "recorded_at": self.fresh_stamp(),
+        }])
+        assert_silent(
+            self.run_resume_hook(pane_id="w1:p9", extra_env=env), "planner_pane mismatch"
+        )
+
+        # executor-role hit: the state would otherwise match this pane completely
+        state = self.read_state()
+        state["resume_pending"]["planner_pane"] = "w1:p2"
+        self.write_state(state)
+        self.write_pane_index("w1:p2", [{
+            "state_dir": str(self.state.resolve()),
+            "cwd": str(self.cwd.resolve()),
+            "role": "executor",
+            "recorded_at": self.fresh_stamp(),
+        }])
+        assert_silent(self.run_resume_hook(pane_id="w1:p2", extra_env=env), "executor role")
+        # nothing claimed, delivered or logged along the way
+        self.assertEqual(self.read_state()["resume_pending"]["status"], "pending")
+        self.assertFalse((plugin_state / "hook.log").exists())
+
+    def test_resume_hook_ambiguous_pane_logs_and_does_not_deliver(self) -> None:
+        self.arm_and_advance_epoch()
+        self.set_status("idle")
+        stub = self.write_pairctl_stub()
+        plugin_state = self.root / "plugin-state-amb"
+        env = {"PAIRCTL": str(stub), "HERDR_PLUGIN_STATE_DIR": str(plugin_state)}
+
+        other = self.root / "other-state"
+        other.mkdir(parents=True, exist_ok=True)
+        (other / "state.json").write_text(json.dumps({
+            "resume_pending": {
+                "planner_pane": "w1:p1", "status": "pending", "epoch_at_arm": 0,
+            },
+            "compaction_epoch": 1,
+        }, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+        shared = self.fresh_stamp()
+        self.write_pane_index("w1:p1", [
+            {"state_dir": str(self.state.resolve()), "cwd": str(self.cwd.resolve()),
+             "role": "planner", "recorded_at": shared},
+            {"state_dir": str(other.resolve()), "cwd": str(self.cwd.resolve()),
+             "role": "planner", "recorded_at": shared},
+        ])
+        hook = self.run_resume_hook(extra_env=env)
+        self.assertEqual(hook.returncode, 0, hook.stderr)
+        self.assertEqual(hook.stdout, "")
+        self.assertEqual(hook.stderr, "")
+        self.assertEqual(self.stub_calls(), [])  # no resume-deliver
+        log_text = (plugin_state / "hook.log").read_text(encoding="utf-8")
+        self.assertIn("ambiguous_pane", log_text)
+        self.assertEqual(self.read_state()["resume_pending"]["status"], "pending")
+
+        # When recorded_at differ the newest wins: one state_dir, no ambiguity.
+        self.write_pane_index("w1:p1", [
+            {"state_dir": str(other.resolve()), "cwd": str(self.cwd.resolve()),
+             "role": "planner", "recorded_at": self.fresh_stamp(seconds=5)},
+            {"state_dir": str(self.state.resolve()), "cwd": str(self.cwd.resolve()),
+             "role": "planner", "recorded_at": shared},
+        ])
+        hook = self.run_resume_hook(extra_env=env)
+        self.assertEqual(hook.returncode, 0, hook.stderr)
+        self.assertEqual(hook.stdout, "")
+        self.assertEqual(hook.stderr, "")
+        calls = self.stub_calls()
+        self.assertEqual(len(calls), 1, calls)
+        self.assertEqual(calls[0], [
+            "resume-deliver", "--pane", "w1:p1", "--via", "plugin",
+            "--cwd", str(self.cwd.resolve()),
+            "--state-dir", str(self.state.resolve()),
+        ])
+        self.assertEqual(self.read_state()["resume_pending"]["status"], "delivered")
+
+    def test_plugin_manifest_declares_resume_hook_only(self) -> None:
+        manifest_path = Path(__file__).resolve().parents[1] / "herdr-plugin.toml"
+        manifest = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(manifest.get("id"), "tc.herdr-pair")
+        self.assertTrue(str(manifest.get("name") or "").strip())
+        self.assertTrue(str(manifest.get("version") or "").strip())
+        self.assertEqual(manifest.get("min_herdr_version"), "0.8.0")
+        self.assertEqual(manifest.get("platforms"), ["linux", "macos"])
+        events = manifest.get("events")
+        self.assertIsInstance(events, list)
+        self.assertEqual(len(events), 1, events)
+        self.assertEqual(events[0].get("on"), "pane.agent_status_changed")
+        command = events[0].get("command")
+        self.assertIsInstance(command, list)
+        self.assertTrue(command, command)
+        hook_args = [part for part in command if part.endswith("on_planner_status.py")]
+        self.assertEqual(len(hook_args), 1, command)
+        resolved = (manifest_path.parent / hook_args[0]).resolve()
+        self.assertEqual(resolved, PLUGIN_HOOK.resolve())
+        self.assertTrue(resolved.is_file())
+        for forbidden in ("actions", "panes", "startup"):
+            self.assertNotIn(forbidden, manifest)
 
 
 if __name__ == "__main__":
