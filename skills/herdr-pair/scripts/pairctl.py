@@ -2338,6 +2338,40 @@ def cmd_send_round(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_prepare_round(args: argparse.Namespace) -> int:
+    """Register a finished handoff for the `pair.dispatch-prepared` action (issue #7).
+
+    Only the file path is recorded, in state.json's `prepared_round`: nothing is
+    sent, linted, freshened or dispatched here. That keeps free-text dispatch out
+    of the plugin (the action may send exactly this one file) and leaves send-round
+    as the single dispatch path with its fence lint, target checks and pending
+    bookkeeping unchanged. Registering again replaces the previous file; the
+    registration is never consumed implicitly.
+    """
+    pp = paths(args)
+    cwd = canonical_cwd(args.cwd)
+    handoff = Path(args.file).expanduser()
+    if not handoff.is_file():
+        raise ValueError(f"handoff file not found: {handoff}")
+    with locked(pp["root"], pp["lock"]):
+        data = load(pp["state"], cwd)
+        write_ledger(pp["ledger"], data)
+        record = {"handoff": str(handoff), "registered_at": now()}
+        data["prepared_round"] = record
+        persist(pp, data)
+    output({
+        "status": "round_prepared",
+        "handoff": record["handoff"],
+        "registered_at": record["registered_at"],
+        "sent": False,
+        "guidance": (
+            "Handoff registered only; pair.dispatch-prepared sends exactly this "
+            "file through send-round while the planner pane holds the focus."
+        ),
+    })
+    return 0
+
+
 def cmd_ack_round(args: argparse.Namespace) -> int:
     pp = paths(args)
     cwd = canonical_cwd(args.cwd)
@@ -3303,6 +3337,13 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--fresh-lines", type=int, default=40)
     p.add_argument("--skip-lint", default="", metavar="REASON")
     p.set_defaults(func=cmd_send_round, fresh=True)
+
+    p = sub.add_parser("prepare-round", parents=[common])
+    p.add_argument(
+        "--file", required=True,
+        help="finished handoff to register for pair.dispatch-prepared; nothing is sent",
+    )
+    p.set_defaults(func=cmd_prepare_round)
 
     p = sub.add_parser("ack-round", parents=[common])
     p.add_argument("--round-id", required=True)

@@ -2988,7 +2988,9 @@ class PairctlTest(unittest.TestCase):
         exited_resolved = (manifest_path.parent / exited_args[0]).resolve()
         self.assertEqual(exited_resolved, self.PANE_EXITED_HOOK.resolve())
         self.assertTrue(exited_resolved.is_file())
-        for forbidden in ("actions", "panes", "startup"):
+        # Round p01-r005 adds [[actions]] (asserted by
+        # test_plugin_manifest_lists_section6_actions); panes and startup stay out.
+        for forbidden in ("panes", "startup"):
             self.assertNotIn(forbidden, manifest)
 
     # --- issue #11: notices, wake, lock timeout, hook failure path ------------------
@@ -3857,6 +3859,243 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(self.auto_continue_prompts(), [], self.herdr_calls())
         notes = [n for n in self.read_state()["notices"] if n["title"] == "herdr-pair executor done"]
         self.assertEqual(len(notes), 1, notes)
+
+    # --- section 6 plugin actions (issue #7, round p01-r005) -------------------------
+
+    ACTION_SCRIPT = Path(__file__).resolve().parents[1] / "hooks" / "action.py"
+    # The only values `resolution.source` may ever carry (round p01-r005 解析).
+    ACTION_SOURCES = {"explicit", "env", "pane_index", "focused_cwd", "workspace_cwd"}
+
+    def run_action(
+        self,
+        action: str,
+        *args: str,
+        context: dict | None = None,
+        extra_env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        """Run hooks/action.py black-box: context arrives via env, never via a live host."""
+        env = os.environ.copy()
+        env["XDG_STATE_HOME"] = str(self.state_home)
+        env["PAIRCTL"] = str(SCRIPT)
+        env["PAIRCTL_STATE_JSON"] = str(self.state / "state.json")
+        env["PAIRCTL_HERDR"] = str(self.herdr)
+        env.pop("PAIRCTL_AUTO_COMPACT", None)
+        env["PAIRCTL_CONTINUE_AFTER_COMPACT"] = "0"
+        # The host machine may export a pair selection of its own; every resolution
+        # source under test is injected explicitly, so an ambient one must not leak.
+        env.pop("PAIRCTL_CWD", None)
+        env.pop("PAIRCTL_STATE_DIR", None)
+        env.pop("HERDR_PLUGIN_STATE_DIR", None)
+        if context is None:
+            env.pop("HERDR_PLUGIN_CONTEXT_JSON", None)
+        else:
+            env["HERDR_PLUGIN_CONTEXT_JSON"] = json.dumps(context)
+        if extra_env:
+            env.update(extra_env)
+        return subprocess.run(
+            ["python3", str(self.ACTION_SCRIPT), action, *args],
+            text=True, capture_output=True, check=False, env=env,
+        )
+
+    def action_context(self, focused_pane: str = "w1:p1", cwd: Path | None = None) -> dict:
+        where = str(cwd if cwd is not None else self.cwd)
+        return {
+            "focused_pane_id": focused_pane,
+            "focused_pane_cwd": where,
+            "workspace_cwd": where,
+        }
+
+    def prompts(self) -> list[list[str]]:
+        """argv tails of every `herdr agent prompt` this case produced."""
+        return [c for c in self.herdr_calls() if c[:2] == ["agent", "prompt"]]
+
+    def test_action_resolution_priority_explicit_wins(self) -> None:
+        # A lower-priority env pair and a context cwd both point elsewhere: only the
+        # explicit --cwd/--state-dir pair may be honoured, and the real state must
+        # answer (a bogus state root would die with a non-JSON pairctl error).
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir(exist_ok=True)
+        bogus_state = self.root / "bogus-state"
+        context = self.action_context(cwd=elsewhere)
+        proc = self.run_action(
+            "pair.status",
+            "--cwd", str(self.cwd), "--state-dir", str(self.state),
+            context=context,
+            extra_env={"PAIRCTL_CWD": str(elsewhere), "PAIRCTL_STATE_DIR": str(bogus_state)},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        payload = json.loads(proc.stdout)
+        resolution = payload["resolution"]
+        self.assertEqual(resolution["source"], "explicit")
+        self.assertEqual(resolution["cwd"], str(self.cwd))
+        self.assertEqual(resolution["state_dir"], str(self.state))
+        self.assertEqual(resolution["focused_pane"], "w1:p1")
+        self.assertEqual(payload["status"], "ok")
+
+    def test_action_resolution_uses_custom_state_dir_from_index(self) -> None:
+        # setUp's `init --state-dir self.state --planner-pane w1:p1` recorded a pane
+        # index entry; the index must beat focused_pane_cwd/workspace_cwd, which both
+        # name a directory whose default state root is empty.
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir(exist_ok=True)
+        context = self.action_context(cwd=elsewhere)
+        proc = self.run_action("pair.status", context=context)
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        payload = json.loads(proc.stdout)
+        resolution = payload["resolution"]
+        self.assertEqual(resolution["source"], "pane_index")
+        self.assertEqual(resolution["state_dir"], str(self.state.resolve()))
+        self.assertEqual(resolution["cwd"], str(self.cwd.resolve()))
+        self.assertEqual(resolution["focused_pane"], "w1:p1")
+        self.assertEqual(payload["status"], "ok")
+
+    def test_write_action_rejected_when_focus_is_executor(self) -> None:
+        # send-round binds w1:p2 into the pane index as the executor, so the write
+        # actions resolve a real state - and must still refuse the executor focus
+        # before any pairctl call or herdr prompt happens.
+        sent = self.send_round(1)
+        self.assertEqual(sent["status"], "round_sent")
+        self.clear_calls()
+        context = self.action_context(focused_pane="w1:p2")
+        for action in ("pair.resume-now", "pair.dispatch-prepared"):
+            proc = self.run_action(action, context=context)
+            self.assertEqual(proc.returncode, 2, action + ": " + proc.stderr + proc.stdout)
+            payload = json.loads(proc.stdout)
+            self.assertEqual(payload["reason"], "focus_not_planner", payload)
+            self.assertEqual(payload["resolution"]["source"], "pane_index", payload)
+        self.assertEqual(self.herdr_calls(), [], "no herdr call may happen before the focus gate")
+
+    def test_action_output_includes_resolution_source(self) -> None:
+        # Every action answers one JSON object carrying `resolution` with all four
+        # fields, and pair.status is read-only: state.json survives byte for byte.
+        state_path = self.state / "state.json"
+        before = state_path.read_text(encoding="utf-8")
+        context = self.action_context()
+        explicit = self.run_action(
+            "pair.status", "--cwd", str(self.cwd), "--state-dir", str(self.state),
+            context=context,
+        )
+        self.assertEqual(explicit.returncode, 0, explicit.stderr + explicit.stdout)
+        indexed = self.run_action("pair.status", context=context)
+        self.assertEqual(indexed.returncode, 0, indexed.stderr + indexed.stdout)
+        for proc in (explicit, indexed):
+            payload = json.loads(proc.stdout)
+            self.assertIn("status", payload)
+            resolution = payload["resolution"]
+            for key in ("source", "cwd", "state_dir", "focused_pane"):
+                self.assertIn(key, resolution, resolution)
+            self.assertIn(resolution["source"], self.ACTION_SOURCES)
+        self.assertEqual(json.loads(explicit.stdout)["resolution"]["source"], "explicit")
+        self.assertEqual(json.loads(indexed.stdout)["resolution"]["source"], "pane_index")
+        self.assertEqual(state_path.read_text(encoding="utf-8"), before)
+
+    def test_resume_now_returns_reason_without_sending(self) -> None:
+        # A record exists but its epoch has not advanced: resume-deliver's own
+        # reason must reach the action's stdout verbatim, exit 2, no prompt sent.
+        armed = self.invoke_ok("compact-self", extra_env=self.RECORD_ENV)
+        self.assertTrue(armed["queued"], armed)
+        self.clear_calls()
+        proc = self.run_action("pair.resume-now", context=self.action_context())
+        self.assertEqual(proc.returncode, 2, proc.stderr + proc.stdout)
+        payload = json.loads(proc.stdout)
+        self.assertEqual(payload["status"], "rejected")
+        self.assertEqual(payload["reason"], "epoch_not_advanced")
+        self.assertEqual(payload["via"], "plugin")
+        self.assertEqual(payload["resolution"]["source"], "pane_index")
+        self.assertEqual(self.prompts(), [], self.herdr_calls())
+
+    def test_dispatch_prepared_sends_registered_handoff(self) -> None:
+        # A first CLI round binds w1:p2 as this state's executor.
+        first = self.send_round(1)
+        self.invoke_ok(
+            "finish-round", "--round-id", first["round_id"], "--status", "accepted",
+            "--artifacts", "artifact-1", "--notes", "verified",
+        )
+        # Only prompts sent from here on belong to prepare/dispatch.
+        self.clear_calls()
+        context = self.action_context()
+
+        # prepare-round only records the file: no prompt, no round, no dispatch.
+        bad = self.write_handoff(
+            "prepared-bad.md", "# Bad\nRegenerate scratch in /tmp/scratch\n"
+        )
+        prepared = self.invoke_ok("prepare-round", "--file", str(bad))
+        self.assertEqual(prepared["status"], "round_prepared")
+        self.assertEqual(self.read_state()["prepared_round"]["handoff"], str(bad))
+        self.assertEqual(self.prompts(), [], "prepare-round must not send")
+        self.clear_calls()
+
+        # The registered file still goes through send-round's fence lint.
+        linted = self.run_action("pair.dispatch-prepared", context=context)
+        self.assertEqual(linted.returncode, 2, linted.stderr + linted.stdout)
+        lint_payload = json.loads(linted.stdout)
+        self.assertEqual(lint_payload["status"], "rejected")
+        self.assertEqual(lint_payload["reason"], "handoff_lint")
+        self.assertEqual(lint_payload["resolution"]["source"], "pane_index")
+        self.assertEqual(self.prompts(), [], lint_payload)
+
+        # The registered file itself is what gets dispatched: same send-round path
+        # as the CLI, target taken from this state's executor.
+        good = self.write_handoff(
+            "prepared-good.md", "[轮次] round_id=<unique-id>\nprepared dispatch body\n"
+        )
+        self.invoke_ok("prepare-round", "--file", str(good))
+        self.clear_calls()
+        proc = self.run_action("pair.dispatch-prepared", context=context)
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        payload = json.loads(proc.stdout)
+        self.assertEqual(payload["status"], "round_sent")
+        self.assertEqual(payload["target"], "w1:p2")
+        self.assertEqual(payload["resolution"]["source"], "pane_index")
+        prompts = self.prompts()
+        # send-round defaults to a fresh executor context, so the fresh command
+        # may prompt too; exactly one prompt may carry the registered handoff.
+        dispatched = [c for c in prompts if "prepared dispatch body" in c[3]]
+        self.assertEqual(len(dispatched), 1, prompts)
+        self.assertEqual(dispatched[0][2], "w1:p2")
+        for prompt in prompts:
+            self.assertEqual(prompt[2], "w1:p2", prompt)
+        state = self.read_state()
+        self.assertEqual(state["rounds"][-1]["executor"], "w1:p2")
+        self.assertEqual(state["rounds"][-1]["status"], "active")
+
+    def test_dispatch_prepared_without_registration_reports_nothing_prepared(self) -> None:
+        proc = self.run_action("pair.dispatch-prepared", context=self.action_context())
+        self.assertEqual(proc.returncode, 2, proc.stderr + proc.stdout)
+        payload = json.loads(proc.stdout)
+        self.assertEqual(payload["reason"], "nothing_prepared")
+        self.assertIn("resolution", payload)
+        self.assertEqual(self.prompts(), [], self.herdr_calls())
+
+    def test_plugin_manifest_lists_section6_actions(self) -> None:
+        manifest_path = Path(__file__).resolve().parents[1] / "herdr-plugin.toml"
+        manifest = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
+        actions = manifest.get("actions")
+        self.assertIsInstance(actions, list)
+        expected = [
+            "pair.status",
+            "pair.focus-planner",
+            "pair.focus-executor",
+            "pair.resume-now",
+            "pair.dispatch-prepared",
+        ]
+        self.assertEqual([a.get("id") for a in actions], expected, actions)
+        for entry in actions:
+            action_id = str(entry.get("id"))
+            self.assertTrue(str(entry.get("title") or "").strip(), action_id)
+            self.assertEqual(
+                entry.get("command"), ["python3", "hooks/action.py", action_id], action_id
+            )
+            self.assertIn("pane", entry.get("contexts") or [], action_id)
+        self.assertTrue(
+            (manifest_path.parent / "hooks" / "action.py").resolve().is_file()
+        )
+        events = manifest.get("events") or []
+        self.assertEqual(
+            [e.get("on") for e in events],
+            ["pane.agent_status_changed", "pane.exited"],
+            events,
+        )
 
 
 if __name__ == "__main__":

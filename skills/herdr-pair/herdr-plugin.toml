@@ -1,8 +1,16 @@
-# herdr plugin manifest for herdr-pair (issues #10/#12, rounds p01-r002/p01-r004).
+# herdr plugin manifest for herdr-pair (issues #10/#12, rounds p01-r002/p01-r004;
+# issue #7 section 6 actions, round p01-r005).
 # Two event subscriptions: pane.agent_status_changed runs the status hook (armed
 # resume prompts via `pairctl resume-deliver --via plugin`, executor-pane status
 # edges via `pairctl executor-event`), and pane.exited runs the exit hook (both
 # pane roles funnel into `pairctl executor-event --status exited`).
+# Five explicit actions (issue #7 section 6) all run hooks/action.py, which reads
+# HERDR_PLUGIN_CONTEXT_JSON and resolves cwd + state directory by fixed priority
+# (explicit args > PAIRCTL_* env > pane index > focused pane cwd > workspace cwd),
+# then delegates every claim/send to pairctl. Read-only actions work with the
+# executor focused; pair.resume-now and pair.dispatch-prepared refuse any focus
+# that is not the state's planner pane. No popup board and no sidebar view here:
+# pair.status only echoes `pairctl status`.
 id = "tc.herdr-pair"
 name = "herdr-pair resume hook"
 version = "0.1.0"
@@ -16,3 +24,33 @@ command = ["python3", "hooks/on_planner_status.py"]
 [[events]]
 on = "pane.exited"
 command = ["python3", "hooks/on_pane_exited.py"]
+
+[[actions]]
+id = "pair.status"
+title = "Pair status"
+command = ["python3", "hooks/action.py", "pair.status"]
+contexts = ["pane"]
+
+[[actions]]
+id = "pair.focus-planner"
+title = "Focus planner pane"
+command = ["python3", "hooks/action.py", "pair.focus-planner"]
+contexts = ["pane"]
+
+[[actions]]
+id = "pair.focus-executor"
+title = "Focus executor pane"
+command = ["python3", "hooks/action.py", "pair.focus-executor"]
+contexts = ["pane"]
+
+[[actions]]
+id = "pair.resume-now"
+title = "Deliver resume prompt now"
+command = ["python3", "hooks/action.py", "pair.resume-now"]
+contexts = ["pane"]
+
+[[actions]]
+id = "pair.dispatch-prepared"
+title = "Dispatch prepared handoff"
+command = ["python3", "hooks/action.py", "pair.dispatch-prepared"]
+contexts = ["pane"]
