@@ -30,7 +30,7 @@ GitHub shares issue and PR numbers. For an ambiguous reference, resolve its type
 
 - A map is one issue labelled `wayfinder:map`, containing Notes, Decisions-so-far, and Fog.
 - Tickets are child issues linked through GitHub sub-issues. If unavailable, use a task list in the map and a `Part of #<map>` line in each child. Ticket labels are `wayfinder:research`, `wayfinder:prototype`, `wayfinder:grilling`, or `wayfinder:task`.
-- Record blockers through native issue dependencies. Use the blocker's numeric database ID, not its issue number or node ID. If dependencies are unavailable, use a `Blocked by: #<number>` line in the child.
+- Record blockers through native issue dependencies. The REST body field `issue_id` is the blocker's integer database id (`gh api repos/<owner>/<repo>/issues/<number> --jq .id`), not the issue number and not `node_id`. Add the edge with `gh api --method POST repos/<owner>/<repo>/issues/<child>/dependencies/blocked_by -F issue_id=<database-id>`. `-F` is required: `-f` sends a JSON string and GitHub returns 422. GraphQL `addBlockedBy` is a different form — `issueId` and `blockingIssueId` are node ids. If dependencies are unavailable, use a `Blocked by: #<number>` line in the child.
 - For the frontier, inspect open children in map order. Select the first unassigned child with no open blockers.
 - Claim a ticket with `gh issue edit <number> --add-assignee @me`.
 - Resolve by posting the answer, closing the ticket, and adding a gist of the decision plus its link to the map's Decisions-so-far section.
