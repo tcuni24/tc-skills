@@ -102,6 +102,10 @@ FRESH_MAX_LINES = 12
 HERDR_CALL_TIMEOUT = 30.0
 DEFAULT_CONTEXT_BUDGET = 150000
 DEFAULT_STALE_HOURS = 12.0
+# A resume_pending record left in any of these states may still be claimed by
+# resume-deliver; delivered/expired/cancelled are terminal for that record.
+RESUME_CLAIMABLE = {"pending", "uncertain", "claimed"}
+DEFAULT_RESUME_DEADLINE_S = 600.0
 SNAPSHOT_COPY_LIMIT = 50 * 1024 * 1024
 FENCE_RE = re.compile(
     r"^\s*\[(可以改|只读输入|可以新建|不许动|环境)\]\s*(.*?)\s*$", re.MULTILINE
@@ -1188,11 +1192,72 @@ def queue_planner_compact(
         "queued_at": now(),
     }
     data["compact_queued"] = record
+    arm_resume_record(pp, data, pane, epoch)
     return {
         "queued": True,
         **record,
         "note": "queued in the planner pane; it executes when the current turn ends",
     }
+
+
+def arm_resume_record(
+    pp: dict[str, Path], data: dict[str, Any], pane: str, epoch: int,
+) -> dict[str, Any]:
+    """Arm the resume owed to the planner once the compaction epoch advances.
+
+    Written exactly where compact_queued is set, so every arm path (finish-round,
+    emit_rollover_block, compact-self, budget compaction) gets one record.
+    """
+    armed_at = now()
+    deadline_s = env_float("PAIRCTL_RESUME_DEADLINE_S", DEFAULT_RESUME_DEADLINE_S)
+    # The deadline is recorded here but not consumed by pairctl itself: the
+    # low-frequency wake-up watcher reads it to decide when a still-pending
+    # resume is due for claim-delivery.
+    record = {
+        "armed_at": armed_at,
+        "epoch_at_arm": int(epoch),
+        "planner_pane": pane,
+        "state_dir": str(pp["root"]),
+        "mechanism": "watcher",
+        "deadline": (
+            dt.datetime.fromisoformat(armed_at) + dt.timedelta(seconds=deadline_s)
+        ).isoformat(),
+        "status": "pending",
+        "attempts": 0,
+        "last_error": "",
+    }
+    data["resume_pending"] = record
+    return record
+
+
+def resume_claim_gate(data: dict[str, Any], record: dict[str, Any]) -> str:
+    """'' when a resume record may be claimed, else the rejection reason.
+
+    Shared by cancel_resume_record (planner-side progress) and cmd_resume_deliver
+    (wake-up source): both need the compaction epoch to have advanced past arming
+    and a non-terminal status. Epoch is checked first, matching resume-deliver's
+    documented rejection order (epoch_not_advanced before not_claimable).
+    """
+    if int(data.get("compaction_epoch", 0)) <= int(record.get("epoch_at_arm", 0)):
+        return "epoch_not_advanced"
+    if str(record.get("status") or "") not in RESUME_CLAIMABLE:
+        return "not_claimable"
+    return ""
+
+
+def cancel_resume_record(data: dict[str, Any], reason: str) -> bool:
+    """Planner-side progress (a round, an adopted contract, a session rollover) made the
+    armed resume unnecessary. Fires only while the shared claim gate passes, so records
+    in a terminal state are never overwritten."""
+    record = data.get("resume_pending")
+    if not isinstance(record, dict) or not record:
+        return False
+    if resume_claim_gate(data, record):
+        return False
+    record["status"] = "cancelled"
+    record["cancel_reason"] = reason
+    record["cancelled_at"] = now()
+    return True
 
 
 def compact_pending(data: dict[str, Any]) -> bool:
@@ -1314,6 +1379,7 @@ def cmd_init(args: argparse.Namespace) -> int:
                 "rollover_required": False,
                 "compaction_epoch": 0,
                 "compact_queued": None,
+                "resume_pending": None,
                 "rounds": [],
                 "jobs": [],
                 "pending_dispatch": None,
@@ -1609,6 +1675,8 @@ def cmd_send_round(args: argparse.Namespace) -> int:
             skip_lint=args.skip_lint or "",
             report=parse_report_path(text, cwd),
         )
+        # The planner dispatched a new round itself: the armed resume is obsolete.
+        cancel_resume_record(data, "send_round")
         after_round_checkpoint(pp, data)
         planner_compact = None
         # A delivered round must be durable before any further Herdr call can fail.
@@ -1920,6 +1988,8 @@ def cmd_adopt_contract(args: argparse.Namespace) -> int:
             "contract_path": contract_path,
             "created_at": now(),
         }
+        # Binding a contract is planner-side progress: the armed resume is obsolete.
+        cancel_resume_record(data, "adopt_contract")
         persist(pp, data)
 
     output({
@@ -2224,6 +2294,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         "auto_compact": auto_compact_enabled(data),
         "compact_queued": data.get("compact_queued"),
         "compaction_epoch": data.get("compaction_epoch", 0),
+        "resume_pending": data.get("resume_pending"),
         "updated_at": data.get("updated_at", ""),
         "session_switched": False,
         "dispatch_status": dispatch_status,
@@ -2264,6 +2335,9 @@ def cmd_rollover(args: argparse.Namespace) -> int:
             if not args.new_session_id:
                 raise ValueError("--new-session-id is required with --reason new")
             data["session_id"] = validate_new_session_id(args.new_session_id, current)
+            # A new session means the planner is already moving on; only an advanced
+            # epoch makes this a real cancellation (epoch_at_arm < compaction_epoch).
+            cancel_resume_record(data, "rollover_new")
         write_checkpoint(pp["checkpoint"], data, f"session rollover ({args.reason})")
         phase_advanced = bool(not active and (data["rollover_required"] or args.force))
         if phase_advanced:
@@ -2306,6 +2380,91 @@ def cmd_compact_self(args: argparse.Namespace) -> int:
     result["checkpoint"] = str(pp["checkpoint"])
     output(result)
     return 0 if result.get("queued") else 2
+
+
+def cmd_resume_deliver(args: argparse.Namespace) -> int:
+    """Claim and deliver the armed resume prompt to the planner pane, exactly once.
+
+    The state-machine rejections (no_record, pane_mismatch, epoch_not_advanced,
+    not_claimable) run on local state before any herdr call; planner_busy needs one
+    `herdr agent get`. Rejections exit 2 with {"status": "rejected"} and touch
+    nothing; a completed transition (delivered/uncertain/expired) exits 0.
+    """
+    pp = paths(args)
+    cwd = canonical_cwd(args.cwd)
+    with locked(pp["root"], pp["lock"]):
+        data = load_ready(pp, cwd)
+        record = data.get("resume_pending")
+        if not isinstance(record, dict) or not record:
+            output({"status": "rejected", "reason": "no_record", "via": args.via})
+            return 2
+        if args.pane != str(record.get("planner_pane") or ""):
+            output({
+                "status": "rejected", "reason": "pane_mismatch", "via": args.via,
+                "expected_pane": record.get("planner_pane"), "pane": args.pane,
+            })
+            return 2
+        # State-machine gate before any herdr call: epoch must have advanced past
+        # arming, and the record must still be claimable.
+        gate = resume_claim_gate(data, record)
+        if gate:
+            output({
+                "status": "rejected", "reason": gate, "via": args.via,
+                "compaction_epoch": int(data.get("compaction_epoch", 0)),
+                "epoch_at_arm": record.get("epoch_at_arm"),
+                "record_status": record.get("status"),
+            })
+            return 2
+        agent_status = str(agent_info(args, args.pane).get("agent_status") or "")
+        if agent_status not in FRESH_OK_STATUS:
+            output({
+                "status": "rejected", "reason": "planner_busy", "via": args.via,
+                "agent_status": agent_status,
+            })
+            return 2
+        # Claim inside the lock and persist before prompting, so a concurrent wake-up
+        # source sees the claim (state-during-send shows "claimed") instead of double-sending.
+        record["status"] = "claimed"
+        persist(pp, data)
+        text = compact_continue_prompt(pp, data)
+        delivered = False
+        error = ""
+        try:
+            code, _, _, payload = run_herdr(args, ["agent", "prompt", args.pane, text])
+            delivered = code == 0 and is_agent_prompted(payload)
+            # last_error carries the herdr error code (or a fixed sentinel), per spec.
+            error = herdr_error_code(payload) or "unknown_response"
+        except ValueError as exc:
+            # run_herdr failed before any response existed; there is no code to extract.
+            error = str(exc)
+        result: dict[str, Any] = {"pane": args.pane, "via": args.via}
+        if delivered:
+            record["status"] = "delivered"
+            record["last_error"] = ""
+            persist(pp, data)
+            output({"status": "resume_delivered", **result, "record": record})
+            return 0
+        record["attempts"] = int(record.get("attempts", 0)) + 1
+        record["last_error"] = error
+        if int(record["attempts"]) >= 2:
+            record["status"] = "expired"
+            persist(pp, data)
+            body = (
+                "herdr-pair resume-deliver gave up: the planner compaction completed but the "
+                f"resume prompt never confirmed. pane={args.pane} attempts={record['attempts']} "
+                f"last_error={record['last_error']} state_dir={pp['root']}. "
+                "Resume the pairing manually."
+            )
+            try:
+                run_herdr(args, ["notification", "show", "herdr-pair resume expired", "--body", body])
+            except ValueError:
+                pass  # Best-effort: the expired record is already durable.
+            output({"status": "resume_expired", **result, "record": record})
+            return 0
+        record["status"] = "uncertain"
+        persist(pp, data)
+        output({"status": "resume_uncertain", **result, "record": record})
+        return 0
 
 
 def parser() -> argparse.ArgumentParser:
@@ -2457,6 +2616,14 @@ def parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("watch-compact-continue", parents=[common])
     p.set_defaults(func=cmd_watch_compact_continue)
+
+    p = sub.add_parser("resume-deliver", parents=[common])
+    p.add_argument("--pane", required=True, help="planner pane that must receive the resume prompt")
+    p.add_argument(
+        "--via", required=True, choices=("plugin", "watcher"),
+        help="wake-up source claiming this delivery (recorded in the output)",
+    )
+    p.set_defaults(func=cmd_resume_deliver)
     return ap
 
 

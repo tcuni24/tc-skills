@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import hashlib
 import json
 import os
@@ -59,6 +60,13 @@ if sub == ["agent", "prompt"] and len(sys.argv) > 4 and sys.argv[4].startswith("
     print(json.dumps({
         "id": "cli:agent:prompt",
         "result": {"type": "agent_prompted", "pane_id": sys.argv[3]},
+    }))
+    raise SystemExit(0)
+if sub == ["notification", "show"]:
+    # Notifications are best-effort; always succeed so prompt-mode failures stay isolated.
+    print(json.dumps({
+        "id": "cli:notification:show",
+        "result": {"type": "notification_show", "shown": True, "reason": "manual"},
     }))
     raise SystemExit(0)
 mode = mode_path.read_text(encoding="utf-8").strip() if mode_path.is_file() else "ok"
@@ -1567,9 +1575,10 @@ class PairctlTest(unittest.TestCase):
         self.assertFalse(json.loads(chk_drift.stdout)["allowed"])
         self.assertEqual(json.loads(chk_drift.stdout)["reason"], "contract_corrupted")
 
-    def test_cycle4_v1_migration_and_adopt_contract(self) -> None:
-        # Create a v1 state file
-        v1_state = {
+    def legacy_v1_state(self) -> dict:
+        """A raw v1 (pre-migration) state file: rounds p01-r001/p01-r002 (r002 active)
+        plus one running background job, written straight to state.json."""
+        return {
             "version": 1,
             "cwd": str(self.cwd),
             "planner_pane": "w1:p1",
@@ -1630,6 +1639,10 @@ class PairctlTest(unittest.TestCase):
             "pending_dispatch": None,
             "created_at": "2026-09-18T09:00:00Z",
         }
+
+    def test_cycle4_v1_migration_and_adopt_contract(self) -> None:
+        # Create a v1 state file
+        v1_state = self.legacy_v1_state()
         (self.state / "state.json").write_text(json.dumps(v1_state, indent=2), encoding="utf-8")
 
         # 1. Inspect status: active round is marked unconfirmed_protocol
@@ -2077,6 +2090,269 @@ class PairctlTest(unittest.TestCase):
         self.assertTrue(records["large.bin"]["sha256"])
         self.assertTrue((metadata.parent / "files" / "manifest.json").is_file())
         self.assertIsInstance(json.loads(metadata.read_text(encoding="utf-8")), list)
+
+    # --- resume_pending record (issue #8) ----------------------------------------------
+
+    REQUIRED_RECORD_KEYS = (
+        "armed_at", "epoch_at_arm", "planner_pane", "state_dir",
+        "mechanism", "deadline", "status", "attempts", "last_error",
+    )
+
+    def arm_and_advance_epoch(self) -> str:
+        """Arm the resume record via compact-self, then advance the epoch. Returns armed_at."""
+        queued = self.invoke_ok("compact-self")
+        self.assertTrue(queued["queued"], queued)
+        armed_at = self.read_state()["resume_pending"]["armed_at"]
+        self.invoke_ok("rollover", "--reason", "compact")
+        return armed_at
+
+    def test_resume_pending_none_after_init_and_full_record_when_armed(self) -> None:
+        self.assertIsNone(self.read_state().get("resume_pending"))
+        self.assertIsNone(self.invoke_ok("status")["resume_pending"])
+
+        queued = self.invoke_ok("compact-self")
+        self.assertTrue(queued["queued"], queued)
+        record = self.invoke_ok("status")["resume_pending"]
+        self.assertIsInstance(record, dict)
+        for key in self.REQUIRED_RECORD_KEYS:
+            self.assertIn(key, record)
+        self.assertEqual(record["status"], "pending")
+        self.assertEqual(record["attempts"], 0)
+        self.assertEqual(record["last_error"], "")
+        self.assertEqual(record["mechanism"], "watcher")
+        self.assertEqual(record["epoch_at_arm"], 0)
+        self.assertEqual(record["planner_pane"], "w1:p1")
+        self.assertEqual(Path(record["state_dir"]).resolve(), self.state.resolve())
+        armed = dt.datetime.fromisoformat(record["armed_at"])
+        deadline = dt.datetime.fromisoformat(record["deadline"])
+        self.assertEqual(deadline - armed, dt.timedelta(seconds=600))
+
+        requeued = self.invoke_ok(
+            "compact-self", extra_env={"PAIRCTL_RESUME_DEADLINE_S": "30"},
+        )
+        self.assertTrue(requeued["queued"], requeued)
+        record = self.read_state()["resume_pending"]
+        armed = dt.datetime.fromisoformat(record["armed_at"])
+        deadline = dt.datetime.fromisoformat(record["deadline"])
+        self.assertEqual(deadline - armed, dt.timedelta(seconds=30))
+
+    def test_rollover_with_active_round_keeps_resume_record(self) -> None:
+        for n in range(1, 5):
+            self.start_finish(n)
+        self.invoke_ok(
+            "start-round",
+            "--file", str(self.write_handoff("fifth.md", "# Fifth\nFull contract body 5\n")),
+            "--executor", "w1:p6", "--scope", "scope-5", "--acceptance", "test-5 exit 0",
+        )
+        state = self.read_state()
+        self.assertTrue(state["rollover_required"])
+        self.assertEqual(state["phase_round_count"], 5)
+
+        armed = self.invoke_ok("compact-self")
+        self.assertTrue(armed["queued"], armed)
+        armed_at = self.read_state()["resume_pending"]["armed_at"]
+
+        rolled = self.invoke_ok("rollover", "--reason", "compact")
+        self.assertEqual(rolled["compaction_epoch"], 1)
+        # An active round keeps the rollover flag set; the record must survive either way.
+        self.assertFalse(rolled["phase_advanced"], rolled)
+        state = self.read_state()
+        self.assertTrue(state["rollover_required"])
+        self.assertEqual(state["phase"], 1)
+        record = state["resume_pending"]
+        self.assertEqual(record["status"], "pending")
+        self.assertEqual(record["armed_at"], armed_at)
+        self.assertEqual(record["epoch_at_arm"], 0)
+
+    def test_rollover_after_fifth_finish_keeps_resume_record(self) -> None:
+        for n in range(1, 6):
+            _, fifth = self.start_finish(n)
+        self.assertEqual(fifth.returncode, 20, fifth.stderr + fifth.stdout)
+        payload = json.loads(fifth.stdout)
+        self.assertTrue(payload["planner_compact"]["queued"], payload)
+        record = self.read_state()["resume_pending"]
+        self.assertEqual(record["status"], "pending")
+        armed_at = record["armed_at"]
+
+        rolled = self.invoke_ok("rollover", "--reason", "compact")
+        self.assertEqual(rolled["compaction_epoch"], 1)
+        self.assertTrue(rolled["phase_advanced"], rolled)
+        state = self.read_state()
+        self.assertFalse(state["rollover_required"])
+        self.assertEqual(state["phase"], 2)
+        record = state["resume_pending"]
+        self.assertEqual(record["status"], "pending")
+        self.assertEqual(record["armed_at"], armed_at)
+        self.assertEqual(record["epoch_at_arm"], 0)
+
+    def test_resume_deliver_rejections_before_epoch_advance(self) -> None:
+        self.clear_calls()
+        missing = self.invoke("resume-deliver", "--pane", "w1:p1", "--via", "watcher")
+        self.assertEqual(missing.returncode, 2, missing.stderr + missing.stdout)
+        payload = json.loads(missing.stdout)
+        self.assertEqual(payload["status"], "rejected")
+        self.assertEqual(payload["reason"], "no_record")
+        self.assertEqual(self.herdr_calls(), [])
+
+        self.invoke_ok("compact-self")
+        self.clear_calls()
+        early = self.invoke("resume-deliver", "--pane", "w1:p1", "--via", "plugin")
+        self.assertEqual(early.returncode, 2, early.stderr + early.stdout)
+        payload = json.loads(early.stdout)
+        self.assertEqual(payload["status"], "rejected")
+        self.assertEqual(payload["reason"], "epoch_not_advanced")
+        self.assertEqual(self.herdr_calls(), [])
+
+        wrong = self.invoke("resume-deliver", "--pane", "w1:p9", "--via", "plugin")
+        self.assertEqual(wrong.returncode, 2, wrong.stderr + wrong.stdout)
+        self.assertEqual(json.loads(wrong.stdout)["reason"], "pane_mismatch")
+        self.assertEqual(self.herdr_calls(), [])
+
+        self.invoke_ok("rollover", "--reason", "compact")
+        self.set_status("running")
+        self.clear_calls()
+        busy = self.invoke("resume-deliver", "--pane", "w1:p1", "--via", "watcher")
+        self.assertEqual(busy.returncode, 2, busy.stderr + busy.stdout)
+        self.assertEqual(json.loads(busy.stdout)["reason"], "planner_busy")
+        calls = self.herdr_calls()
+        self.assertFalse([c for c in calls if c[:2] == ["agent", "prompt"]], calls)
+        self.assertEqual(self.read_state()["resume_pending"]["status"], "pending")
+
+    def test_resume_deliver_prompts_once_and_claims_record(self) -> None:
+        self.arm_and_advance_epoch()
+        self.set_status("idle")
+        self.clear_calls()
+
+        done = self.invoke_ok("resume-deliver", "--pane", "w1:p1", "--via", "watcher")
+        self.assertEqual(done["status"], "resume_delivered")
+        self.assertEqual(done["via"], "watcher")
+        prompts = [c for c in self.herdr_calls() if c[:2] == ["agent", "prompt"]]
+        self.assertEqual(len(prompts), 1, self.herdr_calls())
+        self.assertEqual(prompts[0][2], "w1:p1")
+        self.assertIn("herdr-pair auto-continue after compaction", prompts[0][3])
+
+        record = self.read_state()["resume_pending"]
+        self.assertEqual(record["status"], "delivered")
+        self.assertEqual(record["attempts"], 0)
+        self.assertEqual(record["last_error"], "")
+
+        # The fake snapshots state.json at every herdr call; the prompt call must see
+        # the record already claimed (claim persisted before delivery).
+        snapshot = json.loads(
+            (self.root / "fake-herdr.state-during-send.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(snapshot["resume_pending"]["status"], "claimed")
+
+        self.clear_calls()
+        again = self.invoke("resume-deliver", "--pane", "w1:p1", "--via", "plugin")
+        self.assertEqual(again.returncode, 2, again.stderr + again.stdout)
+        self.assertEqual(json.loads(again.stdout)["reason"], "not_claimable")
+        self.assertEqual(self.herdr_calls(), [])
+        self.assertEqual(self.read_state()["resume_pending"]["status"], "delivered")
+
+    def test_resume_deliver_uncertain_retry_then_expired_notifies_once(self) -> None:
+        self.arm_and_advance_epoch()
+        self.set_herdr_mode("fail")
+        self.clear_calls()
+
+        first = self.invoke("resume-deliver", "--pane", "w1:p1", "--via", "watcher")
+        self.assertEqual(first.returncode, 0, first.stderr + first.stdout)
+        self.assertEqual(json.loads(first.stdout)["status"], "resume_uncertain")
+        record = self.read_state()["resume_pending"]
+        self.assertEqual(record["status"], "uncertain")
+        self.assertEqual(record["attempts"], 1)
+        self.assertEqual(record["last_error"], "agent_not_found")
+
+        self.clear_calls()
+        second = self.invoke("resume-deliver", "--pane", "w1:p1", "--via", "plugin")
+        self.assertEqual(second.returncode, 0, second.stderr + second.stdout)
+        self.assertEqual(json.loads(second.stdout)["status"], "resume_expired")
+        record = self.read_state()["resume_pending"]
+        self.assertEqual(record["status"], "expired")
+        self.assertEqual(record["attempts"], 2)
+        notes = [c for c in self.herdr_calls() if c[:2] == ["notification", "show"]]
+        self.assertEqual(len(notes), 1, self.herdr_calls())
+        self.assertTrue(notes[0][2])
+        self.assertEqual(notes[0][3], "--body")
+        self.assertTrue(notes[0][4])
+
+        self.clear_calls()
+        third = self.invoke("resume-deliver", "--pane", "w1:p1", "--via", "watcher")
+        self.assertEqual(third.returncode, 2, third.stderr + third.stdout)
+        self.assertEqual(json.loads(third.stdout)["reason"], "not_claimable")
+        calls = self.herdr_calls()
+        self.assertFalse([c for c in calls if c[:2] == ["agent", "prompt"]], calls)
+        self.assertFalse([c for c in calls if c[:2] == ["notification", "show"]], calls)
+
+    def test_send_round_cancels_resume_record_after_epoch_advance(self) -> None:
+        self.arm_and_advance_epoch()
+        sent = self.send_round(1)
+        self.assertEqual(sent["status"], "round_sent")
+        record = self.read_state()["resume_pending"]
+        self.assertEqual(record["status"], "cancelled")
+        self.assertEqual(record["cancel_reason"], "send_round")
+        self.assertTrue(record["cancelled_at"])
+
+    def test_rollover_new_cancels_resume_record_after_epoch_advance(self) -> None:
+        self.arm_and_advance_epoch()
+        rolled = self.invoke_ok(
+            "rollover", "--reason", "new", "--new-session-id", "session-b", "--force",
+        )
+        self.assertEqual(rolled["session_id"], "session-b")
+        record = self.read_state()["resume_pending"]
+        self.assertEqual(record["status"], "cancelled")
+        self.assertEqual(record["cancel_reason"], "rollover_new")
+        self.assertTrue(record["cancelled_at"])
+
+    def test_adopt_contract_cancels_resume_record_after_epoch_advance(self) -> None:
+        v1_state = self.legacy_v1_state()
+        (self.state / "state.json").write_text(json.dumps(v1_state, indent=2), encoding="utf-8")
+
+        queued = self.invoke_ok("compact-self")
+        self.assertTrue(queued["queued"], queued)
+        armed_at = self.read_state()["resume_pending"]["armed_at"]
+        self.invoke_ok("rollover", "--reason", "compact")
+        self.assertEqual(self.read_state()["resume_pending"]["armed_at"], armed_at)
+
+        handoff = self.write_handoff("recovery.md", "Adopted contract for r2\n")
+        adopted = self.invoke_ok(
+            "adopt-contract",
+            "--round-id", "p01-r002",
+            "--file", str(handoff),
+            "--scope", "adopted-scope",
+            "--acceptance", "adopted-acceptance",
+        )
+        self.assertEqual(adopted["status"], "contract_adopted")
+        record = self.read_state()["resume_pending"]
+        self.assertEqual(record["status"], "cancelled")
+        self.assertEqual(record["cancel_reason"], "adopt_contract")
+        self.assertTrue(record["cancelled_at"])
+
+    def test_resume_prompt_is_identical_to_legacy_watcher(self) -> None:
+        queued = self.invoke_ok("compact-self")
+        self.assertTrue(queued["queued"], queued)
+        self.set_status("idle")
+        self.clear_calls()
+        watched = self.invoke_ok(
+            "watch-compact-continue",
+            extra_env={
+                "PAIRCTL_CONTINUE_MIN_DELAY_S": "0",
+                "PAIRCTL_CONTINUE_IDLE_S": "0",
+                "PAIRCTL_CONTINUE_POLL_S": "0.05",
+            },
+        )
+        self.assertEqual(watched["status"], "continue_prompted")
+        prompts = [c for c in self.herdr_calls() if c[:2] == ["agent", "prompt"]]
+        self.assertEqual(len(prompts), 1, self.herdr_calls())
+        legacy_text = prompts[0][3]
+
+        self.invoke_ok("rollover", "--reason", "compact")
+        self.clear_calls()
+        delivered = self.invoke_ok("resume-deliver", "--pane", "w1:p1", "--via", "watcher")
+        self.assertEqual(delivered["status"], "resume_delivered")
+        prompts = [c for c in self.herdr_calls() if c[:2] == ["agent", "prompt"]]
+        self.assertEqual(len(prompts), 1, self.herdr_calls())
+        self.assertEqual(prompts[0][3], legacy_text)
 
 
 if __name__ == "__main__":
