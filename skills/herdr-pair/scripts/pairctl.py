@@ -1482,7 +1482,9 @@ def spawn_compact_continue_watcher(
     cmd = [sys.executable, PAIRCTL_SCRIPT, "watch-compact-continue", "--cwd", data["cwd"]]
     state_dir = getattr(args, "state_dir", None)
     if state_dir:
-        cmd += ["--state-dir", str(state_dir)]
+        # The child cwd is the state root: a relative --state-dir would point
+        # inside itself. Always pass the resolved absolute root (issue #16).
+        cmd += ["--state-dir", str(pp["root"])]
     herdr = herdr_bin(args)
     cmd += ["--herdr", herdr]
     # Child env = parent copy + the internal marker. Never rewrite the user's
@@ -1523,7 +1525,9 @@ def spawn_resume_deliver(
     ]
     state_dir = getattr(args, "state_dir", None)
     if state_dir:
-        cmd += ["--state-dir", str(state_dir)]
+        # Same rule as the watcher spawn: hand the child the resolved absolute
+        # state root, never the caller's relative path (issue #16).
+        cmd += ["--state-dir", str(paths(args)["root"])]
     cmd += ["--herdr", herdr_bin(args)]
     env = os.environ.copy()
     env["PAIRCTL_HERDR"] = herdr_bin(args)

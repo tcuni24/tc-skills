@@ -10,7 +10,9 @@ herdr plugin link <仓库根>/skills/herdr-pair --enabled
 
 `link` 即安装本地插件；`--enabled` 同时启用。之后用 `herdr plugin enable tc.herdr-pair` / `herdr plugin disable tc.herdr-pair` 管理开关，`herdr plugin unlink tc.herdr-pair` 卸载。
 
-注意：herdr 0.8.0 的清单校验要求动作 id 不含点号（`invalid_plugin_action_id`）。如果 `link` 报这个错，说明 manifest 里的 `[[actions]]` id 仍是 `pair.*` 形式，需要先把点号改成连字符再链接。
+清单里的动作 id 用不含点号的名字（`pair-status`、`pair-focus-planner` 等；herdr 0.8.0 拒绝含点的动作 id，报 `invalid_plugin_action_id`），但每个 command 仍把带点号的动作名传给 `hooks/action.py`。link 仓库目录即可，不需要任何预处理。
+
+插件子进程的 `PATH` 里没有 `herdr`，但宿主注入 `HERDR_BIN_PATH`。`hooks/action.py` 与 `hooks/notify.py` 按 `PAIRCTL_HERDR` → `HERDR_BIN_PATH` → 字面量 `herdr` 的顺序解析可执行文件，所以在插件环境里能直接调通；调试时设 `PAIRCTL_HERDR` 可指向自己的假二进制。
 
 ## pairctl 路径
 
@@ -30,3 +32,5 @@ herdr plugin link <仓库根>/skills/herdr-pair --enabled
 3. 确认 `resume_pending.status` 变成 `delivered`，且恢复 prompt 恰好到达规划者一次。
 
 机制选择：只有插件已启用 **且** 规划者 kind 为 `claude` 时 `resume_pending.mechanism` 才是 `plugin`；其余一律 `watcher` —— 非 claude 规划者保持 watcher 投递，属设计而非降级。
+
+已知限制：herdr 0.8.0 关闭窗格时不会把 `pane.exited` 派给插件（清单里的事件名不改）。需要记录执行者退出时手动走 `pairctl executor-event --pane <pane> --status exited`，效果相同：写 `executor_pane_gone_at`、发通知、不改绑定。

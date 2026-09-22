@@ -27,31 +27,31 @@ on = "pane.exited"
 command = ["python3", "hooks/on_pane_exited.py"]
 
 [[actions]]
-id = "pair.status"
+id = "pair-status"
 title = "Pair status"
 command = ["python3", "hooks/action.py", "pair.status"]
 contexts = ["pane"]
 
 [[actions]]
-id = "pair.focus-planner"
+id = "pair-focus-planner"
 title = "Focus planner pane"
 command = ["python3", "hooks/action.py", "pair.focus-planner"]
 contexts = ["pane"]
 
 [[actions]]
-id = "pair.focus-executor"
+id = "pair-focus-executor"
 title = "Focus executor pane"
 command = ["python3", "hooks/action.py", "pair.focus-executor"]
 contexts = ["pane"]
 
 [[actions]]
-id = "pair.resume-now"
+id = "pair-resume-now"
 title = "Deliver resume prompt now"
 command = ["python3", "hooks/action.py", "pair.resume-now"]
 contexts = ["pane"]
 
 [[actions]]
-id = "pair.dispatch-prepared"
+id = "pair-dispatch-prepared"
 title = "Dispatch prepared handoff"
 command = ["python3", "hooks/action.py", "pair.dispatch-prepared"]
 contexts = ["pane"]

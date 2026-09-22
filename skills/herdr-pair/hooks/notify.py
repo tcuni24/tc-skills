@@ -100,7 +100,13 @@ def notify_pairctl_failed(pane: str, pairctl_path: str, detail: str) -> None:
     try:
         if marker.is_file():
             return
-        herdr = os.environ.get("PAIRCTL_HERDR") or "herdr"
+        # Same resolution as action.py: PAIRCTL_HERDR, then HERDR_BIN_PATH
+        # (plugin processes lack herdr on PATH), then the literal (issue #16).
+        herdr = (
+            os.environ.get("PAIRCTL_HERDR")
+            or os.environ.get("HERDR_BIN_PATH")
+            or "herdr"
+        )
         subprocess.run(
             [herdr, "notification", "show", FAILURE_TITLE, "--body", line],
             text=True,

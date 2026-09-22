@@ -202,6 +202,11 @@ def main() -> int:
         return 0
     if not isinstance(payload, dict):
         return 0
+    # herdr 0.8.0 wraps the event fields in an envelope {"event", "data"}: read
+    # pane_id/agent_status from `data` when it is a dict, else the flat payload.
+    data = payload.get("data")
+    if isinstance(data, dict):
+        payload = data
     pane_id = str(payload.get("pane_id") or "")
     if not pane_id:
         return 0

@@ -2994,8 +2994,10 @@ class PairctlTest(unittest.TestCase):
         # test_plugin_manifest_lists_section6_actions); issue #14 adds the
         # pair-status popup pane and the startup replay entry (asserted by
         # test_plugin_manifest_lists_popup_pane_and_startup).
+        # herdr 0.8.0 rejects action ids containing dots (issue #16): the ids
+        # are hyphenated while the command still passes the dotted action name.
         self.assertEqual(
-            [a.get("id") for a in manifest.get("actions") or []][0], "pair.status"
+            [a.get("id") for a in manifest.get("actions") or []][0], "pair-status"
         )
 
     # --- issue #11: notices, wake, lock timeout, hook failure path ------------------
@@ -4078,18 +4080,23 @@ class PairctlTest(unittest.TestCase):
         actions = manifest.get("actions")
         self.assertIsInstance(actions, list)
         expected = [
-            "pair.status",
-            "pair.focus-planner",
-            "pair.focus-executor",
-            "pair.resume-now",
-            "pair.dispatch-prepared",
+            "pair-status",
+            "pair-focus-planner",
+            "pair-focus-executor",
+            "pair-resume-now",
+            "pair-dispatch-prepared",
         ]
         self.assertEqual([a.get("id") for a in actions], expected, actions)
         for entry in actions:
             action_id = str(entry.get("id"))
+            # The manifest id is dot-free (0.8.0 rejects dots); the command
+            # still hands action.py the original dotted action name.
+            action_name = action_id.replace("-", ".", 1)
             self.assertTrue(str(entry.get("title") or "").strip(), action_id)
             self.assertEqual(
-                entry.get("command"), ["python3", "hooks/action.py", action_id], action_id
+                entry.get("command"),
+                ["python3", "hooks/action.py", action_name],
+                action_id,
             )
             self.assertIn("pane", entry.get("contexts") or [], action_id)
         self.assertTrue(
@@ -4298,11 +4305,11 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(
             [a.get("id") for a in manifest.get("actions") or []],
             [
-                "pair.status",
-                "pair.focus-planner",
-                "pair.focus-executor",
-                "pair.resume-now",
-                "pair.dispatch-prepared",
+                "pair-status",
+                "pair-focus-planner",
+                "pair-focus-executor",
+                "pair-resume-now",
+                "pair-dispatch-prepared",
             ],
         )
         self.assertEqual(
@@ -4311,6 +4318,204 @@ class PairctlTest(unittest.TestCase):
         )
         self.assertTrue(self.STATUS_PANE.resolve().is_file())
         self.assertTrue(self.STARTUP_HOOK.resolve().is_file())
+
+    # --- issue #16: herdr 0.8.0 real-machine fixes -----------------------------
+
+    # Round-15 finding: HERDR_PLUGIN_EVENT_JSON is an envelope
+    # {"event": "<snake_name>", "data": {pane_id, agent_status, ...}}, while the
+    # hooks used to read pane_id/agent_status at the top level. A stub pairctl
+    # records the argv each hook would run so flat and enveloped payloads can be
+    # compared call-for-call.
+    def run_status_hook_argv(
+        self,
+        event_json: dict,
+        pairctl: Path,
+        *,
+        extra_env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        env = os.environ.copy()
+        env["XDG_STATE_HOME"] = str(self.state_home)
+        env["PAIRCTL_HERDR"] = str(self.herdr)
+        env["PAIRCTL"] = str(pairctl)
+        env["HERDR_PLUGIN_EVENT"] = "pane.agent_status_changed"
+        env["HERDR_PLUGIN_EVENT_JSON"] = json.dumps(event_json)
+        env.pop("HERDR_PLUGIN_STATE_DIR", None)
+        if extra_env:
+            env.update(extra_env)
+        return subprocess.run(
+            ["python3", str(PLUGIN_HOOK)],
+            text=True, capture_output=True, check=False, env=env,
+        )
+
+    def run_exited_hook_argv(
+        self,
+        event_json: dict,
+        pairctl: Path,
+        *,
+        extra_env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        env = os.environ.copy()
+        env["XDG_STATE_HOME"] = str(self.state_home)
+        env["PAIRCTL_HERDR"] = str(self.herdr)
+        env["PAIRCTL"] = str(pairctl)
+        env["HERDR_PLUGIN_EVENT"] = "pane.exited"
+        env["HERDR_PLUGIN_EVENT_JSON"] = json.dumps(event_json)
+        env.pop("HERDR_PLUGIN_STATE_DIR", None)
+        if extra_env:
+            env.update(extra_env)
+        return subprocess.run(
+            ["python3", str(self.PANE_EXITED_HOOK)],
+            text=True, capture_output=True, check=False, env=env,
+        )
+
+    def test_event_hooks_read_envelope_payload(self) -> None:
+        stub = self.write_pairctl_stub()
+
+        # Planner edge: armed resume + advanced epoch -> resume-deliver argv.
+        # The stub execs the real pairctl, so each variant gets its own
+        # arm/advance: a delivered record is no longer deliverable.
+        flat = {"pane_id": "w1:p1", "workspace_id": "ws-1", "agent_status": "idle"}
+        self.arm_and_advance_epoch()
+        proc = self.run_status_hook_argv(flat, stub)
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        flat_calls = self.stub_calls()
+        self.assertEqual(len(flat_calls), 1, flat_calls)
+        self.assertEqual(flat_calls[0][0], "resume-deliver", flat_calls)
+        self.clear_stub_calls()
+        self.arm_and_advance_epoch()
+        envelope = {"event": "pane_agent_status_changed", "data": flat}
+        proc = self.run_status_hook_argv(envelope, stub)
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertEqual(self.stub_calls(), flat_calls, self.stub_calls())
+
+        # Executor edge on the same hook: -> executor-event argv.
+        self.send_round(1)
+        flat_exec = {"pane_id": "w1:p2", "workspace_id": "ws-1", "agent_status": "done"}
+        self.clear_stub_calls()
+        proc = self.run_status_hook_argv(flat_exec, stub)
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        flat_calls = self.stub_calls()
+        self.assertEqual(len(flat_calls), 1, flat_calls)
+        self.assertEqual(flat_calls[0][0], "executor-event", flat_calls)
+        self.clear_stub_calls()
+        envelope = {"event": "pane_agent_status_changed", "data": flat_exec}
+        proc = self.run_status_hook_argv(envelope, stub)
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertEqual(self.stub_calls(), flat_calls, self.stub_calls())
+
+        # Exited hook: -> executor-event --status exited argv.
+        flat_exit = {"pane_id": "w1:p2", "workspace_id": "ws-1"}
+        self.clear_stub_calls()
+        proc = self.run_exited_hook_argv(flat_exit, stub)
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        flat_calls = self.stub_calls()
+        self.assertEqual(len(flat_calls), 1, flat_calls)
+        self.assertEqual(flat_calls[0][:4],
+                         ["executor-event", "--pane", "w1:p2", "--status"], flat_calls)
+        self.assertEqual(flat_calls[0][4], "exited", flat_calls)
+        self.clear_stub_calls()
+        envelope = {"event": "pane_exited", "data": flat_exit}
+        proc = self.run_exited_hook_argv(envelope, stub)
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertEqual(self.stub_calls(), flat_calls, self.stub_calls())
+
+    def write_second_herdr(self) -> Path:
+        other = self.root / "fake-herdr-b"
+        other.write_text(FAKE_HERDR, encoding="utf-8")
+        os.chmod(other, 0o755)
+        return other
+
+    def second_herdr_calls(self, other: Path) -> list[list[str]]:
+        path = Path(str(other) + ".calls.jsonl")
+        if not path.exists():
+            return []
+        return [
+            json.loads(line)["argv"][1:]
+            for line in path.read_text(encoding="utf-8").splitlines() if line.strip()
+        ]
+
+    def test_action_uses_herdr_bin_path(self) -> None:
+        # Round-15 finding: plugin processes have HERDR_BIN_PATH but no herdr on
+        # PATH. With PAIRCTL_HERDR unset the action's herdr calls must land on
+        # the HERDR_BIN_PATH binary.
+        other = self.write_second_herdr()
+        env = os.environ.copy()
+        env["XDG_STATE_HOME"] = str(self.state_home)
+        env["PAIRCTL"] = str(SCRIPT)
+        env["PAIRCTL_STATE_JSON"] = str(self.state / "state.json")
+        env.pop("PAIRCTL_HERDR", None)
+        env["HERDR_BIN_PATH"] = str(other)
+        env["HERDR_PLUGIN_CONTEXT_JSON"] = json.dumps(self.action_context())
+        env.pop("HERDR_PLUGIN_STATE_DIR", None)
+        proc = subprocess.run(
+            ["python3", str(self.ACTION_SCRIPT), "pair.focus-planner"],
+            text=True, capture_output=True, check=False, env=env,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        calls = self.second_herdr_calls(other)
+        self.assertIn(["agent", "focus", "w1:p1"], calls, calls)
+        # And the default binary must not have been touched.
+        self.assertEqual(self.herdr_calls(), [], self.herdr_calls())
+
+    def test_hook_notify_uses_herdr_bin_path(self) -> None:
+        # notify.py's pairctl-failed notification goes through the same binary
+        # resolution: no PAIRCTL_HERDR -> HERDR_BIN_PATH.
+        other = self.write_second_herdr()
+        self.arm_and_advance_epoch()
+        env = os.environ.copy()
+        env["XDG_STATE_HOME"] = str(self.state_home)
+        env.pop("PAIRCTL_HERDR", None)
+        env["HERDR_BIN_PATH"] = str(other)
+        env["PAIRCTL"] = str(self.root / "missing-pairctl.py")
+        env["HERDR_PLUGIN_EVENT"] = "pane.agent_status_changed"
+        env["HERDR_PLUGIN_EVENT_JSON"] = json.dumps({
+            "pane_id": "w1:p1", "workspace_id": "ws-1", "agent_status": "idle",
+        })
+        env.pop("HERDR_PLUGIN_STATE_DIR", None)
+        proc = subprocess.run(
+            ["python3", str(PLUGIN_HOOK)],
+            text=True, capture_output=True, check=False, env=env,
+        )
+        self.assertEqual(proc.returncode, 1, proc.stderr + proc.stdout)
+        calls = self.second_herdr_calls(other)
+        notified = [c for c in calls if c[:2] == ["notification", "show"]]
+        self.assertEqual(len(notified), 1, calls)
+
+    def test_spawned_watcher_receives_absolute_state_dir(self) -> None:
+        # Round-15 finding: compact-self propagated a relative --state-dir into
+        # the detached watcher, whose cwd is the state root -> the child looked
+        # for the state inside itself and died with 'pair state is not
+        # initialized'. The spawned argv must carry the resolved absolute root.
+        env = os.environ.copy()
+        env["XDG_STATE_HOME"] = str(self.state_home)
+        env["PAIRCTL_STATE_JSON"] = str(self.state / "state.json")
+        env["PAIRCTL_HERDR"] = str(self.herdr)
+        env["PAIRCTL_CONTINUE_AFTER_COMPACT"] = "1"
+        env["PAIRCTL_CONTINUE_POLL_S"] = "0.05"
+        env["PAIRCTL_RESUME_DEADLINE_S"] = "600"  # far deadline: never fires here
+        env.pop("PAIRCTL_INTERNAL_WATCHER", None)
+        proc = subprocess.run(
+            [
+                "python3", str(SCRIPT), "compact-self",
+                "--cwd", str(self.cwd), "--state-dir", "state",
+            ],
+            cwd=str(self.root), text=True, capture_output=True, check=False, env=env,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        payload = json.loads(proc.stdout)
+        self.assertTrue(payload["continue_after_compact"]["spawned"], payload)
+        pid = int(
+            (self.state / "compact-continue.pid").read_text(encoding="utf-8").strip()
+        )
+        argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        self.assertIn(b"--state-dir", argv)
+        index = argv.index(b"--state-dir")
+        self.assertEqual(argv[index + 1].decode(), str(self.state.resolve()), argv)
+        # The child runs against the real state: no not-initialized death line.
+        time.sleep(0.5)
+        log_path = self.state / "compact-continue.log"
+        text = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
+        self.assertNotIn("pair state is not initialized", text)
 
 
 if __name__ == "__main__":

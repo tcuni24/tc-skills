@@ -225,7 +225,12 @@ def run_pairctl(cwd: str, state_dir: str, tail: list[str]) -> tuple[int, dict | 
 
 
 def herdr_bin() -> str:
-    return os.environ.get("PAIRCTL_HERDR") or "herdr"
+    # Plugin subprocesses have HERDR_BIN_PATH but no herdr on PATH (issue #16).
+    return (
+        os.environ.get("PAIRCTL_HERDR")
+        or os.environ.get("HERDR_BIN_PATH")
+        or "herdr"
+    )
 
 
 def run_focus(pane: str) -> tuple[bool, str]:
