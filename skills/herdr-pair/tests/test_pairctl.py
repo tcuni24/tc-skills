@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import errno
 import hashlib
 import json
 import os
@@ -66,10 +67,16 @@ if sub == ["agent", "prompt"] and len(sys.argv) > 4 and sys.argv[4].startswith("
     }))
     raise SystemExit(0)
 if sub == ["notification", "show"]:
-    # Notifications are best-effort; always succeed so prompt-mode failures stay isolated.
+    # Notifications are best-effort; the default always succeeds so prompt-mode
+    # failures stay isolated. FAKE_HERDR_NOTIFY_REASON (issue #11) simulates a
+    # suppressed delivery: the four host failure reasons come back shown=false.
+    reason = os.environ.get("FAKE_HERDR_NOTIFY_REASON", "").strip() or "manual"
+    shown = reason not in (
+        "rate_limited", "busy", "no_foreground_client", "disabled",
+    )
     print(json.dumps({
         "id": "cli:notification:show",
-        "result": {"type": "notification_show", "shown": True, "reason": "manual"},
+        "result": {"type": "notification_show", "shown": shown, "reason": reason},
     }))
     raise SystemExit(0)
 if sub == ["plugin", "list"] and "--json" in sys.argv[3:]:
@@ -148,7 +155,16 @@ class PairctlTest(unittest.TestCase):
                     except OSError:
                         break
                     time.sleep(0.05)
-        self.tmp.cleanup()
+        # NFS can report ENOTEMPTY for a directory whose entries were just
+        # unlinked. The test body has already finished; retry only that race.
+        for attempt in range(5):
+            try:
+                self.tmp.cleanup()
+                break
+            except OSError as exc:
+                if exc.errno != errno.ENOTEMPTY or attempt == 4:
+                    raise
+                time.sleep(0.05)
 
     def invoke(
         self,
@@ -2964,6 +2980,406 @@ class PairctlTest(unittest.TestCase):
         self.assertTrue(resolved.is_file())
         for forbidden in ("actions", "panes", "startup"):
             self.assertNotIn(forbidden, manifest)
+
+    # --- issue #11: notices, wake, lock timeout, hook failure path ------------------
+
+    def notification_calls(self) -> list[list[str]]:
+        """argv tails of every `herdr notification show` this case produced."""
+        return [c for c in self.herdr_calls() if c[:2] == ["notification", "show"]]
+
+    def set_pending_dispatch(self, age_s: float, round_id: str = "p01-r007") -> str:
+        """Hand-write a pending_dispatch created age_s seconds ago; returns created_at.
+
+        send-round clears its own pending record on every tested path, so the
+        staleness cases plant the record directly in state.json instead.
+        """
+        created_at = (
+            dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=age_s)
+        ).replace(microsecond=0).isoformat()
+        state = self.read_state()
+        state["pending_dispatch"] = {
+            "status": "uncertain",
+            "counted": False,
+            "round_id": round_id,
+            "target": "w1:p2",
+            "executor": "w1:p2",
+            "scope": "stale-scope",
+            "acceptance": "stale-acceptance",
+            "handoff": str(self.cwd / "stale.md"),
+            "phase_round_count": 0,
+            "created_at": created_at,
+        }
+        self.write_state(state)
+        return created_at
+
+    def test_notice_recorded_when_notification_is_rate_limited(self) -> None:
+        # Two failed prompts expire the record; the expired notification goes
+        # through the notice helper, which must record the suppression itself.
+        self.arm_and_advance_epoch()
+        self.set_status("idle")
+        self.set_herdr_mode("fail")
+        self.clear_calls()
+        env = {"FAKE_HERDR_NOTIFY_REASON": "rate_limited"}
+
+        first = self.invoke(
+            "resume-deliver", "--pane", "w1:p1", "--via", "plugin", extra_env=env,
+        )
+        self.assertEqual(first.returncode, 0, first.stderr + first.stdout)
+        self.assertEqual(json.loads(first.stdout)["status"], "resume_uncertain")
+
+        second = self.invoke(
+            "resume-deliver", "--pane", "w1:p1", "--via", "plugin", extra_env=env,
+        )
+        self.assertEqual(second.returncode, 0, second.stderr + second.stdout)
+        self.assertEqual(json.loads(second.stdout)["status"], "resume_expired")
+
+        notes = self.notification_calls()
+        self.assertEqual(len(notes), 1, self.herdr_calls())
+        self.assertEqual(notes[0][2], "herdr-pair resume expired")
+
+        notices = self.read_state()["notices"]
+        self.assertEqual(len(notices), 1, notices)
+        record = notices[0]
+        self.assertEqual(
+            set(record), {"at", "title", "body", "reason", "shown", "dedupe_key"},
+        )
+        self.assertEqual(record["title"], "herdr-pair resume expired")
+        self.assertEqual(record["reason"], "rate_limited")
+        self.assertIs(record["shown"], False)
+        self.assertTrue(record["body"])
+        self.assertTrue(record["at"])
+        self.assertEqual(record["dedupe_key"], "")
+
+        # status carries the whole notices array
+        shown_status = self.invoke_ok("status")
+        self.assertEqual(shown_status["notices"], notices)
+
+    def test_missing_pairctl_logs_and_notifies_once(self) -> None:
+        # A selected candidate whose pairctl cannot run: log pairctl_failed, show
+        # the host notification exactly once (marker file), exit 1 - never silent.
+        self.arm_and_advance_epoch()
+        self.clear_calls()
+        plugin_state = self.root / "plugin-state-fail"
+        env = {
+            "PAIRCTL": str(self.root / "no-such-pairctl.py"),
+            "HERDR_PLUGIN_STATE_DIR": str(plugin_state),
+        }
+
+        first = self.run_resume_hook(extra_env=env)
+        self.assertEqual(first.returncode, 1, first.stderr + first.stdout)
+        log_text = (plugin_state / "hook.log").read_text(encoding="utf-8")
+        self.assertIn("pairctl_failed", log_text)
+        notes = self.notification_calls()
+        self.assertEqual(len(notes), 1, self.herdr_calls())
+        self.assertEqual(notes[0][2], "herdr-pair pairctl failed")
+        self.assertTrue((plugin_state / "pairctl-failed-notified").is_file())
+        # the pairing state itself is untouched: the hook never writes it
+        self.assertEqual(self.read_state()["resume_pending"]["status"], "pending")
+
+        # The next event only logs: the marker suppresses a second notification.
+        self.clear_calls()
+        second = self.run_resume_hook(extra_env=env)
+        self.assertEqual(second.returncode, 1, second.stderr + second.stdout)
+        self.assertIn(
+            "pairctl_failed",
+            (plugin_state / "hook.log").read_text(encoding="utf-8"),
+        )
+        self.assertEqual(self.notification_calls(), [])
+
+        # Non-JSON pairctl output is the same failure class; still no second notice.
+        junk = self.root / "junk-pairctl.py"
+        junk.write_text("print('definitely not json')\n", encoding="utf-8")
+        self.clear_calls()
+        third = self.run_resume_hook(
+            extra_env={"PAIRCTL": str(junk), "HERDR_PLUGIN_STATE_DIR": str(plugin_state)},
+        )
+        self.assertEqual(third.returncode, 1, third.stderr + third.stdout)
+        self.assertIn(
+            "pairctl_failed",
+            (plugin_state / "hook.log").read_text(encoding="utf-8"),
+        )
+        self.assertEqual(self.notification_calls(), [])
+
+    def test_no_pane_match_stays_silent(self) -> None:
+        # Issue #10 silence contract: no pairing matches this pane, so the hook
+        # must not run pairctl at all - even though PAIRCTL points at nothing.
+        plugin_state = self.root / "plugin-state-silent"
+        env = {
+            "PAIRCTL": str(self.root / "no-such-pairctl.py"),
+            "HERDR_PLUGIN_STATE_DIR": str(plugin_state),
+        }
+        self.clear_calls()
+        hook = self.run_resume_hook(pane_id="wZ:zz", extra_env=env)
+        self.assertEqual(hook.returncode, 0, hook.stderr)
+        self.assertEqual(hook.stdout, "")
+        self.assertEqual(hook.stderr, "")
+        self.assertFalse((plugin_state / "hook.log").exists())
+        self.assertFalse((plugin_state / "pairctl-failed-notified").exists())
+        self.assertEqual(self.herdr_calls(), [])
+
+    def test_hook_silent_when_pairctl_reports_lock_timeout(self) -> None:
+        # Issue #10 silence contract: a bounded lock makes resume-deliver answer
+        # the exact lock_timeout JSON with exit 2. JSON on stdout is a completed
+        # answer, not a pairctl failure - the hook stays exit 0 and silent, and
+        # the released lock lets the next event deliver for real.
+        self.arm_and_advance_epoch()
+        self.set_status("idle")
+        self.clear_calls()
+        plugin_state = self.root / "plugin-state-locktime"
+        lock = self.state / "state.lock"
+        holder = subprocess.Popen(
+            [
+                "python3", "-c",
+                "import fcntl, sys, time\n"
+                "handle = open(sys.argv[1], 'a+')\n"
+                "fcntl.flock(handle, fcntl.LOCK_EX)\n"
+                "print('locked', flush=True)\n"
+                "time.sleep(30)\n",
+                str(lock),
+            ],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        try:
+            self.assertEqual(holder.stdout.readline().strip(), "locked")
+            before = (self.state / "state.json").read_text(encoding="utf-8")
+            hook = self.run_resume_hook(extra_env={
+                "HERDR_PLUGIN_STATE_DIR": str(plugin_state),
+                "PAIRCTL_LOCK_WAIT_S": "0.2",
+            })
+            self.assertEqual(hook.returncode, 0, hook.stderr + hook.stdout)
+            self.assertEqual(hook.stdout, "")
+            self.assertEqual(hook.stderr, "")
+            log = plugin_state / "hook.log"
+            logged = log.read_text(encoding="utf-8") if log.exists() else ""
+            self.assertNotIn("pairctl_failed", logged)
+            self.assertFalse((plugin_state / "pairctl-failed-notified").exists())
+            self.assertEqual(self.notification_calls(), [])
+            # abandoned event: the pairing state is byte-identical
+            self.assertEqual(
+                (self.state / "state.json").read_text(encoding="utf-8"), before,
+            )
+            self.assertEqual(self.read_state()["resume_pending"]["status"], "pending")
+        finally:
+            holder.terminate()
+            try:
+                holder.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                holder.kill()
+                holder.wait(timeout=5)
+        # lock released: the next event resumes-deliver instead of staying stuck
+        self.clear_calls()
+        retry = self.run_resume_hook(
+            extra_env={"HERDR_PLUGIN_STATE_DIR": str(plugin_state)},
+        )
+        self.assertEqual(retry.returncode, 0, retry.stderr + retry.stdout)
+        self.assertEqual(self.read_state()["resume_pending"]["status"], "delivered")
+
+    def test_hook_silent_when_pairctl_prints_json_and_exits_nonzero(self) -> None:
+        # A JSON object on stdout is a completed answer whatever the exit code:
+        # planner_busy and lock_timeout both exit 2, yet neither is a failure.
+        self.arm_and_advance_epoch()
+        self.set_status("idle")
+        self.clear_calls()
+        plugin_state = self.root / "plugin-state-json2"
+        for reason in ("planner_busy", "lock_timeout"):
+            fake = self.root / f"pairctl-{reason}.py"
+            fake.write_text(
+                "import json, sys\n"
+                f"print(json.dumps({{'status': 'rejected', 'reason': '{reason}'}}))\n"
+                "sys.exit(2)\n",
+                encoding="utf-8",
+            )
+            hook = self.run_resume_hook(extra_env={
+                "PAIRCTL": str(fake),
+                "HERDR_PLUGIN_STATE_DIR": str(plugin_state),
+            })
+            self.assertEqual(hook.returncode, 0, hook.stderr + hook.stdout)
+            self.assertEqual(hook.stdout, "")
+            self.assertEqual(hook.stderr, "")
+            log = plugin_state / "hook.log"
+            logged = log.read_text(encoding="utf-8") if log.exists() else ""
+            self.assertNotIn("pairctl_failed", logged, reason)
+            self.assertFalse((plugin_state / "pairctl-failed-notified").exists())
+            self.assertEqual(self.notification_calls(), [])
+            self.assertEqual(self.read_state()["resume_pending"]["status"], "pending")
+
+    def test_rate_limited_stale_dispatch_still_reports_notified(self) -> None:
+        # record_notice returns "a new notice was recorded", not "the host showed
+        # it": a rate-limited delivery is still a notice, so wake reports True.
+        self.set_pending_dispatch(age_s=1000)
+        self.clear_calls()
+        first = self.invoke(
+            "wake", "--source", "command",
+            extra_env={"FAKE_HERDR_NOTIFY_REASON": "rate_limited"},
+        )
+        self.assertEqual(first.returncode, 0, first.stderr + first.stdout)
+        payload = json.loads(first.stdout)
+        self.assertTrue(payload["dispatch_stale_notified"], payload)
+        notices = self.read_state()["notices"]
+        self.assertEqual(len(notices), 1, notices)
+        self.assertEqual(notices[0]["reason"], "rate_limited")
+        self.assertIs(notices[0]["shown"], False)
+
+        # the dedupe key now recorded makes the second wake quiet: False again
+        self.clear_calls()
+        second = self.invoke("wake", "--source", "command")
+        self.assertEqual(second.returncode, 0, second.stderr + second.stdout)
+        self.assertFalse(json.loads(second.stdout)["dispatch_stale_notified"])
+        self.assertEqual(len(self.read_state()["notices"]), 1)
+
+    def test_lock_timeout_abandons_event_and_later_wake_retries(self) -> None:
+        lock = self.state / "state.lock"
+        holder = subprocess.Popen(
+            [
+                "python3", "-c",
+                "import fcntl, sys, time\n"
+                "handle = open(sys.argv[1], 'a+')\n"
+                "fcntl.flock(handle, fcntl.LOCK_EX)\n"
+                "print('locked', flush=True)\n"
+                "time.sleep(30)\n",
+                str(lock),
+            ],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        try:
+            self.assertEqual(holder.stdout.readline().strip(), "locked")
+            before = (self.state / "state.json").read_text(encoding="utf-8")
+            self.clear_calls()
+            timed = self.invoke(
+                "wake", "--source", "hook",
+                extra_env={"PAIRCTL_LOCK_WAIT_S": "1"},
+            )
+            self.assertEqual(timed.returncode, 2, timed.stderr + timed.stdout)
+            self.assertEqual(
+                timed.stdout, '{"status":"rejected","reason":"lock_timeout"}',
+            )
+            self.assertEqual(timed.stderr, "")
+            # abandoned event: state byte-identical, no notification attempted
+            self.assertEqual(
+                (self.state / "state.json").read_text(encoding="utf-8"), before,
+            )
+            self.assertEqual(self.read_state()["notices"], [])
+            self.assertEqual(self.herdr_calls(), [])
+        finally:
+            holder.terminate()
+            try:
+                holder.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                holder.kill()
+                holder.wait(timeout=5)
+        # lock released: the next wake retries cleanly instead of staying stuck
+        self.clear_calls()
+        retry = self.invoke(
+            "wake", "--source", "hook", extra_env={"PAIRCTL_LOCK_WAIT_S": "1"},
+        )
+        self.assertEqual(retry.returncode, 0, retry.stderr + retry.stdout)
+        payload = json.loads(retry.stdout)
+        self.assertEqual(payload["status"], "wake_checked")
+        self.assertFalse(payload["dispatch_stale_notified"])
+        self.assertEqual(payload["notices"], [])
+        self.assertEqual(self.read_state()["notices"], [])
+        self.assertEqual(self.herdr_calls(), [])
+
+    def test_stale_dispatch_notifies_once(self) -> None:
+        created_at = self.set_pending_dispatch(age_s=1000)
+        self.clear_calls()
+
+        first = self.invoke("wake", "--source", "command")
+        self.assertEqual(first.returncode, 0, first.stderr + first.stdout)
+        notes = self.notification_calls()
+        self.assertEqual(len(notes), 1, self.herdr_calls())
+        self.assertEqual(notes[0][2], "herdr-pair dispatch stale")
+
+        notices = self.read_state()["notices"]
+        self.assertEqual(len(notices), 1, notices)
+        record = notices[0]
+        self.assertEqual(
+            set(record), {"at", "title", "body", "reason", "shown", "dedupe_key"},
+        )
+        self.assertEqual(record["title"], "herdr-pair dispatch stale")
+        self.assertEqual(record["dedupe_key"], f"dispatch-stale:p01-r007:{created_at}")
+        self.assertEqual(record["reason"], "manual")
+        self.assertIs(record["shown"], True)
+        self.assertTrue(record["body"])
+        self.assertTrue(record["at"])
+
+        # every later wake point stays quiet: same key, no second herdr call
+        self.clear_calls()
+        second = self.invoke("wake", "--source", "hook")
+        self.assertEqual(second.returncode, 0, second.stderr + second.stdout)
+        self.assertEqual(self.notification_calls(), [])
+        self.assertEqual(len(self.read_state()["notices"]), 1)
+
+        # status runs the same check, then reports the pending dispatch with notices
+        blocked = self.invoke("status")
+        self.assertEqual(blocked.returncode, 2, blocked.stderr + blocked.stdout)
+        payload = json.loads(blocked.stdout)
+        self.assertEqual(payload["status"], "PENDING_DISPATCH_UNRESOLVED")
+        self.assertEqual(payload["notices"], notices)
+        self.assertEqual(self.notification_calls(), [])
+
+        # and the normal (no pending) status still exposes the same array
+        state = self.read_state()
+        state["pending_dispatch"] = None
+        self.write_state(state)
+        ok = self.invoke_ok("status")
+        self.assertEqual(ok["notices"], notices)
+
+        # herdr itself failing still records the notice instead of vanishing.
+        # The stale check only runs when a pending dispatch exists, so plant a
+        # fresh stale record again (the block above cleared it on purpose).
+        self.set_pending_dispatch(age_s=1000)
+        state = self.read_state()
+        state["notices"] = []
+        self.write_state(state)
+        self.clear_calls()
+        failed = self.invoke(
+            "wake", "--source", "status",
+            extra_env={"PAIRCTL_HERDR": str(self.root / "no-such-herdr")},
+        )
+        self.assertEqual(failed.returncode, 0, failed.stderr + failed.stdout)
+        self.assertEqual(self.notification_calls(), [])
+        broken = self.read_state()["notices"]
+        self.assertEqual(len(broken), 1, broken)
+        self.assertEqual(broken[0]["reason"], "herdr_failed")
+        self.assertIs(broken[0]["shown"], False)
+
+    def test_dispatch_stale_threshold_is_configurable(self) -> None:
+        # PAIRCTL_DISPATCH_STALE_S shrinks the window: 500 s old counts as stale.
+        self.set_pending_dispatch(age_s=500)
+        self.clear_calls()
+        fast = self.invoke(
+            "wake", "--source", "status",
+            extra_env={"PAIRCTL_DISPATCH_STALE_S": "300"},
+        )
+        self.assertEqual(fast.returncode, 0, fast.stderr + fast.stdout)
+        self.assertEqual(len(self.notification_calls()), 1, self.herdr_calls())
+
+        # An unparsable threshold falls back to the 900 s default: 500 s is fresh.
+        state = self.read_state()
+        state["notices"] = []
+        self.write_state(state)
+        self.clear_calls()
+        fallback = self.invoke(
+            "wake", "--source", "command",
+            extra_env={"PAIRCTL_DISPATCH_STALE_S": "banana"},
+        )
+        self.assertEqual(fallback.returncode, 0, fallback.stderr + fallback.stdout)
+        self.assertEqual(self.notification_calls(), [])
+        self.assertEqual(self.read_state()["notices"], [])
+
+        # Unset threshold keeps the documented 900 s default: 1000 s is stale.
+        created = self.set_pending_dispatch(age_s=1000, round_id="p01-r008")
+        self.clear_calls()
+        default = self.invoke("wake", "--source", "watcher")
+        self.assertEqual(default.returncode, 0, default.stderr + default.stdout)
+        notes = self.notification_calls()
+        self.assertEqual(len(notes), 1, self.herdr_calls())
+        notices = self.read_state()["notices"]
+        self.assertEqual(len(notices), 1, notices)
+        self.assertEqual(
+            notices[0]["dedupe_key"], f"dispatch-stale:p01-r008:{created}",
+        )
 
 
 if __name__ == "__main__":

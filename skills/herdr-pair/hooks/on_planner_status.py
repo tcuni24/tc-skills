@@ -19,9 +19,16 @@ compaction epoch has advanced. Contractual rules:
 * newest recorded_at wins; a newest stamp shared by two state dirs is ambiguous:
   log a line containing "ambiguous_pane" and do not deliver;
 * zero hit, stale, mismatch or any check failure: exit 0 with empty stdout and
-  stderr.
+  stderr;
+* a selected candidate whose pairctl cannot answer (missing file, or stdout
+  that is not JSON): log a "pairctl_failed" line, show the
+  "herdr-pair pairctl failed" notification once (marker file), exit 1.
+  A non-zero exit code on its own is not a failure: lock_timeout and
+  planner_busy answer JSON with exit 2, and those stay silent exit 0.
 
-The hook never imports pairctl, never writes state.json, and never calls herdr.
+The hook never imports pairctl and never writes state.json. Its only herdr
+call is that failure notification (`notification show`); it never runs
+`herdr agent prompt`.
 """
 
 from __future__ import annotations
@@ -29,9 +36,13 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
-import subprocess
 import sys
 from pathlib import Path
+
+# Same directory as this hook: log paths, the pairctl runner, and the one-time
+# failure notification live in notify.py so neither module imports the other's.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from notify import append_log, notify_pairctl_failed, run_pairctl  # noqa: E402
 
 DEFAULT_STALE_HOURS = 12.0
 DEFAULT_STATE_HOME = "~/.local/state"
@@ -45,25 +56,6 @@ DELIVERABLE_STATUS = {"pending", "uncertain"}
 def index_path(pane_id: str) -> Path:
     base = Path(os.environ.get("XDG_STATE_HOME", DEFAULT_STATE_HOME)).expanduser()
     return base / "herdr-pair" / "panes" / f"{pane_id}.json"
-
-
-def log_path() -> Path:
-    plugin_state = os.environ.get("HERDR_PLUGIN_STATE_DIR")
-    if plugin_state:
-        return Path(plugin_state).expanduser() / "hook.log"
-    base = Path(os.environ.get("XDG_STATE_HOME", DEFAULT_STATE_HOME)).expanduser()
-    return base / "herdr-pair" / "plugin-hook.log"
-
-
-def append_log(line: str) -> None:
-    """Best-effort plugin log: logging must never change the hook's exit path."""
-    try:
-        path = log_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(line.rstrip("\n") + "\n")
-    except OSError:
-        pass
 
 
 def parse_stamp(value: object) -> dt.datetime | None:
@@ -164,18 +156,20 @@ def main() -> int:
         Path(__file__).resolve().parent.parent / "scripts" / "pairctl.py"
     )
     argv = [
-        sys.executable, pairctl, "resume-deliver",
+        "resume-deliver",
         "--pane", pane_id, "--via", "plugin",
         "--cwd", str(entry.get("cwd") or ""),
         "--state-dir", str(entry.get("state_dir") or ""),
     ]
     # Capture the child's output: the hook stays silent whatever resume-deliver
-    # reports, and its own exit code is always 0 (contract: checks failing or
-    # hitting zero records exit quietly).
-    try:
-        subprocess.run(argv, capture_output=True, text=True, check=False)
-    except (OSError, subprocess.SubprocessError):
-        pass
+    # answers. Only a pairctl that cannot answer (missing file, non-JSON stdout)
+    # is the one loud path: log pairctl_failed, notify once, exit 1 (issue #11).
+    # A JSON answer with a non-zero exit (lock_timeout, planner_busy) is a
+    # completed answer under the issue #10 silence contract.
+    ok, detail = run_pairctl(pairctl, argv)
+    if not ok:
+        notify_pairctl_failed(pane_id, pairctl, detail)
+        return 1
     return 0
 
 

@@ -22,9 +22,21 @@ from typing import Any, Iterator
 
 
 class PendingDispatchError(ValueError):
-    def __init__(self, pending: dict[str, Any]) -> None:
+    def __init__(
+        self, pending: dict[str, Any], notices: list[dict[str, Any]] | None = None,
+    ) -> None:
         self.pending = pending
+        # status carries the notices array even on the pending-error path (issue #11).
+        self.notices = notices
         super().__init__("unresolved pending_dispatch")
+
+
+class LockTimeoutError(Exception):
+    """PAIRCTL_LOCK_WAIT_S elapsed before the state lock was acquired (issue #11).
+
+    Deliberately not a ValueError: main() must answer with the exact
+    lock_timeout payload on stdout and an empty stderr, not PAIRCTL_ERROR.
+    """
 
 
 VERSION = 2
@@ -111,6 +123,12 @@ FENCE_RE = re.compile(
     r"^\s*\[(可以改|只读输入|可以新建|不许动|环境)\]\s*(.*?)\s*$", re.MULTILINE
 )
 TMP_PATH_RE = re.compile(r"(^|[^\w])/tmp(/|\b)")
+# Issue #11: notification notices, pending-dispatch staleness, bounded lock wait.
+HOST_FAILURE_REASONS = {"rate_limited", "busy", "no_foreground_client", "disabled"}
+DEFAULT_DISPATCH_STALE_S = 900.0
+STALE_DISPATCH_TITLE = "herdr-pair dispatch stale"
+# Written verbatim (no trailing newline, no sort_keys) on a bounded lock timeout.
+LOCK_TIMEOUT_PAYLOAD = '{"status":"rejected","reason":"lock_timeout"}'
 
 
 class FreshError(ValueError):
@@ -160,6 +178,23 @@ def chmod_private(path: Path, mode: int) -> None:
     os.chmod(path, mode)
 
 
+def lock_wait_s() -> float | None:
+    """PAIRCTL_LOCK_WAIT_S seconds (issue #11): bound on acquiring the state lock.
+
+    Unset, unparsable or negative keeps the historical blocking lock; a valid
+    value lets a hook event be abandoned on contention and retried by the next
+    wake-up source instead of hanging behind another writer.
+    """
+    raw = (os.environ.get("PAIRCTL_LOCK_WAIT_S") or "").strip()
+    if not raw:
+        return None
+    try:
+        wait = float(raw)
+    except ValueError:
+        return None
+    return wait if wait >= 0 else None
+
+
 @contextlib.contextmanager
 def locked(root: Path, lock_path: Path, create: bool = False) -> Iterator[None]:
     if create:
@@ -169,7 +204,21 @@ def locked(root: Path, lock_path: Path, create: bool = False) -> Iterator[None]:
         raise ValueError("pair state is not initialized")
     with lock_path.open("a+", encoding="utf-8") as handle:
         chmod_private(lock_path, FILE_MODE)
-        fcntl.flock(handle, fcntl.LOCK_EX)
+        wait = lock_wait_s()
+        if wait is None:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+        else:
+            deadline = time.monotonic() + wait
+            while True:
+                try:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise LockTimeoutError(
+                            f"state lock not acquired within {wait}s"
+                        )
+                    time.sleep(0.05)
         try:
             yield
         finally:
@@ -234,6 +283,8 @@ def load(path: Path, cwd: str) -> dict[str, Any]:
     data = json.loads(path.read_text(encoding="utf-8"))
     if data.get("cwd") != cwd:
         raise ValueError(f"state cwd mismatch: {data.get('cwd')!r} != {cwd!r}")
+    # Issue #11: states written before notices existed gain the array on load.
+    data.setdefault("notices", [])
     ver = data.get("version")
     if ver == 1:
         data["version"] = 2
@@ -295,6 +346,127 @@ def pending_payload(pending: dict[str, Any]) -> dict[str, Any]:
             f"{PENDING_GUIDANCE} target={target} round_id={round_id}."
         ),
     }
+
+
+def record_notice(
+    args: argparse.Namespace,
+    pp: dict[str, Path],
+    data: dict[str, Any],
+    *,
+    title: str,
+    body: str,
+    dedupe_key: str = "",
+) -> bool:
+    """Show one host notification and record its outcome in state (issue #11).
+
+    Every `herdr notification show` goes through here: call herdr first, then
+    append {at,title,body,reason,shown,dedupe_key} to state["notices"] and
+    persist. Host suppression reasons (rate_limited, busy, no_foreground_client,
+    disabled) and herdr failures record shown=false but still record; a
+    non-empty dedupe_key that already exists skips the herdr call and the
+    second record entirely. Returns True exactly when a NEW notice was
+    appended - the caller asks "was anything notified", not "did the host
+    toast appear", so a rate-limited delivery still counts.
+    """
+    notices = data.setdefault("notices", [])
+    if dedupe_key and any(
+        str(entry.get("dedupe_key") or "") == dedupe_key for entry in notices
+    ):
+        return False  # already notified once: no second call, no second record
+    reason = "manual"
+    shown = True
+    try:
+        code, out, err, payload = run_herdr(
+            args, ["notification", "show", title, "--body", body]
+        )
+    except ValueError:
+        reason, shown = "herdr_failed", False  # herdr missing or timed out
+    else:
+        result = payload.get("result") if isinstance(payload, dict) else None
+        failed = (
+            code != 0
+            or not isinstance(result, dict)
+            or (isinstance(payload, dict) and payload.get("error"))
+        )
+        if failed:
+            reason, shown = "herdr_failed", False
+        else:
+            reason = str(result.get("reason") or "manual")
+            shown = bool(result.get("shown", True))
+    if reason in HOST_FAILURE_REASONS:
+        shown = False  # host suppressed the toast; the record still must exist
+    notices.append({
+        "at": now(),
+        "title": title,
+        "body": body,
+        "reason": reason,
+        "shown": shown,
+        "dedupe_key": dedupe_key,
+    })
+    persist(pp, data)
+    return True  # a new notice exists, whatever the host did with it
+
+
+def dispatch_stale_threshold_s() -> float:
+    """PAIRCTL_DISPATCH_STALE_S seconds (issue #11); unset/invalid falls back to 900."""
+    raw = (os.environ.get("PAIRCTL_DISPATCH_STALE_S") or "").strip()
+    if not raw:
+        return DEFAULT_DISPATCH_STALE_S
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_DISPATCH_STALE_S
+    return value if value >= 0 else DEFAULT_DISPATCH_STALE_S
+
+
+def check_dispatch_stale(
+    args: argparse.Namespace, pp: dict[str, Path], data: dict[str, Any]
+) -> bool:
+    """Notify once when pending_dispatch outlived the staleness threshold.
+
+    Wake-up point check (issue #11): runs from `wake` (every source), from
+    `status` after the state read, and from every `watch-compact-continue`
+    round. The dedupe key keeps later wake-ups quiet. Returns True when a
+    notice was newly recorded.
+    """
+    pending = data.get("pending_dispatch")
+    if not isinstance(pending, dict) or not pending:
+        return False  # nothing pending: never notify
+    created_at = str(pending.get("created_at") or "")
+    try:
+        stamp = dt.datetime.fromisoformat(created_at)
+    except ValueError:
+        return False  # unparsable stamp cannot be compared: stay quiet
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=dt.timezone.utc)
+    if time.time() - stamp.timestamp() <= dispatch_stale_threshold_s():
+        return False  # still inside the threshold window
+    round_id = str(pending.get("round_id") or "")
+    target = str(pending.get("target") or "")
+    body = (
+        "pending_dispatch is unresolved past the staleness threshold: "
+        f"round_id={round_id} target={target} created_at={created_at} "
+        f"state_dir={pp['root']}. Inspect the recorded dispatch and resolve it "
+        "with `resolve-pending --outcome delivered|not-delivered` only after "
+        "confirming whether the pane received the handoff."
+    )
+    return record_notice(
+        args,
+        pp,
+        data,
+        title=STALE_DISPATCH_TITLE,
+        body=body,
+        dedupe_key=f"dispatch-stale:{round_id}:{created_at}",
+    )
+
+
+def resume_due(record: dict[str, Any]) -> bool:
+    """True when a resume record's deadline passed (issue #11 watcher wake-ups)."""
+    try:
+        deadline = dt.datetime.fromisoformat(str(record.get("deadline") or ""))
+    except ValueError:
+        return True  # an unparsable deadline must never block delivery forever
+    return deadline.timestamp() <= time.time()
 
 
 def validate_new_session_id(value: str, current: str) -> str:
@@ -1102,6 +1274,90 @@ def spawn_compact_continue_watcher(
     return {"spawned": True, "pid": proc.pid, "log": str(log)}
 
 
+def spawn_resume_deliver(
+    args: argparse.Namespace, cwd: str, pane: str, via: str = "watcher"
+) -> dict[str, Any]:
+    """Run `resume-deliver --via <via>` in a child pairctl; {} when unparsable.
+
+    Shared by the watch loop and `wake --source watcher` (issue #11): the
+    subprocess owns the claim state machine, so two wake-up sources racing
+    here can never both prompt the planner.
+    """
+    cmd = [
+        sys.executable, PAIRCTL_SCRIPT, "resume-deliver",
+        "--pane", pane, "--via", via, "--cwd", cwd,
+    ]
+    state_dir = getattr(args, "state_dir", None)
+    if state_dir:
+        cmd += ["--state-dir", str(state_dir)]
+    cmd += ["--herdr", herdr_bin(args)]
+    env = os.environ.copy()
+    env["PAIRCTL_HERDR"] = herdr_bin(args)
+    proc = subprocess.run(cmd, text=True, capture_output=True, check=False, env=env)
+    try:
+        payload = json.loads(proc.stdout)
+    except ValueError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def wake_check(
+    args: argparse.Namespace, source: str, *, quiet: bool = False
+) -> dict[str, Any]:
+    """One wake-up point (issue #11): pending-dispatch staleness for every source,
+    the due resume-deliver only for the watcher source.
+
+    Uses load(), not load_ready(): a stale pending is notified here and the
+    caller keeps running - resolve-pending / status still own the refusal path,
+    and plain commands never gain a resume-deliver side effect.
+    """
+    pp = paths(args)
+    cwd = canonical_cwd(args.cwd)
+    result: dict[str, Any] = {
+        "status": "wake_checked",
+        "source": source,
+        "dispatch_stale_notified": False,
+        "notices": [],
+        "resume": None,
+        "pane": "",
+    }
+    due_pane = ""
+    with locked(pp["root"], pp["lock"]):
+        data = load(pp["state"], cwd)
+        # jobs.tsv is a derived view of state.json, never a second source of truth.
+        write_ledger(pp["ledger"], data)
+        result["dispatch_stale_notified"] = check_dispatch_stale(args, pp, data)
+        result["notices"] = data.get("notices", [])
+        record = data.get("resume_pending")
+        if (
+            source == "watcher"
+            and isinstance(record, dict)
+            and record
+            and str(record.get("status") or "") in {"pending", "uncertain"}
+            and str(record.get("planner_pane") or "")
+            and resume_due(record)
+        ):
+            due_pane = str(record.get("planner_pane") or "")
+    if due_pane:
+        # Released the lock first: the child claims through its own locked run.
+        result["pane"] = due_pane
+        payload = spawn_resume_deliver(args, cwd, due_pane, via="watcher")
+        result["resume"] = payload.get("status")
+    if not quiet:
+        output(result)
+    return result
+
+
+def cmd_wake(args: argparse.Namespace) -> int:
+    """`pairctl wake --source ...` (issue #11): one wake-up check, exit 0.
+
+    A bounded lock (PAIRCTL_LOCK_WAIT_S) surfaces as the exact lock_timeout
+    payload with exit 2 via main(); everything checkable here is best-effort.
+    """
+    wake_check(args, args.source, quiet=False)
+    return 0
+
+
 def cmd_watch_compact_continue(args: argparse.Namespace) -> int:
     """Low-frequency record-driven loop: deliver the armed resume exactly once (issue #9).
 
@@ -1111,11 +1367,31 @@ def cmd_watch_compact_continue(args: argparse.Namespace) -> int:
     simply wait for the next tick without counting failures. Delivery success still
     reports status=continue_prompted with exit 0, and the prompt text comes only
     from the existing compact_continue_prompt.
+
+    Issue #11: every round additionally runs `wake --source watcher` - the
+    pending-dispatch staleness notification plus the same due resume-deliver -
+    on top of the original record-driven judgment below.
     """
     pp = paths(args)
     cwd = canonical_cwd(args.cwd)
     poll = max(env_float("PAIRCTL_CONTINUE_POLL_S", 15.0), 0.05)
     while True:
+        # Wake-up point first (issue #11). A bounded lock abandons only this round.
+        try:
+            wake = wake_check(args, "watcher", quiet=True)
+        except LockTimeoutError:
+            time.sleep(poll)
+            continue
+        if wake.get("resume") == "resume_delivered":
+            output({"status": "continue_prompted", "pane": wake.get("pane")})
+            return 0
+        if wake.get("resume") == "resume_expired":
+            output({
+                "status": "continue_skipped", "reason": "resume_expired",
+                "pane": wake.get("pane"),
+            })
+            return 0
+        attempted = wake.get("resume") is not None
         with locked(pp["root"], pp["lock"]):
             data = load(pp["state"], cwd)
             write_ledger(pp["ledger"], data)
@@ -1133,6 +1409,10 @@ def cmd_watch_compact_continue(args: argparse.Namespace) -> int:
             # claimed by another wake-up source: only wait for that delivery.
             time.sleep(poll)
             continue
+        if attempted:
+            # wake above already spent this round's claim attempt; wait for the next tick.
+            time.sleep(poll)
+            continue
         try:
             due = dt.datetime.fromisoformat(str(record.get("deadline") or "")).timestamp() <= time.time()
         except ValueError:
@@ -1145,22 +1425,8 @@ def cmd_watch_compact_continue(args: argparse.Namespace) -> int:
             return 0
         # One claim per tick; the subprocess owns the state machine, so a concurrent
         # wake-up source (plugin, a second watcher) cannot double-send.
-        cmd = [
-            sys.executable, PAIRCTL_SCRIPT, "resume-deliver",
-            "--pane", pane, "--via", "watcher", "--cwd", cwd,
-        ]
-        state_dir = getattr(args, "state_dir", None)
-        if state_dir:
-            cmd += ["--state-dir", str(state_dir)]
-        cmd += ["--herdr", herdr_bin(args)]
-        env = os.environ.copy()
-        env["PAIRCTL_HERDR"] = herdr_bin(args)
-        proc = subprocess.run(cmd, text=True, capture_output=True, check=False, env=env)
-        try:
-            payload = json.loads(proc.stdout)
-        except ValueError:
-            payload = {}
-        result = payload.get("status") if isinstance(payload, dict) else None
+        payload = spawn_resume_deliver(args, cwd, pane, via="watcher")
+        result = payload.get("status")
         if result == "resume_delivered":
             output({"status": "continue_prompted", "pane": pane})
             return 0
@@ -1518,6 +1784,7 @@ def cmd_init(args: argparse.Namespace) -> int:
                 "rounds": [],
                 "jobs": [],
                 "pending_dispatch": None,
+                "notices": [],
                 "created_at": now(),
             }
         persist(pp, data)
@@ -2398,7 +2665,11 @@ def cmd_status(args: argparse.Namespace) -> int:
     pp = paths(args)
     cwd = canonical_cwd(args.cwd)
     with locked(pp["root"], pp["lock"]):
-        data = load_ready(pp, cwd)
+        data = load(pp["state"], cwd)
+        write_ledger(pp["ledger"], data)
+        check_dispatch_stale(args, pp, data)
+        if data.get("pending_dispatch"):
+            raise PendingDispatchError(data["pending_dispatch"], data.get("notices", []))
     active_jobs = [j for j in data["jobs"] if j["state"] not in TERMINAL_JOBS]
     active_ids = active_round_ids(data)
     dispatch_status = "idle"
@@ -2446,6 +2717,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         "contract_status": contract_status,
         "contract_valid": contract_valid,
         "report": report,
+        "notices": data.get("notices", []),
     }
     if data["rollover_required"]:
         payload["guidance"] = ROLLOVER_GUIDANCE
@@ -2605,10 +2877,10 @@ def cmd_resume_deliver(args: argparse.Namespace) -> int:
                 f"last_error={record['last_error']} state_dir={pp['root']}. "
                 "Resume the pairing manually."
             )
-            try:
-                run_herdr(args, ["notification", "show", "herdr-pair resume expired", "--body", body])
-            except ValueError:
-                pass  # Best-effort: the expired record is already durable.
+            record_notice(
+                args, pp, data,
+                title="herdr-pair resume expired", body=body, dedupe_key="",
+            )
             output({"status": "resume_expired", **result, "record": record})
             return 0
         record["status"] = "uncertain"
@@ -2774,6 +3046,13 @@ def parser() -> argparse.ArgumentParser:
         help="wake-up source claiming this delivery (recorded in the output)",
     )
     p.set_defaults(func=cmd_resume_deliver)
+
+    p = sub.add_parser("wake", parents=[common])
+    p.add_argument(
+        "--source", required=True, choices=("command", "hook", "status", "watcher"),
+        help="wake-up point that ran this check (recorded in the output)",
+    )
+    p.set_defaults(func=cmd_wake)
     return ap
 
 
@@ -2781,8 +3060,16 @@ def main() -> int:
     args = parser().parse_args()
     try:
         return args.func(args)
+    except LockTimeoutError:
+        # Exact, stable, and newline-free: the caller's stdout may already hold a
+        # partial result, so this bypasses output() (and its sort_keys formatting).
+        sys.stdout.write(LOCK_TIMEOUT_PAYLOAD)
+        return 2
     except PendingDispatchError as exc:
-        output(pending_payload(exc.pending))
+        payload = pending_payload(exc.pending)
+        if exc.notices is not None:
+            payload["notices"] = exc.notices
+        output(payload)
         return 2
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"PAIRCTL_ERROR: {exc}", file=sys.stderr)
