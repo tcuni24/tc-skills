@@ -24,10 +24,13 @@ from typing import Any, Iterator
 class PendingDispatchError(ValueError):
     def __init__(
         self, pending: dict[str, Any], notices: list[dict[str, Any]] | None = None,
+        board: dict[str, Any] | None = None,
     ) -> None:
         self.pending = pending
         # status carries the notices array even on the pending-error path (issue #11).
         self.notices = notices
+        # status also carries the six popup-board fields on that path (issue #14).
+        self.board = board
         super().__init__("unresolved pending_dispatch")
 
 
@@ -363,6 +366,39 @@ def pending_payload(pending: dict[str, Any]) -> dict[str, Any]:
         "guidance": (
             f"{PENDING_GUIDANCE} target={target} round_id={round_id}."
         ),
+    }
+
+
+def board_fields(data: dict[str, Any]) -> dict[str, Any]:
+    """The six fields the pair.status popup board renders (issue #14).
+
+    Both `pairctl status` exits — the normal answer and the PENDING_DISPATCH_
+    UNRESOLVED rejection — carry this exact set, computed once from the state
+    already loaded under the lock. `pending_dispatch_age_s` stays null unless a
+    pending record with a parsable created_at exists; `resume_pending` is null
+    when no record was ever armed.
+    """
+    age: int | None = None
+    pending = data.get("pending_dispatch")
+    if isinstance(pending, dict):
+        stamp = parse_stamp(pending.get("created_at"))
+        if stamp is not None:
+            age = max(0, int(time.time() - stamp.timestamp()))
+    return {
+        "goal": str(data.get("goal") or ""),
+        "phase": data.get("phase"),
+        "rounds": [
+            {
+                "round_id": str(item.get("round_id") or ""),
+                "status": str(item.get("status") or ""),
+                "executor": str(item.get("executor") or ""),
+            }
+            for item in (data.get("rounds") or [])
+            if isinstance(item, dict)
+        ],
+        "pending_dispatch_age_s": age,
+        "resume_pending": data.get("resume_pending"),
+        "notices": data.get("notices", []),
     }
 
 
@@ -2916,7 +2952,9 @@ def cmd_status(args: argparse.Namespace) -> int:
         write_ledger(pp["ledger"], data)
         check_dispatch_stale(args, pp, data)
         if data.get("pending_dispatch"):
-            raise PendingDispatchError(data["pending_dispatch"], data.get("notices", []))
+            raise PendingDispatchError(
+                data["pending_dispatch"], data.get("notices", []), board_fields(data)
+            )
     active_jobs = [j for j in data["jobs"] if j["state"] not in TERMINAL_JOBS]
     active_ids = active_round_ids(data)
     dispatch_status = "idle"
@@ -2939,12 +2977,16 @@ def cmd_status(args: argparse.Namespace) -> int:
         contract_valid, contract_status = verify_round_contract(active_round, current_revision)
         report = str(active_round.get("report") or "")
 
+    board = board_fields(data)
     payload = {
         "status": "SESSION_ROLLOVER_REQUIRED" if data["rollover_required"] else "ok",
         "rollover_required": data["rollover_required"],
+        "goal": board["goal"],
         "phase": data["phase"],
         "phase_round_count": data["phase_round_count"],
+        "rounds": board["rounds"],
         "rounds_total": len(data["rounds"]),
+        "pending_dispatch_age_s": board["pending_dispatch_age_s"],
         "active_rounds": active_ids,
         "active_jobs": len(active_jobs),
         "checkpoint": (data.get("last_checkpoint") or {}).get("path", ""),
@@ -3467,6 +3509,10 @@ def main() -> int:
         return 2
     except PendingDispatchError as exc:
         payload = pending_payload(exc.pending)
+        # The status exit also carries the popup-board fields (issue #14); the
+        # notices argument stays for raises that never computed a board.
+        if exc.board:
+            payload.update(exc.board)
         if exc.notices is not None:
             payload["notices"] = exc.notices
         output(payload)

@@ -10,9 +10,11 @@ import os
 from pathlib import Path
 import re
 import signal
+import socket
 import stat
 import subprocess
 import tempfile
+import threading
 import time
 import tomllib
 import unittest
@@ -2989,9 +2991,12 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(exited_resolved, self.PANE_EXITED_HOOK.resolve())
         self.assertTrue(exited_resolved.is_file())
         # Round p01-r005 adds [[actions]] (asserted by
-        # test_plugin_manifest_lists_section6_actions); panes and startup stay out.
-        for forbidden in ("panes", "startup"):
-            self.assertNotIn(forbidden, manifest)
+        # test_plugin_manifest_lists_section6_actions); issue #14 adds the
+        # pair-status popup pane and the startup replay entry (asserted by
+        # test_plugin_manifest_lists_popup_pane_and_startup).
+        self.assertEqual(
+            [a.get("id") for a in manifest.get("actions") or []][0], "pair.status"
+        )
 
     # --- issue #11: notices, wake, lock timeout, hook failure path ------------------
 
@@ -4096,6 +4101,216 @@ class PairctlTest(unittest.TestCase):
             ["pane.agent_status_changed", "pane.exited"],
             events,
         )
+
+    # --- issue #14: popup board + sidebar replay --------------------------------
+
+    STATUS_PANE = Path(__file__).resolve().parents[1] / "hooks" / "status_pane.py"
+    STARTUP_HOOK = Path(__file__).resolve().parents[1] / "hooks" / "on_startup.py"
+
+    def run_plugin_hook(
+        self, script: Path, extra_env: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        """Run a hook script black-box with the same injected environment as invoke()."""
+        env = os.environ.copy()
+        env["XDG_STATE_HOME"] = str(self.state_home)
+        env["PAIRCTL"] = str(SCRIPT)
+        env["PAIRCTL_STATE_JSON"] = str(self.state / "state.json")
+        env["PAIRCTL_HERDR"] = str(self.herdr)
+        env.pop("PAIRCTL_AUTO_COMPACT", None)
+        env["PAIRCTL_CONTINUE_AFTER_COMPACT"] = "0"
+        env.pop("PAIRCTL_CWD", None)
+        env.pop("PAIRCTL_STATE_DIR", None)
+        env.pop("HERDR_PLUGIN_STATE_DIR", None)
+        env.pop("HERDR_PLUGIN_CONTEXT_JSON", None)
+        env.pop("HERDR_SOCKET_PATH", None)
+        if extra_env:
+            env.update(extra_env)
+        return subprocess.run(
+            ["python3", str(script)],
+            text=True, capture_output=True, check=False, env=env,
+        )
+
+    def test_status_payload_includes_board_fields(self) -> None:
+        sent = self.send_round(1)
+        payload = self.invoke_ok("status")
+        for key in (
+            "goal", "phase", "rounds", "pending_dispatch_age_s",
+            "resume_pending", "notices",
+        ):
+            self.assertIn(key, payload, payload)
+        self.assertIsNone(payload["pending_dispatch_age_s"], payload)
+        self.assertIsNone(payload["resume_pending"], payload)
+        row = payload["rounds"][0]
+        self.assertEqual(row["round_id"], sent["round_id"], payload["rounds"])
+        self.assertEqual(row["status"], "active", row)
+        self.assertEqual(row["executor"], "w1:p2", row)
+
+        created_at = self.set_pending_dispatch(age_s=120)
+        proc = self.invoke("status")
+        self.assertEqual(proc.returncode, 2, proc.stderr + proc.stdout)
+        pending = json.loads(proc.stdout)
+        self.assertEqual(pending["status"], "PENDING_DISPATCH_UNRESOLVED", pending)
+        for key in (
+            "goal", "phase", "rounds", "pending_dispatch_age_s",
+            "resume_pending", "notices",
+        ):
+            self.assertIn(key, pending, pending)
+        self.assertEqual(pending["rounds"], payload["rounds"], pending)
+        expect = int(
+            time.time() - dt.datetime.fromisoformat(created_at).timestamp()
+        )
+        age = pending["pending_dispatch_age_s"]
+        self.assertIsInstance(age, int, pending)
+        self.assertGreaterEqual(age, 0, pending)
+        self.assertLessEqual(abs(age - expect), 30, pending)
+
+    def test_status_pane_prints_rate_limited_notice(self) -> None:
+        state = self.read_state()
+        state.setdefault("notices", []).append({
+            "at": "2026-09-22T00:00:00+00:00",
+            "title": "herdr-pair resume expired",
+            "body": "prompt could not be confirmed",
+            "reason": "rate_limited",
+            "shown": False,
+            "dedupe_key": "test-rate-limited",
+        })
+        self.write_state(state)
+        proc = self.run_plugin_hook(self.STATUS_PANE, extra_env={
+            "PAIRCTL_CWD": str(self.cwd),
+            "PAIRCTL_STATE_DIR": str(self.state),
+        })
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn("herdr-pair resume expired", proc.stdout)
+        self.assertIn("shown=false", proc.stdout)
+
+    def test_pair_status_opens_popup_from_executor_focus(self) -> None:
+        # send-round binds w1:p2 into the pane index as the executor: the
+        # read-only status action resolves from that focus and still opens the
+        # board. The popup is the only herdr call; agent.view.set is the startup
+        # hook's job, never this action's.
+        self.send_round(1)
+        self.clear_calls()
+        state_path = self.state / "state.json"
+        before = state_path.read_bytes()
+        proc = self.run_action(
+            "pair.status", context=self.action_context(focused_pane="w1:p2")
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        payload = json.loads(proc.stdout)
+        self.assertIn("phase", payload)
+        self.assertEqual(payload["resolution"]["source"], "pane_index", payload)
+        self.assertEqual(
+            self.herdr_calls(),
+            [[
+                "plugin", "pane", "open",
+                "--plugin", "tc.herdr-pair",
+                "--entrypoint", "pair-status",
+                "--placement", "popup",
+            ]],
+            self.herdr_calls(),
+        )
+        self.assertEqual(state_path.read_bytes(), before)
+
+    def startup_replay(self, plugin_state: Path, sock_path: str) -> list[dict]:
+        """Run on_startup.py against a one-shot unix listener; return received frames."""
+        received: list[bytes] = []
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(sock_path)
+        listener.listen(1)
+        listener.settimeout(10)
+
+        def serve() -> None:
+            try:
+                conn, _ = listener.accept()
+            except socket.timeout:
+                return
+            finally:
+                listener.close()
+            with conn:
+                conn.settimeout(5)
+                data = b""
+                while not data.endswith(b"\n"):
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+                received.append(data)
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        proc = self.run_plugin_hook(self.STARTUP_HOOK, extra_env={
+            "HERDR_PLUGIN_STATE_DIR": str(plugin_state),
+            "HERDR_SOCKET_PATH": sock_path,
+        })
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        thread.join(timeout=15)
+        return [json.loads(raw) for raw in received if raw.strip()]
+
+    def test_startup_replays_saved_sidebar_view(self) -> None:
+        self.send_round(1)
+        plugin_state = self.root / "plugin-state"
+        proc = self.run_action(
+            "pair.status",
+            context=self.action_context(),
+            extra_env={"HERDR_PLUGIN_STATE_DIR": str(plugin_state)},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertTrue((plugin_state / "sidebar-view.json").is_file())
+
+        frames = self.startup_replay(plugin_state, str(self.root / "herdr.sock"))
+        self.assertEqual(len(frames), 1, frames)
+        frame = frames[0]
+        self.assertTrue(str(frame.get("id") or "").strip(), frame)
+        self.assertEqual(frame.get("method"), "agent.view.set", frame)
+        params = frame.get("params") or {}
+        self.assertEqual(params.get("source"), "tc.herdr-pair", params)
+        self.assertEqual(params.get("label"), "herdr-pair", params)
+        view_filter = params.get("filter") or {}
+        self.assertEqual(view_filter.get("op"), "in", params)
+        self.assertEqual(view_filter.get("field"), "pane_id", params)
+        values = view_filter.get("values") or []
+        self.assertIn("w1:p1", values, params)
+        self.assertIn("w1:p2", values, params)
+
+        # No saved view: the hook writes nothing at all.
+        (plugin_state / "sidebar-view.json").unlink()
+        frames = self.startup_replay(plugin_state, str(self.root / "herdr2.sock"))
+        self.assertEqual(frames, [], frames)
+
+    def test_plugin_manifest_lists_popup_pane_and_startup(self) -> None:
+        manifest_path = Path(__file__).resolve().parents[1] / "herdr-plugin.toml"
+        manifest = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
+        panes = [
+            p for p in (manifest.get("panes") or []) if p.get("id") == "pair-status"
+        ]
+        self.assertEqual(len(panes), 1, manifest.get("panes"))
+        self.assertEqual(panes[0].get("title"), "Pair status", panes)
+        self.assertEqual(
+            panes[0].get("command"), ["python3", "hooks/status_pane.py"], panes
+        )
+        self.assertEqual(panes[0].get("placement"), "popup", panes)
+        startup = manifest.get("startup") or []
+        self.assertIsInstance(startup, list, startup)
+        self.assertIn(
+            {"command": ["python3", "hooks/on_startup.py"]}, startup, startup
+        )
+        self.assertEqual(manifest.get("min_herdr_version"), "0.8.0")
+        self.assertEqual(
+            [a.get("id") for a in manifest.get("actions") or []],
+            [
+                "pair.status",
+                "pair.focus-planner",
+                "pair.focus-executor",
+                "pair.resume-now",
+                "pair.dispatch-prepared",
+            ],
+        )
+        self.assertEqual(
+            [e.get("on") for e in manifest.get("events") or []],
+            ["pane.agent_status_changed", "pane.exited"],
+        )
+        self.assertTrue(self.STATUS_PANE.resolve().is_file())
+        self.assertTrue(self.STARTUP_HOOK.resolve().is_file())
 
 
 if __name__ == "__main__":

@@ -9,8 +9,9 @@
 # (explicit args > PAIRCTL_* env > pane index > focused pane cwd > workspace cwd),
 # then delegates every claim/send to pairctl. Read-only actions work with the
 # executor focused; pair.resume-now and pair.dispatch-prepared refuse any focus
-# that is not the state's planner pane. No popup board and no sidebar view here:
-# pair.status only echoes `pairctl status`.
+# that is not the state's planner pane. pair.status also opens the pair-status
+# popup board below and persists the sidebar view query for the startup hook to
+# replay (issue #14); the popup itself only renders `pairctl status`.
 id = "tc.herdr-pair"
 name = "herdr-pair resume hook"
 version = "0.1.0"
@@ -54,3 +55,12 @@ id = "pair.dispatch-prepared"
 title = "Dispatch prepared handoff"
 command = ["python3", "hooks/action.py", "pair.dispatch-prepared"]
 contexts = ["pane"]
+
+[[panes]]
+id = "pair-status"
+title = "Pair status"
+command = ["python3", "hooks/status_pane.py"]
+placement = "popup"
+
+[[startup]]
+command = ["python3", "hooks/on_startup.py"]

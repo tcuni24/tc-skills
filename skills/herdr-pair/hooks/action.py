@@ -31,7 +31,14 @@ pair.focus-executor) succeed with the executor focused too.
 
 Action bodies:
 
-* pair.status           `pairctl status` payload + resolution (state untouched)
+* pair.status           `pairctl status` payload + resolution (state untouched).
+                        When the answer carries `phase` — including the exit-2
+                        pending-dispatch payload — it also opens the pair-status
+                        popup via `herdr plugin pane open` and persists the
+                        sidebar view query to
+                        $HERDR_PLUGIN_STATE_DIR/sidebar-view.json (replayed by
+                        hooks/on_startup.py; the action itself never calls
+                        agent.view.set)
 * pair.focus-planner    `herdr agent focus <planner_pane>`
 * pair.focus-executor   `herdr agent focus <active round executor>`; no active
                         executor => exit 2 `no_executor`
@@ -57,6 +64,10 @@ from pathlib import Path
 DEFAULT_STALE_HOURS = 12.0
 DEFAULT_STATE_HOME = "~/.local/state"
 HERDR_CALL_TIMEOUT = 30.0
+PLUGIN_ID = "tc.herdr-pair"
+SIDEBAR_LABEL = "herdr-pair"
+SIDEBAR_VIEW_FILE = "sidebar-view.json"
+STATUS_PANE_ENTRYPOINT = "pair-status"
 # Mutating actions: focus must equal the state's planner_pane or they refuse.
 WRITE_ACTIONS = frozenset({"pair.resume-now", "pair.dispatch-prepared"})
 KNOWN_ACTIONS = (
@@ -280,6 +291,107 @@ def fail(action: str, reason: str, resolution: dict, **extra: object) -> int:
     return 2
 
 
+def open_status_popup() -> None:
+    """`herdr plugin pane open` for the status board; best-effort, never fatal."""
+    argv = [
+        herdr_bin(), "plugin", "pane", "open",
+        "--plugin", PLUGIN_ID,
+        "--entrypoint", STATUS_PANE_ENTRYPOINT,
+        "--placement", "popup",
+    ]
+    try:
+        subprocess.run(
+            argv, text=True, capture_output=True, check=False,
+            timeout=HERDR_CALL_TIMEOUT,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        pass  # the board is a convenience: a failed open must not fail the action
+
+
+def sidebar_view_params(payload: dict, state: dict | None) -> dict | None:
+    """agent.view.set params persisted for the startup replay (issue #14).
+
+    Values lead with planner_pane and add the active round's executor; with no
+    active round the last non-empty executor in `rounds` stands in, and a state
+    with neither leaves the planner pane alone. None means "do not write".
+    """
+    planner = str(payload.get("planner_pane") or "").strip() or str(
+        (state or {}).get("planner_pane") or ""
+    ).strip()
+    if not planner:
+        return None
+    rounds = payload.get("rounds")
+    if not isinstance(rounds, list):
+        rounds = (state or {}).get("rounds") or []
+    executor = ""
+    for item in rounds:
+        if not isinstance(item, dict) or str(item.get("status") or "") != "active":
+            continue
+        executor = str(item.get("executor") or "").strip()
+        if executor:
+            break
+    if not executor:
+        for item in reversed(rounds):
+            if not isinstance(item, dict):
+                continue
+            executor = str(item.get("executor") or "").strip()
+            if executor:
+                break
+    values = [planner]
+    if executor and executor not in values:
+        values.append(executor)
+    return {
+        "source": PLUGIN_ID,
+        "label": SIDEBAR_LABEL,
+        "filter": {"op": "in", "field": "pane_id", "values": values},
+    }
+
+
+def write_sidebar_view(params: dict) -> None:
+    """Persist the view query for hooks/on_startup.py; failures stay silent."""
+    base = (os.environ.get("HERDR_PLUGIN_STATE_DIR") or "").strip()
+    if not base:
+        return
+    try:
+        path = Path(base).expanduser() / SIDEBAR_VIEW_FILE
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(params, ensure_ascii=False) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def run_pair_status(cwd: str, state_dir: str, resolution: dict) -> int:
+    """pair.status: echo the status JSON, then board side-effects (issue #14).
+
+    The answer is emitted first so stdout stays one clean JSON line; the popup
+    open and sidebar persist afterwards only run when the answer carried
+    `phase`, which covers both the normal exit and the exit-2 pending-dispatch
+    payload. A non-JSON or phase-less answer opens nothing.
+    """
+    code, payload, detail = run_pairctl(cwd, state_dir, ["status"])
+    if payload is None:
+        emit({
+            "status": "failed",
+            "reason": "pairctl_failed",
+            "action": "pair.status",
+            "detail": detail,
+            "resolution": resolution,
+        })
+        return 2
+    merged = {**payload, "action": "pair.status", "resolution": resolution}
+    emit(merged)
+    if "phase" in payload:
+        open_status_popup()
+        view = sidebar_view_params(payload, load_state(state_dir))
+        if view is not None:
+            write_sidebar_view(view)
+    if str(payload.get("status") or "") == "rejected":
+        return 2
+    return code
+
+
 def run_pairctl_action(
     action: str, cwd: str, state_dir: str, resolution: dict, tail: list[str]
 ) -> int:
@@ -346,9 +458,7 @@ def main() -> int:
             )
 
     if args.action == "pair.status":
-        return run_pairctl_action(
-            args.action, cwd, state_dir, resolution, ["status"]
-        )
+        return run_pair_status(cwd, state_dir, resolution)
 
     if args.action == "pair.focus-planner":
         planner = str((load_state(state_dir) or {}).get("planner_pane") or "")
