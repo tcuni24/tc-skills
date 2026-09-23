@@ -115,6 +115,9 @@ minimum delay 20s, consecutive idle 8s, poll 1s, timeout 600s), then prompts the
 and continue. This is a routing heuristic, not proof of completed compaction.
 PAIRCTL_CONTINUE_AFTER_COMPACT=0 disables this watcher only.
 
+This watcher resumes the planner after compaction. Waiting for the executor is
+[executor-wait.md](executor-wait.md).
+
 If the planner does not continue, inspect compact-continue.log and compact-continue.pid next to
 state.json and compare agent status with the visible screen. The timing knobs are
 PAIRCTL_CONTINUE_MIN_DELAY_S, PAIRCTL_CONTINUE_IDLE_S, PAIRCTL_CONTINUE_POLL_S and
@@ -157,6 +160,11 @@ agent_prompted proves delivery to a pane, not intended identity or completed wor
 pane/tab against the resolved seat. A recycled/missing pane needs re-listing, never a guessed
 same-type replacement. --wait does not track turns: a previous turn can satisfy it, so idle after
 --wait is not task acceptance. Require a persisted report and artifact verification.
+
+After agent_prompted, settle the executor with standalone `herdr agent wait` on its pane
+([executor-wait.md](executor-wait.md)). Do not use `agent prompt --wait` for that, and do not
+treat a plugin notice as the wait. On timeout, read `agent get` and `agent read` before any
+resend or stop.
 
 ## Audit the governing spec
 
