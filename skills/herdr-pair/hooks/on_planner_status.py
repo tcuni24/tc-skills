@@ -52,7 +52,7 @@ from pathlib import Path
 # Same directory as this hook: log paths, the pairctl runner, and the one-time
 # failure notification live in notify.py so neither module imports the other's.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from notify import append_log, notify_pairctl_failed, run_pairctl  # noqa: E402
+from notify import append_log, notify_pairctl_failed, recorded_machine, run_pairctl  # noqa: E402
 
 DEFAULT_STALE_HOURS = 12.0
 DEFAULT_STATE_HOME = "~/.local/state"
@@ -221,16 +221,20 @@ def main() -> int:
     if agent_status in EXECUTOR_OK_STATUS:
         exec_entry = select_executor_entry(pane_id)
         if exec_entry is not None:
+            state_dir = str(exec_entry.get("state_dir") or "")
             argv = [
                 "executor-event",
                 "--pane", pane_id,
                 "--status", agent_status,
                 "--cwd", str(exec_entry.get("cwd") or ""),
-                "--state-dir", str(exec_entry.get("state_dir") or ""),
+                "--state-dir", state_dir,
             ]
+            machine = recorded_machine(state_dir)
+            if machine:
+                argv.extend(("--machine", machine))
             ok, detail = run_pairctl(pairctl, argv)
             if not ok:
-                notify_pairctl_failed(pane_id, pairctl, detail)
+                notify_pairctl_failed(pane_id, pairctl, detail, machine)
                 return 1
             return 0
     if agent_status not in FRESH_OK_STATUS:
@@ -238,12 +242,16 @@ def main() -> int:
     entry = select_candidate(pane_id)
     if entry is None:
         return 0
+    state_dir = str(entry.get("state_dir") or "")
     argv = [
         "resume-deliver",
         "--pane", pane_id, "--via", "plugin",
         "--cwd", str(entry.get("cwd") or ""),
-        "--state-dir", str(entry.get("state_dir") or ""),
+        "--state-dir", state_dir,
     ]
+    machine = recorded_machine(state_dir)
+    if machine:
+        argv.extend(("--machine", machine))
     # Capture the child's output: the hook stays silent whatever resume-deliver
     # answers. Only a pairctl that cannot answer (missing file, non-JSON stdout)
     # is the one loud path: log pairctl_failed, notify once, exit 1 (issue #11).
@@ -251,7 +259,7 @@ def main() -> int:
     # completed answer under the issue #10 silence contract.
     ok, detail = run_pairctl(pairctl, argv)
     if not ok:
-        notify_pairctl_failed(pane_id, pairctl, detail)
+        notify_pairctl_failed(pane_id, pairctl, detail, machine)
         return 1
     return 0
 

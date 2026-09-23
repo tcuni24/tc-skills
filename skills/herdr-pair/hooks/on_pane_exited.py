@@ -38,7 +38,7 @@ from pathlib import Path
 # Same directory as this hook: log paths, the pairctl runner, and the one-time
 # failure notification live in notify.py so neither module imports the other's.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from notify import append_log, notify_pairctl_failed, run_pairctl  # noqa: E402
+from notify import append_log, notify_pairctl_failed, recorded_machine, run_pairctl  # noqa: E402
 
 DEFAULT_STALE_HOURS = 12.0
 DEFAULT_STATE_HOME = "~/.local/state"
@@ -130,12 +130,15 @@ def main() -> int:
             "--pane", pane_id, "--status", "exited",
             "--cwd", cwd, "--state-dir", state_dir,
         ]
+        machine = recorded_machine(state_dir)
+        if machine:
+            argv.extend(("--machine", machine))
         # Capture the child's output: the hook stays silent whatever
         # executor-event answers. Only a pairctl that cannot answer (missing
         # file, non-JSON stdout) logs pairctl_failed, notifies once, exits 1.
         ok, detail = run_pairctl(pairctl, argv)
         if not ok:
-            notify_pairctl_failed(pane_id, pairctl, detail)
+            notify_pairctl_failed(pane_id, pairctl, detail, machine)
             return 1
     return 0
 

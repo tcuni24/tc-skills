@@ -29,6 +29,12 @@ state is **unknown**: do not clear, resend, declare completion, or switch execut
 Prefer, in order: same tab → same workspace + same `cwd` → same `cwd` anywhere. Use a level only
 when it yields **exactly one** match; never fall through past an ambiguous level. Always address
 the resolved `pane_id`, never the agent name — names repeat across panes, `pane_id` does not.
+`pane_id` uniqueness is per Herdr server: another machine may also have `w1:p1`. Selecting a
+machine in the TUI does not retarget pairctl or other CLI calls; they still talk to the local
+server. For a saved SSH machine, discover panes with `herdr --machine <label-or-id> agent list`
+(global prefix; label or profile id) and bind the pair with `pairctl init --machine <label-or-id>`.
+pairctl records that selector and prefixes every later herdr agent/pane call for the pair,
+including resume and hooks. Omit `--machine` for the local server.
 
 If the user named a type and several panes match, ask once, listing each candidate's `pane_id`,
 `tab_id`, `cwd` and `terminal_title`. If the named type is not live anywhere, say so and offer the

@@ -37,6 +37,13 @@ as argv without shell expansion. State defaults to
 `state.json` is authoritative; `jobs.tsv` is derived. Each handoff must give the same absolute
 `PAIRCTL`, canonical `--cwd` and exact `--state-dir` or default-state selection.
 
+Pane ids are unique per Herdr server, not across machines. A saved SSH machine uses Herdr's
+global prefix `herdr --machine <label-or-id> …` on every call, and the same selector on pairctl
+(`init --machine <label-or-id>`). pairctl records it (`machine`, `planner_machine`,
+`executor_machine`; empty means local) and reuses it for every later herdr call in that pair,
+including resume and hooks. Omit `--machine` for the local server. Selecting a machine in the
+TUI does not retarget pairctl or the CLI.
+
 ```bash
 python3 "$PAIRCTL" init --planner-pane "$HERDR_PANE_ID" --goal '<one-sentence goal>'
 python3 "$PAIRCTL" context-usage
@@ -91,7 +98,8 @@ their settings for this workflow.
 
 Record your `HERDR_PANE_ID` as the return address and run `herdr agent list`; exclude yourself.
 Filter by type only if the user named it. Prefer same tab, then same workspace + cwd, then same cwd
-anywhere. Stop at the first ambiguous level and ask which pane; address the unique `pane_id`.
+anywhere. Stop at the first ambiguous level and ask which pane; address the unique `pane_id`
+(unique per server — [executor-resolution.md](reference/executor-resolution.md) for `--machine`).
 Respect whether the user's writer choice covers one round or the entire task.
 
 Status and quota banners are routing hints. Conflicting screen/status means unknown: inspect
@@ -232,7 +240,8 @@ For request routing and troubleshooting examples, read
    强制必须传 `--revision`。若返回 `allowed: false`，立即停止写入并向 Planner 上报阻断原因。
 5. **在 fence 范围内执行编辑与测试**：严格遵守 stop 条件与范围限制。
 6. **落盘完整执行与验收证据**。
-7. **发送短回报给 Planner**：通过 `herdr agent prompt` 回报结论与证据。
+7. **发送短回报给 Planner**：通过 `herdr agent prompt` 回报结论与证据。远程配对使用同一选择器：
+   `herdr --machine <label-or-id> agent prompt`。
 
 For evidence, scope, reports, assumptions, numerical provenance and stale prompts, follow
 [Executor responsibilities](reference/handoff.md#executor-responsibilities). Always use the

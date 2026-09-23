@@ -46,14 +46,18 @@ def setting(name, default):
     return path.read_text(encoding="utf-8").strip() if path.is_file() else default
 
 
-sub = sys.argv[1:3]
+# Herdr global prefix: `herdr --machine <label-or-id> <command…>`.
+argv = sys.argv[:]
+if len(argv) >= 3 and argv[1] == "--machine":
+    argv = [argv[0], *argv[3:]]
+sub = argv[1:3]
 if sub == ["agent", "get"]:
     print(json.dumps({
         "id": "cli:agent:get",
         "result": {"agent": {
             "agent": setting("kind", "pi"),
             "agent_status": setting("status", "idle"),
-            "pane_id": sys.argv[3],
+            "pane_id": argv[3],
         }},
     }))
     raise SystemExit(0)
@@ -61,11 +65,11 @@ if sub == ["agent", "read"]:
     screen_path = Path(sys.argv[0] + ".screen")
     print(screen_path.read_text(encoding="utf-8") if screen_path.is_file() else "✓ New session started\n")
     raise SystemExit(0)
-if sub == ["agent", "prompt"] and len(sys.argv) > 4 and sys.argv[4].startswith("/"):
+if sub == ["agent", "prompt"] and len(argv) > 4 and argv[4].startswith("/"):
     # Slash commands (/new, /clear, /compact) are always delivered by the fake.
     print(json.dumps({
         "id": "cli:agent:prompt",
-        "result": {"type": "agent_prompted", "pane_id": sys.argv[3]},
+        "result": {"type": "agent_prompted", "pane_id": argv[3]},
     }))
     raise SystemExit(0)
 if sub == ["notification", "show"]:
@@ -98,7 +102,7 @@ mode = mode_path.read_text(encoding="utf-8").strip() if mode_path.is_file() else
 if mode == "ok":
     print(json.dumps({
         "id": "cli:agent:prompt",
-        "result": {"type": "agent_prompted", "pane_id": sys.argv[3] if len(sys.argv) > 3 else ""},
+        "result": {"type": "agent_prompted", "pane_id": argv[3] if len(argv) > 3 else ""},
     }))
     raise SystemExit(0)
 if mode == "fail":
@@ -182,6 +186,7 @@ class PairctlTest(unittest.TestCase):
         env["PAIRCTL_STATE_JSON"] = str(self.state / "state.json")
         env["PAIRCTL_HERDR"] = str(self.herdr)
         env.pop("PAIRCTL_AUTO_COMPACT", None)
+        env.pop("PAIRCTL_HERDR_MACHINE", None)
         env["PAIRCTL_CONTINUE_AFTER_COMPACT"] = "0"
         if extra_env:
             env.update(extra_env)
@@ -201,6 +206,7 @@ class PairctlTest(unittest.TestCase):
         env["PAIRCTL_STATE_JSON"] = str(self.state / "state.json")
         env["PAIRCTL_HERDR"] = str(self.herdr)
         env.pop("PAIRCTL_AUTO_COMPACT", None)
+        env.pop("PAIRCTL_HERDR_MACHINE", None)
         env["PAIRCTL_CONTINUE_AFTER_COMPACT"] = "0"
         if extra_env:
             env.update(extra_env)
@@ -3892,6 +3898,7 @@ class PairctlTest(unittest.TestCase):
         # source under test is injected explicitly, so an ambient one must not leak.
         env.pop("PAIRCTL_CWD", None)
         env.pop("PAIRCTL_STATE_DIR", None)
+        env.pop("PAIRCTL_HERDR_MACHINE", None)
         env.pop("HERDR_PLUGIN_STATE_DIR", None)
         if context is None:
             env.pop("HERDR_PLUGIN_CONTEXT_JSON", None)
@@ -4127,6 +4134,7 @@ class PairctlTest(unittest.TestCase):
         env["PAIRCTL_CONTINUE_AFTER_COMPACT"] = "0"
         env.pop("PAIRCTL_CWD", None)
         env.pop("PAIRCTL_STATE_DIR", None)
+        env.pop("PAIRCTL_HERDR_MACHINE", None)
         env.pop("HERDR_PLUGIN_STATE_DIR", None)
         env.pop("HERDR_PLUGIN_CONTEXT_JSON", None)
         env.pop("HERDR_SOCKET_PATH", None)
@@ -4516,6 +4524,171 @@ class PairctlTest(unittest.TestCase):
         log_path = self.state / "compact-continue.log"
         text = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
         self.assertNotIn("pair state is not initialized", text)
+
+
+    # --- saved Herdr machine routing ----------------------------------------------
+
+    def assert_local_herdr(self, calls: list[list[str]]) -> None:
+        for call in calls:
+            self.assertNotIn("--machine", call, call)
+
+    def assert_machine_herdr(self, calls: list[list[str]], machine: str) -> None:
+        self.assertTrue(calls, "expected at least one herdr call")
+        for call in calls:
+            self.assertEqual(call[:2], ["--machine", machine], call)
+            self.assertGreaterEqual(len(call), 4, call)
+
+    def test_local_default_omits_machine_and_records_local(self) -> None:
+        state = self.read_state()
+        self.assertEqual(state["machine"], "")
+        self.assertEqual(state["planner_machine"], "")
+        self.assertEqual(state["executor_machine"], "")
+        self.clear_calls()
+        sent = self.send_round(1)
+        self.assertEqual(sent["status"], "round_sent")
+        self.assert_local_herdr(self.herdr_calls())
+        state = self.read_state()
+        self.assertEqual(state["machine"], "")
+        self.assertEqual(state["planner_machine"], "")
+        self.assertEqual(state["rounds"][0]["executor_machine"], "")
+        self.assertEqual(state["executor_machine"], "")
+        status = self.invoke_ok("status")
+        self.assertEqual(status["machine"], "")
+        self.assertEqual(status["planner_machine"], "")
+        self.assertEqual(status["executor_machine"], "")
+        # The local pane index stays the historical four fields.
+        self.assertEqual(
+            set(self.read_pane_index("w1:p1")[0]),
+            {"state_dir", "cwd", "role", "recorded_at"},
+        )
+
+    def test_machine_prefixes_every_herdr_call_and_records_both_seats(self) -> None:
+        bound = self.invoke_ok("init", "--machine", "Build machine", "--planner-pane", "w1:p1")
+        self.assertEqual(bound["machine"], "Build machine")
+        self.assertEqual(bound["planner_machine"], "Build machine")
+        state = self.read_state()
+        self.assertEqual(state["machine"], "Build machine")
+        self.assertEqual(state["planner_machine"], "Build machine")
+        planner_index = self.read_pane_index("w1:p1")
+        self.assertEqual(planner_index[-1]["machine"], "Build machine")
+        self.clear_calls()
+
+        sent = self.send_round(1)
+        self.assertEqual(sent["status"], "round_sent")
+        calls = self.herdr_calls()
+        self.assert_machine_herdr(calls, "Build machine")
+        kinds = [call[2:4] for call in calls]
+        self.assertIn(["agent", "get"], kinds, calls)
+        self.assertIn(["agent", "read"], kinds, calls)
+        self.assertIn(["agent", "prompt"], kinds, calls)
+        state = self.read_state()
+        self.assertEqual(state["executor_machine"], "Build machine")
+        self.assertEqual(state["rounds"][0]["executor_machine"], "Build machine")
+        self.assertEqual(state["planner_machine"], "Build machine")
+        self.assertEqual(self.read_pane_index("w1:p2")[-1]["machine"], "Build machine")
+
+        # A later command that does not repeat --machine still targets the same server.
+        self.clear_calls()
+        queued = self.invoke_ok("compact-self", extra_env=self.RECORD_ENV)
+        self.assertTrue(queued["queued"], queued)
+        self.assert_machine_herdr(self.herdr_calls(), "Build machine")
+        prompts = [c for c in self.herdr_calls() if c[2:4] == ["agent", "prompt"]]
+        self.assertTrue(any("Herdr machine `Build machine`" in c[-1] for c in prompts), prompts)
+        self.assertIn("Herdr machine: `Build machine`", (self.state / "CHECKPOINT.md").read_text())
+
+        self.clear_calls()
+        self.invoke_ok("rollover", "--reason", "compact")
+        delivered = self.invoke_ok("resume-deliver", "--pane", "w1:p1", "--via", "watcher")
+        self.assertEqual(delivered["status"], "resume_delivered", delivered)
+        prompts = [c for c in self.herdr_calls() if c[2:4] == ["agent", "prompt"]]
+        self.assertEqual(len(prompts), 1, self.herdr_calls())
+        self.assertEqual(prompts[0][:2], ["--machine", "Build machine"])
+        self.assert_machine_herdr(self.herdr_calls(), "Build machine")
+        # A pair that already bound panes cannot be retargeted onto another server.
+        rebind = self.invoke("init", "--machine", "elsewhere")
+        self.assertEqual(rebind.returncode, 2, rebind.stdout + rebind.stderr)
+        self.assertIn("machine mismatch", rebind.stderr)
+        self.assertEqual(self.read_state()["machine"], "Build machine")
+        self.assertEqual(self.read_state()["planner_machine"], "Build machine")
+
+    def test_machine_mismatch_refuses_before_any_herdr_call(self) -> None:
+        self.invoke_ok("init", "--machine", "buildbox")
+        self.clear_calls()
+        handoff = self.write_handoff("mismatch.md", "[轮次] round_id=<unique-id>\nbody\n")
+        refused = self.invoke(
+            "send-round", "--target", "w1:p2", "--file", str(handoff),
+            "--machine", "otherbox", "--scope", "x", "--acceptance", "y",
+        )
+        self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
+        self.assertIn("machine mismatch", refused.stderr)
+        self.assertEqual(self.herdr_calls(), [])
+        self.assertIsNone(self.read_state()["pending_dispatch"])
+        self.assertEqual(self.read_state()["machine"], "buildbox")
+        self.assertEqual(self.read_state()["rounds"], [])
+
+    def test_action_and_hook_use_recorded_machine(self) -> None:
+        self.invoke_ok("init", "--machine", "buildbox", "--planner-pane", "w1:p1")
+        self.clear_calls()
+        focused = self.run_action("pair.focus-planner", context=self.action_context())
+        self.assertEqual(focused.returncode, 0, focused.stderr + focused.stdout)
+        self.assertEqual(
+            self.herdr_calls(),
+            [["--machine", "buildbox", "agent", "focus", "w1:p1"]],
+        )
+        self.clear_calls()
+        status = self.run_action("pair.status", context=self.action_context())
+        self.assertEqual(status.returncode, 0, status.stderr + status.stdout)
+        self.assert_machine_herdr(self.herdr_calls(), "buildbox")
+        self.assertEqual(self.herdr_calls()[0][2:4], ["plugin", "pane"])
+
+        # Failure notification from the planner hook is the same selector.
+        self.arm_and_advance_epoch()
+        other = self.write_second_herdr()
+        env = os.environ.copy()
+        env["XDG_STATE_HOME"] = str(self.state_home)
+        env.pop("PAIRCTL_HERDR", None)
+        env.pop("PAIRCTL_HERDR_MACHINE", None)
+        env["HERDR_BIN_PATH"] = str(other)
+        env["PAIRCTL"] = str(self.root / "missing-pairctl.py")
+        env["HERDR_PLUGIN_EVENT"] = "pane.agent_status_changed"
+        env["HERDR_PLUGIN_EVENT_JSON"] = json.dumps({
+            "pane_id": "w1:p1", "workspace_id": "ws-1", "agent_status": "idle",
+        })
+        env.pop("HERDR_PLUGIN_STATE_DIR", None)
+        proc = subprocess.run(
+            ["python3", str(PLUGIN_HOOK)],
+            text=True, capture_output=True, check=False, env=env,
+        )
+        self.assertEqual(proc.returncode, 1, proc.stderr + proc.stdout)
+        notified = [
+            c for c in self.second_herdr_calls(other) if c[2:4] == ["notification", "show"]
+        ]
+        self.assertEqual(len(notified), 1, self.second_herdr_calls(other))
+        self.assertEqual(notified[0][:2], ["--machine", "buildbox"])
+
+    def test_spawned_watcher_receives_recorded_machine(self) -> None:
+        self.invoke_ok("init", "--machine", "buildbox")
+        queued = self.invoke_ok("compact-self", extra_env={
+            "PAIRCTL_CONTINUE_AFTER_COMPACT": "1",
+            "PAIRCTL_CONTINUE_POLL_S": "0.05",
+            "PAIRCTL_RESUME_DEADLINE_S": "600",
+        })
+        self.assertTrue(queued["continue_after_compact"]["spawned"], queued)
+        self.assert_machine_herdr(self.herdr_calls(), "buildbox")
+        pid = int((self.state / "compact-continue.pid").read_text(encoding="utf-8").strip())
+        argv = b""
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            try:
+                argv = Path(f"/proc/{pid}/cmdline").read_bytes()
+            except OSError:
+                argv = b""
+            if b"--machine" in argv:
+                break
+            time.sleep(0.05)
+        parts = argv.split(b"\0")
+        self.assertIn(b"--machine", parts, parts)
+        self.assertEqual(parts[parts.index(b"--machine") + 1], b"buildbox")
 
 
 if __name__ == "__main__":

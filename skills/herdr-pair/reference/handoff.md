@@ -192,7 +192,9 @@ Two numbers that disagree is a *fixture* question before it is an *honesty* ques
    diff contradicts costs you the seat.
 5. **Send the report back, do not just write it.** Finishing your turn does not notify anyone.
    Use `herdr agent prompt <planner_pane_id> '<短报告或报告路径>'` — the prompt should name the pane; if it
-   does not, ask for it before you start. Send when you are blocked, too, not only when you are
+   does not, ask for it before you start. Pane ids are per server: a saved machine needs
+   `herdr --machine <label-or-id> agent prompt`, and the TUI's selected machine does not retarget
+   that call. Send when you are blocked, too, not only when you are
    done. A report that only exists in your own pane is a report nobody received.
    **Keep it under a few KB.** The prompt is one argv argument and dies above **131,071 bytes**
    (≈43,600 汉字) with `argument list too long` — from the shell, so nothing is delivered and you get

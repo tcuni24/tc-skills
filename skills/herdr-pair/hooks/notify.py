@@ -84,7 +84,31 @@ def run_pairctl(pairctl_path: str, argv: list[str]) -> tuple[bool, str]:
     return True, json.dumps(payload, sort_keys=True)
 
 
-def notify_pairctl_failed(pane: str, pairctl_path: str, detail: str) -> None:
+def recorded_machine(state_dir: str) -> str:
+    """Saved Herdr selector in state.json, or '' when the pair is local or unreadable."""
+    try:
+        raw = json.loads(
+            (Path(state_dir).expanduser() / "state.json").read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(raw, dict):
+        return ""
+    return str(raw.get("machine") or "").strip()
+
+
+def herdr_argv(herdr: str, tail: list[str], machine: str = "") -> list[str]:
+    """Global prefix form: `herdr --machine <label-or-id> <tail…>` when remote."""
+    argv = [herdr]
+    if machine:
+        argv.extend(("--machine", machine))
+    argv.extend(tail)
+    return argv
+
+
+def notify_pairctl_failed(
+    pane: str, pairctl_path: str, detail: str, machine: str = "",
+) -> None:
     """Log the failure and show the one-time host notification (best effort).
 
     The marker file gates the host call: the first failure logs and notifies,
@@ -108,7 +132,11 @@ def notify_pairctl_failed(pane: str, pairctl_path: str, detail: str) -> None:
             or "herdr"
         )
         subprocess.run(
-            [herdr, "notification", "show", FAILURE_TITLE, "--body", line],
+            herdr_argv(
+                herdr,
+                ["notification", "show", FAILURE_TITLE, "--body", line],
+                machine,
+            ),
             text=True,
             capture_output=True,
             check=False,

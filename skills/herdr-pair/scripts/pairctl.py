@@ -154,6 +154,14 @@ class FreshError(ValueError):
     """The executor pane could not be verified as freshly cleared."""
 
 
+class MachineMismatchError(Exception):
+    """`--machine` disagrees with the Herdr server this pair is bound to.
+
+    Pane ids are unique per server. A mismatched selector would send those ids
+    to the wrong machine, so pairctl refuses before any herdr call.
+    """
+
+
 def now() -> str:
     return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
 
@@ -261,13 +269,17 @@ def atomic_text(path: Path, text: str) -> None:
             os.unlink(tmp_name)
 
 
-def record_pane(pane_id: str, state_dir: str, cwd: str, role: str) -> None:
+def record_pane(
+    pane_id: str, state_dir: str, cwd: str, role: str, machine: str = "",
+) -> None:
     """Index which pair state directory a pane belongs to (issue #10).
 
     The file is a JSON array of {state_dir, cwd, role, recorded_at} elements keyed
     by state_dir + role: rewriting one refreshes recorded_at in place and moves the
     element to the end of the array instead of appending a duplicate. An empty
-    pane id writes nothing. The index only feeds the plugin resume hook, so
+    pane id writes nothing. A non-empty `machine` (saved Herdr label or profile id)
+    is stored on the entry so hooks can tell which server that pane id belongs to;
+    local panes omit the key. The index only feeds the plugin resume hook, so
     state.json stays the single source of truth: a corrupt file restarts the
     array and an unwritable location never fails the command it decorates.
     """
@@ -287,9 +299,12 @@ def record_pane(pane_id: str, state_dir: str, cwd: str, role: str) -> None:
         e for e in entries
         if (str(e.get("state_dir") or ""), str(e.get("role") or "")) != key
     ]
-    entries.append({
+    entry = {
         "state_dir": state_dir, "cwd": cwd, "role": role, "recorded_at": now(),
-    })
+    }
+    if machine:
+        entry["machine"] = machine
+    entries.append(entry)
     try:
         atomic_text(path, json.dumps(entries, ensure_ascii=False, indent=2) + "\n")
     except OSError:
@@ -1042,6 +1057,10 @@ def write_checkpoint(path: Path, data: dict[str, Any], reason: str) -> None:
         f"- Rounds in phase: `{data['phase_round_count']}`",
         f"- Rollover required: `{str(data['rollover_required']).lower()}`",
         f"- Session ID: `{data.get('session_id') or 'unknown'}`",
+        *(
+            [f"- Herdr machine: `{str(data.get('machine') or '').strip()}`"]
+            if str(data.get("machine") or "").strip() else []
+        ),
         f"- Goal: `{table_cell(data.get('goal')) or 'unspecified'}`",
         f"- Context usage: `{tokens if tokens is not None else 'unknown'}`",
         f"- Budget: `{usage.get('budget', data.get('context_budget', DEFAULT_CONTEXT_BUDGET))}`",
@@ -1199,6 +1218,7 @@ def commit_round(
     snapshot: dict[str, Any] | None = None,
     skip_lint: str = "",
     report: str = "",
+    executor_machine: str = "",
 ) -> None:
     expected = allocate_round_id(data)
     if round_id != expected:
@@ -1233,7 +1253,9 @@ def commit_round(
         "snapshot": snapshot,
         "skip_lint": skip_lint,
         "fresh": fresh,
+        "executor_machine": executor_machine,
     })
+    data["executor_machine"] = executor_machine
     if data["phase_round_count"] >= 5:
         data["rollover_required"] = True
 
@@ -1276,11 +1298,121 @@ def herdr_bin(args: argparse.Namespace) -> str:
     return getattr(args, "herdr", None) or os.environ.get("PAIRCTL_HERDR") or "herdr"
 
 
+def _machine_name(value: str) -> str:
+    return value if value else "local"
+
+
+def recorded_machine(data: dict[str, Any] | None) -> str | None:
+    """Saved selector on this state, or None when the pair has no machine binding.
+
+    Empty string is a binding: the local Herdr server. Missing key is unbound
+    (states written before machine routing).
+    """
+    if not isinstance(data, dict) or "machine" not in data:
+        return None
+    return str(data.get("machine") or "").strip()
+
+
+def read_recorded_machine(args: argparse.Namespace) -> str | None:
+    try:
+        raw = json.loads(paths(args)["state"].read_text(encoding="utf-8"))
+    except (OSError, ValueError, AttributeError):
+        return None
+    return recorded_machine(raw if isinstance(raw, dict) else None)
+
+
+def env_machine() -> str:
+    return (os.environ.get("PAIRCTL_HERDR_MACHINE") or "").strip()
+
+
+def pin_machine(args: argparse.Namespace, data: dict[str, Any] | None = None) -> str:
+    """Resolve the saved-machine selector for every herdr call in this process.
+
+    Explicit `--machine` wins when it matches the recorded binding. A recorded
+    binding (including local) wins over PAIRCTL_HERDR_MACHINE. The env var is
+    only the default for a pair that has never recorded a machine. The result
+    is cached on args so later calls in the same process stay on that server.
+    """
+    cached = getattr(args, "_resolved_machine", None)
+    if cached is not None:
+        return str(cached)
+    cli = getattr(args, "machine", None)
+    recorded = recorded_machine(data) if data is not None else read_recorded_machine(args)
+    if isinstance(cli, str):
+        chosen = cli.strip()
+        if recorded is not None and chosen != recorded:
+            raise MachineMismatchError(
+                "machine mismatch: pair is bound to "
+                f"{_machine_name(recorded)}; refusing {_machine_name(chosen)}. "
+                "pane ids from one Herdr server are not valid on another"
+            )
+    elif recorded is not None:
+        chosen = recorded
+    else:
+        chosen = env_machine()
+    args._resolved_machine = chosen
+    return chosen
+
+
+def remember_machine(args: argparse.Namespace, data: dict[str, Any], *, create: bool) -> str:
+    """Record which Herdr server this pair's pane ids belong to.
+
+    `init --machine` sets or rebinds the selector. A later init without the flag
+    keeps the recorded server. A brand-new state with no flag uses
+    PAIRCTL_HERDR_MACHINE, then the local server.
+    """
+    cli = getattr(args, "machine", None)
+    if isinstance(cli, str):
+        machine = cli.strip()
+        if not create:
+            previous = recorded_machine(data)
+            effective = previous if previous is not None else ""
+            busy = bool(data.get("rounds") or data.get("pending_dispatch"))
+            if busy and machine != effective:
+                raise MachineMismatchError(
+                    "machine mismatch: pair is bound to "
+                    f"{_machine_name(effective)}; refusing {_machine_name(machine)}. "
+                    "pane ids from one Herdr server are not valid on another"
+                )
+        data["machine"] = machine
+        data["planner_machine"] = machine
+    elif create or "machine" not in data:
+        machine = env_machine()
+        data["machine"] = machine
+        data["planner_machine"] = machine
+    else:
+        machine = str(data.get("machine") or "").strip()
+        data.setdefault("planner_machine", machine)
+    data.setdefault("executor_machine", "")
+    args._resolved_machine = machine
+    return machine
+
+
+def herdr_argv(args: argparse.Namespace, tail: list[str]) -> list[str]:
+    """Global prefix form Herdr documents: `herdr --machine <label-or-id> <tail…>`.
+
+    No selector means the local server: the argv is `herdr <tail…>` with no
+    `--machine` flag at all.
+    """
+    argv = [herdr_bin(args)]
+    machine = pin_machine(args)
+    if machine:
+        argv.extend(("--machine", machine))
+    argv.extend(tail)
+    return argv
+
+
+def pairctl_machine_args(args: argparse.Namespace) -> list[str]:
+    """`--machine <selector>` for a pairctl child, or [] for the local server."""
+    machine = pin_machine(args)
+    return ["--machine", machine] if machine else []
+
+
 def run_herdr(
     args: argparse.Namespace, tail: list[str], timeout: float = HERDR_CALL_TIMEOUT
 ) -> tuple[int, str, str, Any]:
     """Run one herdr subcommand with an argv list (no shell). Never raises on herdr errors."""
-    argv = [herdr_bin(args), *tail]
+    argv = herdr_argv(args, tail)
     try:
         proc = subprocess.run(
             argv, check=False, capture_output=True, text=True, shell=False, timeout=timeout,
@@ -1487,11 +1619,15 @@ def spawn_compact_continue_watcher(
         cmd += ["--state-dir", str(pp["root"])]
     herdr = herdr_bin(args)
     cmd += ["--herdr", herdr]
+    cmd += pairctl_machine_args(args)
     # Child env = parent copy + the internal marker. Never rewrite the user's
     # PAIRCTL_CONTINUE_AFTER_COMPACT here (issue #9): that flag is not recursion control.
     env = os.environ.copy()
     env["PAIRCTL_HERDR"] = herdr
     env["PAIRCTL_INTERNAL_WATCHER"] = "1"
+    machine = pin_machine(args)
+    if machine:
+        env["PAIRCTL_HERDR_MACHINE"] = machine
     try:
         handle = log.open("ab")
         proc = subprocess.Popen(
@@ -1529,8 +1665,12 @@ def spawn_resume_deliver(
         # state root, never the caller's relative path (issue #16).
         cmd += ["--state-dir", str(paths(args)["root"])]
     cmd += ["--herdr", herdr_bin(args)]
+    cmd += pairctl_machine_args(args)
     env = os.environ.copy()
     env["PAIRCTL_HERDR"] = herdr_bin(args)
+    machine = pin_machine(args)
+    if machine:
+        env["PAIRCTL_HERDR_MACHINE"] = machine
     proc = subprocess.run(cmd, text=True, capture_output=True, check=False, env=env)
     try:
         payload = json.loads(proc.stdout)
@@ -1562,6 +1702,7 @@ def wake_check(
     due_pane = ""
     with locked(pp["root"], pp["lock"]):
         data = load(pp["state"], cwd)
+        pin_machine(args, data)
         # jobs.tsv is a derived view of state.json, never a second source of truth.
         write_ledger(pp["ledger"], data)
         result["dispatch_stale_notified"] = check_dispatch_stale(args, pp, data)
@@ -1693,11 +1834,16 @@ def compact_instructions(pp: dict[str, Path], data: dict[str, Any], kind: str) -
         )
     else:
         focus = " No active round."
+    machine = str(data.get("machine") or "").strip()
+    machine_note = (
+        f" Herdr machine `{machine}`; pass --machine {machine} on every herdr and pairctl call."
+        if machine else ""
+    )
     return (
         "herdr-pair context checkpoint. Keep verbatim: checkpoint file "
         f"{pp['checkpoint']}. Goal: {data.get('goal') or 'unspecified'}. Preserve "
         f"planner pane {data.get('planner_pane') or 'unknown'}, working "
-        f"directory {data['cwd']}.{focus} Keep every round_id with status, all nonterminal "
+        f"directory {data['cwd']}.{machine_note}{focus} Keep every round_id with status, all nonterminal "
         "background jobs, open blockers, and the user's original task statement. The executor "
         "report may already have arrived; after compaction first read pairctl status and the "
         f"Report file, then read the checkpoint. {rollover}"
@@ -2001,6 +2147,7 @@ def cmd_init(args: argparse.Namespace) -> int:
                 data["goal"] = args.goal
             if args.context_budget is not None:
                 data["context_budget"] = args.context_budget
+            remember_machine(args, data, create=False)
         else:
             data = {
                 "version": VERSION,
@@ -2025,6 +2172,7 @@ def cmd_init(args: argparse.Namespace) -> int:
                 "notices": [],
                 "created_at": now(),
             }
+            remember_machine(args, data, create=True)
         persist(pp, data)
         usage = read_context_usage(
             pp, cwd, budget_for(args, data), env_float("PAIRCTL_SESSION_STALE_HOURS", DEFAULT_STALE_HOURS), data
@@ -2038,7 +2186,10 @@ def cmd_init(args: argparse.Namespace) -> int:
             planner_compact = queue_budget_compact(args, pp, data, "init_context_budget")
         persist(pp, data)
         # Pane index, write point 1: init's --planner-pane.
-        record_pane(args.planner_pane or "", str(pp["root"]), cwd, "planner")
+        record_pane(
+            args.planner_pane or "", str(pp["root"]), cwd, "planner",
+            str(data.get("machine") or ""),
+        )
     continue_after = spawn_compact_continue_watcher(args, pp, data, planner_compact) if planner_compact else None
     payload = {
         "status": "CONTEXT_COMPACT_QUEUED" if planner_compact and planner_compact.get("queued") else "initialized",
@@ -2046,6 +2197,8 @@ def cmd_init(args: argparse.Namespace) -> int:
         "ledger": str(pp["ledger"]),
         "state_root": str(pp["root"]),
         "context_usage": usage,
+        "machine": str(data.get("machine") or ""),
+        "planner_machine": str(data.get("planner_machine") or ""),
     }
     if planner_compact:
         payload.update({"planner_compact": planner_compact, "checkpoint": str(pp["checkpoint"]), "continue_after_compact": continue_after})
@@ -2061,8 +2214,10 @@ def cmd_note_session(args: argparse.Namespace) -> int:
         "kind": args.kind, "source": args.source, "pane": args.pane or "", "recorded_at": now(),
     }
     with locked(pp["root"], pp["lock"], create=True):
+        machine = ""
         if pp["state"].is_file():
             data = load(pp["state"], cwd)
+            machine = str(data.get("machine") or "")
             planner_pane = str(data.get("planner_pane") or "")
             if planner_pane and not args.pane:
                 output({"status": "session_ignored", "reason": "pane_unknown"})
@@ -2077,7 +2232,7 @@ def cmd_note_session(args: argparse.Namespace) -> int:
                 return 0
         atomic_text(pp["planner_session"], json.dumps(record, indent=2, sort_keys=True) + "\n")
         # Pane index, write point 2: note-session's --pane.
-        record_pane(args.pane or "", str(pp["root"]), cwd, "planner")
+        record_pane(args.pane or "", str(pp["root"]), cwd, "planner", machine)
     output({"status": "session_noted", "planner_session": str(pp["planner_session"])})
     return 0
 
@@ -2127,6 +2282,7 @@ def cmd_start_round(args: argparse.Namespace) -> int:
         raise ValueError("contract file is empty")
     with locked(pp["root"], pp["lock"]):
         data = load_ready(pp, cwd)
+        machine = pin_machine(args, data)
         if data["rollover_required"]:
             return emit_rollover_block(pp, data, "round limit reached", args)
         if compact_pending(data):
@@ -2157,6 +2313,7 @@ def cmd_start_round(args: argparse.Namespace) -> int:
             snapshot=snapshot,
             skip_lint=args.skip_lint or "",
             report=parse_report_path(source_text, cwd),
+            executor_machine=machine,
         )
         after_round_checkpoint(pp, data)
         persist(pp, data)
@@ -2186,6 +2343,7 @@ def cmd_send_round(args: argparse.Namespace) -> int:
     text = handoff.read_text(encoding="utf-8")
     with locked(pp["root"], pp["lock"]):
         data = load_ready(pp, cwd)
+        machine = pin_machine(args, data)
         # Issue #12: a pane that exited during a round must not be freshened or
         # prompted into a dead target. Checked before any dispatch bookkeeping so
         # a refusal consumes no round and leaves pending_dispatch untouched.
@@ -2238,7 +2396,7 @@ def cmd_send_round(args: argparse.Namespace) -> int:
                 return 2
         snapshot, warnings = snapshot_round(pp, cwd, round_id, 1, text)
         contract_path, contract_hash = save_contract(pp, round_id, 1, message)
-        argv = [herdr_bin(args), "agent", "prompt", args.target, message]
+        argv = herdr_argv(args, ["agent", "prompt", args.target, message])
         data["pending_dispatch"] = {
             "status": "uncertain",
             "counted": False,
@@ -2253,6 +2411,7 @@ def cmd_send_round(args: argparse.Namespace) -> int:
             "contract_hash": contract_hash,
             "fresh": fresh,
             "snapshot": snapshot,
+            "executor_machine": machine,
             "skip_lint": args.skip_lint or "",
             "report": parse_report_path(text, cwd),
             "phase_round_count": data["phase_round_count"],
@@ -2332,6 +2491,7 @@ def cmd_send_round(args: argparse.Namespace) -> int:
             snapshot=snapshot,
             skip_lint=args.skip_lint or "",
             report=parse_report_path(text, cwd),
+            executor_machine=machine,
         )
         # The planner dispatched a new round itself: the armed resume is obsolete.
         cancel_resume_record(data, "send_round")
@@ -2347,7 +2507,7 @@ def cmd_send_round(args: argparse.Namespace) -> int:
             planner_compact = queue_budget_compact(args, pp, data, "post_dispatch_budget")
         persist(pp, data)
         # Pane index, write point 3: send-round's --target, bound as the executor.
-        record_pane(args.target, str(pp["root"]), cwd, "executor")
+        record_pane(args.target, str(pp["root"]), cwd, "executor", machine)
     continue_after = spawn_compact_continue_watcher(args, pp, data, planner_compact) if planner_compact else None
     result = {
         "status": "round_sent",
@@ -2760,6 +2920,11 @@ def cmd_resolve_pending(args: argparse.Namespace) -> int:
                 snapshot=pending.get("snapshot"),
                 skip_lint=str(pending.get("skip_lint") or ""),
                 report=str(pending.get("report") or ""),
+                executor_machine=str(
+                    pending.get("executor_machine")
+                    or data.get("machine")
+                    or ""
+                ),
             )
             data["pending_dispatch"] = None
             after_round_checkpoint(pp, data)
@@ -2953,6 +3118,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     cwd = canonical_cwd(args.cwd)
     with locked(pp["root"], pp["lock"]):
         data = load(pp["state"], cwd)
+        pin_machine(args, data)
         write_ledger(pp["ledger"], data)
         check_dispatch_stale(args, pp, data)
         if data.get("pending_dispatch"):
@@ -2995,6 +3161,9 @@ def cmd_status(args: argparse.Namespace) -> int:
         "active_jobs": len(active_jobs),
         "checkpoint": (data.get("last_checkpoint") or {}).get("path", ""),
         "planner_pane": data.get("planner_pane") or "",
+        "machine": str(data.get("machine") or ""),
+        "planner_machine": str(data.get("planner_machine") or data.get("machine") or ""),
+        "executor_machine": str(data.get("executor_machine") or ""),
         "session_id": data.get("session_id") or "",
         "auto_compact": auto_compact_enabled(data),
         "compact_queued": data.get("compact_queued"),
@@ -3053,7 +3222,10 @@ def cmd_rollover(args: argparse.Namespace) -> int:
         data["compact_queued"] = None
         persist(pp, data)
         # Pane index, write point 4: rollover's planner_pane.
-        record_pane(str(data.get("planner_pane") or ""), str(pp["root"]), cwd, "planner")
+        record_pane(
+            str(data.get("planner_pane") or ""), str(pp["root"]), cwd, "planner",
+            str(data.get("machine") or ""),
+        )
     output({
         "status": "rollover_recorded",
         "phase": data["phase"],
@@ -3077,6 +3249,7 @@ def cmd_compact_self(args: argparse.Namespace) -> int:
     cwd = canonical_cwd(args.cwd)
     with locked(pp["root"], pp["lock"]):
         data = load(pp["state"], cwd)
+        pin_machine(args, data)
         write_ledger(pp["ledger"], data)
         if args.planner_pane:
             data["planner_pane"] = args.planner_pane
@@ -3086,7 +3259,10 @@ def cmd_compact_self(args: argparse.Namespace) -> int:
         persist(pp, data)
         # Pane index, write point 5: the planner pane compact-self actually used
         # (--planner-pane wins above, otherwise the state's planner_pane).
-        record_pane(str(data.get("planner_pane") or ""), str(pp["root"]), cwd, "planner")
+        record_pane(
+            str(data.get("planner_pane") or ""), str(pp["root"]), cwd, "planner",
+            str(data.get("machine") or ""),
+        )
     result["status"] = "planner_compact_queued" if result.get("queued") else "planner_compact_not_queued"
     result["checkpoint"] = str(pp["checkpoint"])
     # Spawn point (issue #9): only fires for a newly armed record with auto-continue on.
@@ -3109,6 +3285,7 @@ def cmd_resume_deliver(args: argparse.Namespace) -> int:
     cwd = canonical_cwd(args.cwd)
     with locked(pp["root"], pp["lock"]):
         data = load_ready(pp, cwd)
+        pin_machine(args, data)
         record = data.get("resume_pending")
         if not isinstance(record, dict) or not record:
             output({"status": "rejected", "reason": "no_record", "via": args.via})
@@ -3202,6 +3379,7 @@ def cmd_executor_event(args: argparse.Namespace) -> int:
     pane = args.pane
     with locked(pp["root"], pp["lock"]):
         data = load(pp["state"], cwd)
+        pin_machine(args, data)
         if status == "exited" and pane == str(data.get("planner_pane") or ""):
             # The planner is gone: no short report can land there, so only the
             # human hears it and an owed resume dies. No hold and no interval
@@ -3324,6 +3502,15 @@ def parser() -> argparse.ArgumentParser:
     common.add_argument("--cwd", default=os.getcwd())
     common.add_argument("--state-dir")
     common.add_argument("--herdr", help="herdr executable; PAIRCTL_HERDR otherwise, then herdr")
+    common.add_argument(
+        "--machine",
+        default=None,
+        help=(
+            "saved Herdr machine label or profile id; prefixed as "
+            "`herdr --machine <value>` on every herdr call. Omit for the local server. "
+            "Recorded by init and reused when omitted later"
+        ),
+    )
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest="subcommand", required=True)
 
@@ -3520,6 +3707,9 @@ def main() -> int:
         if exc.notices is not None:
             payload["notices"] = exc.notices
         output(payload)
+        return 2
+    except MachineMismatchError as exc:
+        print(f"PAIRCTL_ERROR: {exc}", file=sys.stderr)
         return 2
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"PAIRCTL_ERROR: {exc}", file=sys.stderr)

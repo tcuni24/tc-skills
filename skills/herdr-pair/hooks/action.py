@@ -191,17 +191,39 @@ def pairctl_path() -> str:
     )
 
 
+def recorded_machine(state_dir: str) -> str:
+    """Pair's saved Herdr selector, or '' for the local server / unbound state."""
+    state = load_state(state_dir)
+    if not state:
+        return ""
+    return str(state.get("machine") or "").strip()
+
+
+def herdr_argv(tail: list[str], machine: str = "") -> list[str]:
+    """`herdr --machine <label-or-id> <tail…>`, or `herdr <tail…>` when local."""
+    argv = [herdr_bin()]
+    if machine:
+        argv.extend(("--machine", machine))
+    argv.extend(tail)
+    return argv
+
+
 def run_pairctl(cwd: str, state_dir: str, tail: list[str]) -> tuple[int, dict | None, str]:
     """Run one pairctl subcommand against the resolved selection.
 
     Returns (exit code, parsed JSON object or None, failure detail). A pairctl
     that cannot answer (missing file, timeout, non-JSON stdout) yields None so
     the caller can fail loudly instead of pretending the action happened.
+    A recorded machine is passed through so the child prefixes every herdr call
+    with the same `--machine` selector.
     """
     path = pairctl_path()
     if not Path(path).is_file():
         return 2, None, f"pairctl not found: {path}"
     cmd = [sys.executable, path, *tail, "--cwd", cwd, "--state-dir", state_dir]
+    machine = recorded_machine(state_dir)
+    if machine:
+        cmd.extend(("--machine", machine))
     env = os.environ.copy()
     env.setdefault("PAIRCTL_LOCK_WAIT_S", "5")
     try:
@@ -233,9 +255,9 @@ def herdr_bin() -> str:
     )
 
 
-def run_focus(pane: str) -> tuple[bool, str]:
-    """`herdr agent focus <pane>`; (False, detail) when the host could not answer."""
-    argv = [herdr_bin(), "agent", "focus", pane]
+def run_focus(pane: str, machine: str = "") -> tuple[bool, str]:
+    """`herdr [--machine <id>] agent focus <pane>`; (False, detail) on host failure."""
+    argv = herdr_argv(["agent", "focus", pane], machine)
     try:
         proc = subprocess.run(
             argv, text=True, capture_output=True, check=False, timeout=HERDR_CALL_TIMEOUT
@@ -296,14 +318,17 @@ def fail(action: str, reason: str, resolution: dict, **extra: object) -> int:
     return 2
 
 
-def open_status_popup() -> None:
+def open_status_popup(machine: str = "") -> None:
     """`herdr plugin pane open` for the status board; best-effort, never fatal."""
-    argv = [
-        herdr_bin(), "plugin", "pane", "open",
-        "--plugin", PLUGIN_ID,
-        "--entrypoint", STATUS_PANE_ENTRYPOINT,
-        "--placement", "popup",
-    ]
+    argv = herdr_argv(
+        [
+            "plugin", "pane", "open",
+            "--plugin", PLUGIN_ID,
+            "--entrypoint", STATUS_PANE_ENTRYPOINT,
+            "--placement", "popup",
+        ],
+        machine,
+    )
     try:
         subprocess.run(
             argv, text=True, capture_output=True, check=False,
@@ -388,7 +413,7 @@ def run_pair_status(cwd: str, state_dir: str, resolution: dict) -> int:
     merged = {**payload, "action": "pair.status", "resolution": resolution}
     emit(merged)
     if "phase" in payload:
-        open_status_popup()
+        open_status_popup(recorded_machine(state_dir))
         view = sidebar_view_params(payload, load_state(state_dir))
         if view is not None:
             write_sidebar_view(view)
@@ -469,7 +494,7 @@ def main() -> int:
         planner = str((load_state(state_dir) or {}).get("planner_pane") or "")
         if not planner:
             return fail(args.action, "no_planner", resolution)
-        ok, detail = run_focus(planner)
+        ok, detail = run_focus(planner, recorded_machine(state_dir))
         if not ok:
             return fail(args.action, "focus_failed", resolution, detail=detail, pane=planner)
         emit({
@@ -486,7 +511,7 @@ def main() -> int:
         executor = active_executor(state)
         if not executor:
             return fail(args.action, "no_executor", resolution)
-        ok, detail = run_focus(executor)
+        ok, detail = run_focus(executor, recorded_machine(state_dir))
         if not ok:
             return fail(
                 args.action, "focus_failed", resolution, detail=detail, pane=executor
