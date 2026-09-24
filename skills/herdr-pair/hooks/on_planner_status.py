@@ -32,7 +32,8 @@ decision there (dedupe, hold, interval, ignore). Contractual rules:
   stderr;
 * a selected candidate whose pairctl cannot answer (missing file, or stdout
   that is not JSON): log a "pairctl_failed" line, show the
-  "herdr-pair pairctl failed" notification once (marker file), exit 1.
+  "herdr-pair pairctl failed" notification once per failure episode (marker
+  file, cleared when pairctl answers again), exit 1.
   A non-zero exit code on its own is not a failure: lock_timeout and
   planner_busy answer JSON with exit 2, and those stay silent exit 0.
 

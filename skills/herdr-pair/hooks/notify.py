@@ -3,8 +3,8 @@
 Shared by `on_planner_status.py` (issue #11) and `on_pane_exited.py`
 (issue #12). This module never imports pairctl.py: it spawns the script as a
 child process, so a pairctl import error cannot take the hook down with it.
-The only host call here is the one-time `herdr notification show` announcing
-that pairctl failed.
+The only host call here is `herdr notification show` announcing that pairctl
+failed, once per failure episode.
 """
 
 from __future__ import annotations
@@ -81,15 +81,31 @@ def run_pairctl(pairctl_path: str, argv: list[str]) -> tuple[bool, str]:
         tail = detail[-1] if detail else ""
         suffix = f": {tail}" if tail else ""
         return False, f"pairctl stdout was not JSON (exit {proc.returncode}){suffix}"[:300]
+    clear_failure_notice()
     return True, json.dumps(payload, sort_keys=True)
 
 
+def clear_failure_notice() -> None:
+    """End the current failure episode once pairctl answers again.
+
+    Without this the marker outlives the failure that wrote it, and every later
+    failure (a different cause included) is only logged, never shown.
+    """
+    marker = marker_path()
+    try:
+        marker.unlink()
+    except OSError:
+        return  # no marker (the usual case) or not removable: nothing to announce
+    append_log("pairctl_recovered: failure notice re-armed")
+
+
 def notify_pairctl_failed(pane: str, pairctl_path: str, detail: str) -> None:
-    """Log the failure and show the one-time host notification (best effort).
+    """Log the failure and show one host notification per failure episode (best effort).
 
     The marker file gates the host call: the first failure logs and notifies,
-    every later failure only logs. The marker is written after the attempt so
-    a crash mid-notify leaves the next run a chance to retry. Never raises.
+    later failures only log until run_pairctl sees pairctl answer again and
+    clears the marker. The marker is written after the attempt so a crash
+    mid-notify leaves the next run a chance to retry. Never raises.
     """
     line = f"pairctl_failed pane={pane} pairctl={pairctl_path} detail={detail}"
     try:

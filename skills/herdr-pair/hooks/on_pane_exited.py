@@ -22,7 +22,8 @@ Contractual rules:
 * zero hit or only stale entries: exit 0 with empty stdout and stderr;
 * a selected entry whose pairctl cannot answer (missing file, or stdout that is
   not JSON): log a "pairctl_failed" line, show the "herdr-pair pairctl failed"
-  notification once (marker file), exit 1. A non-zero exit code on its own is
+  notification once per failure episode (marker file, cleared when pairctl
+  answers again), exit 1. A non-zero exit code on its own is
   not a failure: executor-event answers JSON for every gate it rejects, and
   those stay silent exit 0.
 """

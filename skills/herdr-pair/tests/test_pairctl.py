@@ -3120,6 +3120,45 @@ class PairctlTest(unittest.TestCase):
         )
         self.assertEqual(self.notification_calls(), [])
 
+    def test_pairctl_answer_resets_failure_notice(self) -> None:
+        # One notice per failure episode: once pairctl answers the hook again,
+        # the marker is cleared so the next failure notifies instead of being
+        # buried in hook.log.
+        self.arm_and_advance_epoch()
+        self.set_status("idle")
+        self.clear_calls()
+        plugin_state = self.root / "plugin-state-reset"
+        marker = plugin_state / "pairctl-failed-notified"
+        broken = {
+            "PAIRCTL": str(self.root / "no-such-pairctl.py"),
+            "HERDR_PLUGIN_STATE_DIR": str(plugin_state),
+        }
+
+        failed = self.run_resume_hook(extra_env=broken)
+        self.assertEqual(failed.returncode, 1, failed.stderr + failed.stdout)
+        self.assertTrue(marker.is_file())
+        self.assertEqual(len(self.notification_calls()), 1, self.herdr_calls())
+
+        healed = self.run_resume_hook(
+            extra_env={"PAIRCTL": str(SCRIPT), "HERDR_PLUGIN_STATE_DIR": str(plugin_state)},
+        )
+        self.assertEqual(healed.returncode, 0, healed.stderr + healed.stdout)
+        self.assertEqual(healed.stdout, "")
+        self.assertEqual(healed.stderr, "")
+        self.assertEqual(self.read_state()["resume_pending"]["status"], "delivered")
+        self.assertFalse(marker.exists())
+        self.assertIn(
+            "pairctl_recovered", (plugin_state / "hook.log").read_text(encoding="utf-8"),
+        )
+
+        # A fresh episode: arm again, break pairctl, and the notice comes back.
+        self.arm_and_advance_epoch()
+        self.clear_calls()
+        again = self.run_resume_hook(extra_env=broken)
+        self.assertEqual(again.returncode, 1, again.stderr + again.stdout)
+        self.assertEqual(len(self.notification_calls()), 1, self.herdr_calls())
+        self.assertTrue(marker.is_file())
+
     def test_no_pane_match_stays_silent(self) -> None:
         # Issue #10 silence contract: no pairing matches this pane, so the hook
         # must not run pairctl at all - even though PAIRCTL points at nothing.
