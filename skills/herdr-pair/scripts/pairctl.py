@@ -1273,7 +1273,13 @@ def emit_rollover_block(
 
 
 def herdr_bin(args: argparse.Namespace) -> str:
-    return getattr(args, "herdr", None) or os.environ.get("PAIRCTL_HERDR") or "herdr"
+    # Plugin hooks run pairctl with HERDR_BIN_PATH set but no herdr on PATH.
+    return (
+        getattr(args, "herdr", None)
+        or os.environ.get("PAIRCTL_HERDR")
+        or os.environ.get("HERDR_BIN_PATH")
+        or "herdr"
+    )
 
 
 def run_herdr(
@@ -3323,7 +3329,7 @@ def parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--cwd", default=os.getcwd())
     common.add_argument("--state-dir")
-    common.add_argument("--herdr", help="herdr executable; PAIRCTL_HERDR otherwise, then herdr")
+    common.add_argument("--herdr", help="herdr executable; PAIRCTL_HERDR otherwise, then HERDR_BIN_PATH, then herdr")
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest="subcommand", required=True)
 

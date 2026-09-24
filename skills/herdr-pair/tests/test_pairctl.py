@@ -13,6 +13,7 @@ import signal
 import socket
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -4480,6 +4481,41 @@ class PairctlTest(unittest.TestCase):
         calls = self.second_herdr_calls(other)
         notified = [c for c in calls if c[:2] == ["notification", "show"]]
         self.assertEqual(len(notified), 1, calls)
+
+    def test_hook_resume_deliver_uses_herdr_bin_path(self) -> None:
+        # Real plugin environment: no PAIRCTL_HERDR, no herdr on PATH, only
+        # HERDR_BIN_PATH. The pairctl child spawned by the hook must still reach
+        # herdr, or every plugin resume dies with "cannot run herdr (herdr)" and
+        # the planner stalls until the watcher deadline.
+        other = self.write_second_herdr()
+        self.arm_and_advance_epoch()
+        self.clear_calls()
+        env = os.environ.copy()
+        env["XDG_STATE_HOME"] = str(self.state_home)
+        env["PATH"] = f"{Path(sys.executable).parent}:/usr/bin:/bin"
+        env.pop("PAIRCTL_HERDR", None)
+        env.pop("PAIRCTL", None)
+        env["HERDR_BIN_PATH"] = str(other)
+        env["HERDR_PLUGIN_STATE_DIR"] = str(self.root / "plugin-state")
+        env["HERDR_PLUGIN_EVENT"] = "pane.agent_status_changed"
+        env["HERDR_PLUGIN_EVENT_JSON"] = json.dumps({
+            "event": "pane_agent_status_changed",
+            "data": {"pane_id": "w1:p1", "workspace_id": "ws-1", "agent_status": "idle"},
+        })
+        proc = subprocess.run(
+            [sys.executable, str(PLUGIN_HOOK)],
+            text=True, capture_output=True, check=False, env=env,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertFalse((self.root / "plugin-state" / "hook.log").exists())
+        prompts = [
+            c for c in self.second_herdr_calls(other)
+            if c[:3] == ["agent", "prompt", "w1:p1"]
+            and "auto-continue after compaction" in c[3]
+        ]
+        self.assertEqual(len(prompts), 1, self.second_herdr_calls(other))
+        self.assertEqual(self.herdr_calls(), [], self.herdr_calls())
+        self.assertEqual(self.read_state()["resume_pending"]["status"], "delivered")
 
     def test_spawned_watcher_receives_absolute_state_dir(self) -> None:
         # Round-15 finding: compact-self propagated a relative --state-dir into
