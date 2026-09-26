@@ -31,6 +31,6 @@ herdr plugin link <仓库根>/skills/herdr-pair --enabled
 2. `herdr plugin log list` 查看这次触发的钩子/动作调用记录（事件、exit code、stdout/stderr）。
 3. 确认 `resume_pending.status` 变成 `delivered`，且恢复 prompt 恰好到达规划者一次。
 
-机制选择：只有插件已启用 **且** 规划者 kind 为 `claude` 时 `resume_pending.mechanism` 才是 `plugin`；其余一律 `watcher` —— 非 claude 规划者保持 watcher 投递，属设计而非降级。
+机制选择：只有插件已启用 **且** 规划者 kind 为 `claude` 时 `resume_pending.mechanism` 才是 `plugin`；其余一律 `watcher` —— 非 claude 规划者保持 watcher 投递，属设计而非降级。取舍与重新评估条件见仓库 `docs/adr/0001-herdr-pair-claude-planner-first.md`。
 
 已知限制：herdr 0.8.0 关闭窗格时不会把 `pane.exited` 派给插件（清单里的事件名不改）。需要记录执行者退出时手动走 `pairctl executor-event --pane <pane> --status exited`，效果相同：写 `executor_pane_gone_at`、发通知、不改绑定。
