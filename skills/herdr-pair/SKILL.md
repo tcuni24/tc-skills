@@ -28,7 +28,7 @@ Precision work is pairable with a frozen read-only spec and exact definitions in
 
 ## 0. Preflight
 
-Run `test "${HERDR_ENV:-}" = 1`, `herdr --skill`, and `herdr agent prompt --help`.
+Run `test "${HERDR_ENV:-}" = 1`, `herdr --skill`, `herdr agent prompt --help`, and `herdr agent wait --help`.
 Outside Herdr, report the missing environment. The installed CLI is authoritative.
 
 Locate `PAIRCTL=<skill-dir>/scripts/pairctl.py`. Use it for every dispatch; it passes file contents
@@ -105,9 +105,10 @@ One round has one scope fence, a literal acceptance result and a diff you can si
 Carry verified inputs into the next contract. Read the governing spec end-to-end before splitting;
 raise conflicting requirements explicitly rather than having the executor reinterpret them.
 Drive rounds sequentially; isolated worktrees are required for separate writers.
-Use the five-round fallback above. Request an ETA once, check after it, then request stop/report
-if overdue; stop repeated polling. For spec audits and budget recovery, read
-[recovery.md](reference/recovery.md).
+Use the five-round fallback above. After `agent_prompted`, settle the executor with
+`herdr agent wait` and an explicit timeout — [executor-wait.md](reference/executor-wait.md).
+Do not busy-poll chat, and do not wait only for a plugin notification. For spec audits and
+budget recovery, read [recovery.md](reference/recovery.md).
 
 ## 3. Write a self-contained handoff
 
@@ -161,6 +162,10 @@ fresh-session screen, then records pending before delivery. Only `agent_prompted
 active round. `fresh_failed` consumes nothing; resolve the actual configuration/state problem.
 `--no-fresh` deliberately retains context and needs a recorded reason.
 
+After `agent_prompted`, wait on that executor pane before §5. `idle`/`done` means the agent
+settled; `blocked` means an approval or question UI. Neither is acceptance. Recipe:
+[executor-wait.md](reference/executor-wait.md).
+
 Uncertain delivery stays pending; inspect the target before explicit `resolve-pending`.
 Never blindly resend. The snapshot is the **pre-dispatch working directory**, including untracked
 files, not an old HEAD. `snapshot: null` with warnings means no paths were parsed; obtain a valid
@@ -175,6 +180,8 @@ Read the on-disk report and compare the current artifacts with the round snapsho
 Read every relevant diff and verify acceptance. Check scope, identifiers, supplied definitions
 and the precise failure you warned about. Recompute reported numbers and evaluate explanations'
 preconditions over all affected records. A callback is a notification, not evidence.
+`idle` or `done` from `herdr agent wait` is the same kind of signal: run the checks below
+before accepting.
 For full verification, non-Git work and review epochs, read
 [verification.md](reference/verification.md) before accepting.
 `finish-round --status accepted` requires nonblank artifacts and notes; any supplied

@@ -13,6 +13,7 @@
 | “/compact 之后它没接着干” / Cursor `/summarize` / “为什么又停下了” | pairctl now waits for idle after compact and prompts the planner to continue; you should not have to ping it. If it still stops, check `compact-continue.log` next to the pairing state and `PAIRCTL_CONTINUE_AFTER_COMPACT` |
 | Named type is not live anywhere | Say so, offer live candidates, do not silently substitute |
 | “让它把每次的执行结果的结论返回给你” | Put your `$HERDR_PANE_ID` in the prompt (§1); enforce the §3 report contract; verify per §5 before accepting |
+| “派出去之后怎么知道它做完了” / “它停在批准框上” | After `agent_prompted`, `herdr agent wait` on the executor pane ([executor-wait.md](executor-wait.md)). `blocked` is a dialog to read and answer or escalate. A plugin toast is not the wait, and idle/done is not acceptance |
 | “它跑完了，为什么没发回给你” | You omitted the return address (§1). The work is likely done — go read the repo, then re-send the report contract with the pane id |
 | “这个数对不上” | Ask for the script and command first (§7). Fixture mismatch before fabrication |
 | “全文发不出去 / argument list too long” | [handoff.md](handoff.md) 上限 131,071 字节（单个 argv 参数）。落盘 + 指路，不要想办法把全文塞进 prompt |
