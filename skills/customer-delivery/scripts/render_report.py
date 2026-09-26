@@ -460,7 +460,7 @@ class Renderer:
         if sp.get("intro"):
             it = sp["intro"]
             intro = (
-                f'<div class="b-intro"><div class="b-eyebrow">{esc(it.get("eyebrow", "速览"))}</div>'
+                f'<div class="b-intro"><div class="b-eyebrow">{esc(it.get("eyebrow", "主要结论"))}</div>'
                 f'<h2>{esc(it.get("title"))}</h2><p>{text(it.get("text"), it.get("html", False))}</p></div>'
             )
         meta = ""

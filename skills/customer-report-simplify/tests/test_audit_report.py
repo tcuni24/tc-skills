@@ -155,6 +155,23 @@ class AuditReportTests(unittest.TestCase):
         finally:
             terms_path.unlink(missing_ok=True)
 
+    def test_repeated_terms_file_cli(self):
+        # --terms-file 可重复传入，多个词表的词都作为阻断项
+        import subprocess
+
+        voice_terms = REFERENCES_DIR.parent.parent / "customer-delivery" / "references" / "voice-terms.txt"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            report = Path(tmpdir) / "report.html"
+            report.write_text("<html><body><h2>两项需求，两张主表</h2><p>locus_type 为核心型。</p></body></html>",
+                              encoding="utf-8")
+            res = subprocess.run(
+                [sys.executable, str(SCRIPTS_DIR / "audit_report.py"), str(report),
+                 "--terms-file", str(REFERENCES_DIR / "probe-terms.txt"), "--terms-file", str(voice_terms)],
+                capture_output=True, text=True)
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("locus_type", res.stdout)
+        self.assertIn("主表", res.stdout)
+
     def test_probe_terms_file_exists_and_usable(self):
         # 验证抽离的 probe-terms.txt 存在并可加载
         probe_terms_file = REFERENCES_DIR / "probe-terms.txt"

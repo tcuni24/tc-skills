@@ -3,7 +3,7 @@
 
 用法：
   audit_report.py 报告.html [--appendix-id sec-appendix]
-                           [--extra-terms 词1,词2,...] [--terms-file 词表.txt]
+                           [--extra-terms 词1,词2,...] [--terms-file 词表.txt ...]
                            [--extra-warn-terms 词1,词2,...] [--warn-terms-file 提示词表.txt]
                            [--strict]
 
@@ -114,7 +114,8 @@ def main() -> int:
     ap.add_argument("report", type=Path, help="待检查的 HTML 报告文件")
     ap.add_argument("--appendix-id", default="sec-appendix", help="附录 section 的 id；其后内容不计入正文")
     ap.add_argument("--extra-terms", default="", help="逗号分隔的违禁术语（阻断项，如内部列名/样本号）")
-    ap.add_argument("--terms-file", type=Path, default=None, help="每行一个违禁术语的文件路径（如 references/probe-terms.txt）")
+    ap.add_argument("--terms-file", type=Path, action="append", default=[],
+                    help="每行一个违禁术语的文件路径（如 references/probe-terms.txt）；可重复传入多个")
     ap.add_argument("--extra-warn-terms", default="", help="逗号分隔的可读性提示词（非阻断建议）")
     ap.add_argument("--warn-terms-file", type=Path, default=None, help="每行一个可读性提示词的文件路径")
     ap.add_argument("--strict", action="store_true", help="开启严格模式：可读性提示词命中也会导致退出码为 1")
@@ -127,9 +128,9 @@ def main() -> int:
     raw = args.report.read_text(encoding="utf-8")
 
     extra_forbidden: list[str] = [t.strip() for t in args.extra_terms.split(",") if t.strip()]
-    if args.terms_file:
+    for terms_file in args.terms_file:
         try:
-            extra_forbidden.extend(load_terms_file(args.terms_file))
+            extra_forbidden.extend(load_terms_file(terms_file))
         except FileNotFoundError as e:
             print(f"[ERROR] {e}", file=sys.stderr)
             return 2

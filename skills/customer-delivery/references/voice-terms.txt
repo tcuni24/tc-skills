@@ -1,0 +1,32 @@
+# 客户报告 / Excel 说明页中的「工作口吻」短语（阻断项）
+# 这些说法在描述我们的工单与交付动作，而不是告诉客户结果是什么。
+# 用法：
+#   audit_report.py report.html --terms-file <customer-delivery>/references/voice-terms.txt
+#   audit_delivery.py <交付目录> --terms-file <customer-delivery>/references/voice-terms.txt
+# 确实需要其中某个词时（例如客户原话），在 audit_delivery 用 --allow-terms 放行，并在汇报里说明。
+
+# 工单 / 需求口吻：客户不需要被告知「这是第几项需求」
+需求
+本表回答
+本报告回答
+本次交付
+交付物
+
+# 交付物清点口吻：用「几张表」代替结论
+两张主表
+三张主表
+主表
+
+# 工作过程口吻：写结果本身，不写「我们做了什么」
+已整理
+已完成
+已确认
+已按要求
+我们对
+我们已
+
+# 阅读指挥口吻：结论放在最前面，不必安排客户的阅读顺序
+先查看
+再查看
+按需查看
+便于按需

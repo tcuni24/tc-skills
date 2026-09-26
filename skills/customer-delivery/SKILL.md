@@ -30,7 +30,7 @@ description: Use when an analysis is finished and the user asks to 生成交付�
 
 先看 `work/final/`（或等价的最终结果目录）和项目需求文档，回答：
 
-- 客户的问题是什么（通常一两句，写进报告标题下的速览）。
+- 客户的问题是什么，答案是什么（各一两句）。答案写进封面「主要结论」，写的是发现，不是交付了几张表。
 - 哪几个文件直接回答这个问题 → 进 Excel。
 - 每个内部列名对应什么客户说法；哪些内部枚举值要翻译（HC → 高、`liftoff_unmapped` → 序列无法定位）。
 - 哪些列是内部调试字段（中间分值、内部 note、路径）→ 不进 Excel，或只进附录字段对照。
@@ -47,6 +47,7 @@ from xlsx_kit import Column, ReadmeSheet, tsv_to_sheet, write_workbook
 ```
 
 - 第一页 `ReadmeSheet`：项目是什么、每张表放什么、每列什么意思、使用建议。客户不看报告也能用表。
+  intro 写"本工作簿包含……结果"，不写"本表回答两项需求"。
 - `Column(src, header, mapping, desc)`：src 是内部列名，只在代码里出现；header 与 desc 写进 Excel。
 - 主表只放 HC/MC 这类"建议使用"的行；低置信、未对应放单独工作表并写明原因，而不是删掉。
 - 缺失值留空，不写 NA / None / 0。
@@ -66,7 +67,28 @@ from xlsx_kit import Column, ReadmeSheet, tsv_to_sheet, write_workbook
 
 ### 4. 写报告内容 JSON，渲染 HTML（`scripts/render_report.py`）
 
-结构与块类型见 `references/content-spec.md`。写文案时执行 customer-report-simplify 的规则：
+结构与块类型见 `references/content-spec.md`。
+
+**先定口吻：报告写给客户看结果，不是我们的工作记录。** 需求单、交付清单、处理过程是内部视角，
+直接搬进封面就会出现"两项需求，两张主表"这类话。逐句问：客户读完这句，是否知道了关于其样品/探针的新信息？
+
+| 位置 | 不要（内部视角） | 要（客户视角） |
+|---|---|---|
+| 封面主要结论 `intro.title` | 两项需求，两张主表 | 全部探针已定位到新参考基因组，各样品在探针区域内的突变很少 |
+| `intro.text` | 先查看 A 表，再查看 B 表；附表便于按需查询 | 关键发现用"约一半""不到百分之一"讲一两句 + 最需要注意的一条限制 |
+| 章节引导 | 已整理每条探针的位置及序列 | 每条探针一行，列出其染色体、起止坐标和区域序列 |
+| 方法步骤 | 依据已确认的参考坐标提取序列 | 按每条探针在新参考基因组中的坐标提取区域序列 |
+| 附录标题 | 方法与判定规则（按需查看） | 分析方法与判定规则 |
+| 体裁 / 页脚 | 分析结果 | 售后分析报告、结果交付报告等具体体裁 |
+
+- 不出现：需求、工单、主表、交付物、"已整理/已完成/已确认"、"先查看/按需查看"。完整清单见
+  `references/voice-terms.txt`，第 5 步审计时作为阻断项。
+- 封面必须有四格 `kpis`（见 `references/report-style.md`）。第四格放影响结果解读的风险
+  （如缺失比例、未对应比例），不要让它只埋在正文注释里。
+- 正文每个结果章：`lead` 一句定义 → 概况表（数值 + 单位）→ 图（带 `principle`/`interpretation`）→ `watchbox` 使用时注意。
+  不要用"Excel 工作表"当概况表的列；文件位置放进表的一行或文件章。
+
+写文案时再执行 customer-report-simplify 的规则：
 
 - 一个问题只用一种口径；核心数字全篇一致，来源同一份统计。
 - 正文数字只放表格、KPI、图注；段落里用"约八成"。
@@ -87,19 +109,25 @@ logo 可选：`--logo <brand.png>`，传入项目自有品牌图片文件；若�
 
 ```bash
 # 1. 交付目录结构与信息泄漏体检（本 skill 内置脚本）
-python3 <skill-dir>/scripts/audit_delivery.py delivery/<date>/<name> --terms <内部列名,内部枚举值,内部样本码>
+python3 <skill-dir>/scripts/audit_delivery.py delivery/<date>/<name> --terms <内部列名,内部枚举值,内部样本码> \
+    --terms-file <skill-dir>/references/voice-terms.txt
 
 # 2. 报告文本可读性与通俗度体检（依赖同仓库 customer-report-simplify skill）
 # 定位方式：
 #   - 仓库内同级引用：<skill-dir>/../customer-report-simplify/scripts/audit_report.py
 #   - Agent 全局安装引用：<agent-skills-dir>/customer-report-simplify/scripts/audit_report.py
 python3 <simplify-skill-dir>/scripts/audit_report.py delivery/<date>/<name>/report.html \
-    --extra-terms <同一批术语>
+    --extra-terms <同一批术语> --terms-file <skill-dir>/references/voice-terms.txt
 ```
 
 `audit_delivery` 查：白名单外的文件、绝对路径、`work/` 片段、脚本 / 日志名、用户名主机名、
 外部资源、缺图、自定义术语（xlsx 单元格也扫）。`audit_report` 查正文（附录前）的术语命中、
 字数、数字密集句。两者退出码都要为 0；命中就回到 deliver 脚本改，不要手改产物。
+`--terms-file` 可重复传入（如再加 customer-report-simplify 的 `probe-terms.txt`）。
+自定义术语不要选会误伤的短串：`GT` 会命中项目编号 `TC-GTS-…` 和 DNA 序列，改用带上下文的写法。
+客户明确要求保留的原始列名（如原表表头）会在 xlsx 中命中，用 `--allow-terms` 放行并在汇报里说明。
+
+审计只拦截词，拦不住"内容对但视角错"。审计通过后，把封面主要结论和每章第一句单独读一遍，对照第 4 步的口吻表。
 
 两个审计脚本不识别 PNG 中汉字的地区字形。再用浏览器（或 `agent-browser`）打开 `report.html`，
 看一眼封面、KPI、图是否显示，并人工核对图中的简体中文字形；无浏览器时如实说明未做。
@@ -130,6 +158,8 @@ deliver 脚本内部产生的 `content.json` 放在 `delivery/<date>/_build/`（
 - Excel 里保留 `note=cross_chrom`、`evidence=FBpS` 这类内部编码而不翻译。
 - 把 4 个方向的比对结果都交付：客户只问了 A→参考，B→参考。
 - KPI 四格全是成绩色；把"未对应比例"当成绩指标。
+- 封面写"两项需求，两张主表""先查看 A 表再查看 B 表"：这是交付清单，不是结论；且省掉 KPI 行。
+- 影响解读的大比例缺失（如每样品约四成探针缺失）只在正文末尾 note 里带一句，封面和 KPI 看不到。
 - 报告说"所有图片已内嵌"但实际用的相对路径；或反过来只交付 HTML 不带 `plot/`。
 
 参考：`references/example-gene-map.md` 是一次实际交付（基因 ID 对应表）的规格与检查结果。

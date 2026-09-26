@@ -104,6 +104,40 @@ class AuditDeliveryTests(unittest.TestCase):
             self.assertIn("开发标记", res.stdout)
             self.assertIn("自定义术语", res.stdout)
 
+    def test_voice_terms_and_repeated_terms_file(self):
+        voice_terms = Path(__file__).resolve().parent.parent / "references" / "voice-terms.txt"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "project.xlsx").write_bytes(b"dummy")
+            (root / "report.html").write_text(
+                "<html><body><h2>两项需求，两张主表</h2><p>结果见 probe_col。</p></body></html>",
+                encoding="utf-8",
+            )
+            project_terms = root.parent / f"{root.name}-terms.txt"
+            project_terms.write_text("probe_col\n", encoding="utf-8")
+            try:
+                res = self.run_audit(root, ["--terms-file", str(voice_terms), "--terms-file", str(project_terms)])
+            finally:
+                project_terms.unlink(missing_ok=True)
+            self.assertEqual(res.returncode, 1)
+            self.assertIn("需求", res.stdout)
+            self.assertIn("主表", res.stdout)
+            self.assertIn("probe_col", res.stdout)
+
+    def test_allow_terms_exempts_custom_terms(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "project.xlsx").write_bytes(b"dummy")
+            (root / "report.html").write_text(
+                "<html><body><p>原表列 区域起点_1based 保留；另见 x_1based。</p></body></html>",
+                encoding="utf-8",
+            )
+            res = self.run_audit(root, ["--terms", "1based", "--allow-terms", "区域起点_1based"])
+            self.assertEqual(res.returncode, 1)
+            self.assertIn("1based ×1", res.stdout)
+            res = self.run_audit(root, ["--terms", "1based", "--allow-terms", "区域起点_1based,x_1based"])
+            self.assertIn("内容泄漏疑点: 无", res.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

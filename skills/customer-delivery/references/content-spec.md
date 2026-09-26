@@ -10,7 +10,7 @@
   "genre": "结果交付报告",
   "title": "报告标题",
   "subtitle": "一句话副标题",
-  "intro": {"eyebrow": "速览", "title": "一句话结论", "text": "规模说明 + 阅读入口"},
+  "intro": {"eyebrow": "主要结论", "title": "一句话发现（回答客户问题）", "text": "关键发现 + 最需要注意的一条限制"},
   "meta": [{"label": "项目编号", "value": "…"}, {"label": "参考基因组", "value": "…"}],
   "kpis": [{"value": "83.6%", "label": "指标名", "note": "口径说明", "watch": false}],
   "sections": [ {"id": "overview", "title": "一页结论", "short": "结论", "kicker": "OVERVIEW", "blocks": [ … ]} ],
@@ -19,7 +19,9 @@
 }
 ```
 
-- `kpis` 通常 4 格；`watch: true` 表示风险位（琥珀色），不要把成绩指标标成 watch。
+- `intro.title` 写客户关心的发现（"全部探针已定位，各样品突变很少"），不写交付清单（"两项需求，两张主表"）；
+  `intro.text` 不安排阅读顺序（"先查看……再查看……"）。`eyebrow` 省略时渲染为「主要结论」。
+- `kpis` 必填，通常 4 格；`watch: true` 表示风险位（琥珀色），不要把成绩指标标成 watch。
 - `appendix.id` 保持 `sec-appendix`，`customer-report-simplify/scripts/audit_report.py` 默认以它为正文边界。
 - `meta` 建议 3–4 项身份字段：项目编号、物种 / 参考、样本或品种、交付日期。
 

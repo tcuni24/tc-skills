@@ -3,7 +3,7 @@
 
 用法：
   audit_delivery.py <交付目录> [--allow-ext xlsx,html,png,pdf] [--allow-dir plot]
-                    [--terms 词1,词2] [--terms-file 词表.txt] [--allow-terms 词1,词2]
+                    [--terms 词1,词2] [--terms-file 词表.txt ...] [--allow-terms 词1,词2]
 
 检查项：
   1. 文件清单：只允许白名单扩展名 / 子目录；报告其他一切文件（日志、tsv、脚本、配置、隐藏文件）。
@@ -70,6 +70,9 @@ def scan_text(label: str, txt: str, patterns: dict, terms: list[str], allow: set
             if s in allow or any(a in s for a in allow):
                 continue
             findings.append((label, name, s))
+    # 例外字符串整段移除后再数自定义术语（如客户要求保留的原表表头）
+    for a in allow:
+        txt = txt.replace(a, "")
     for t in terms:
         n = txt.count(t)
         if n:
@@ -83,8 +86,8 @@ def main() -> int:
     ap.add_argument("--allow-dir", default="plot", help="允许的子目录（逗号分隔）")
     ap.add_argument("--allow-file", default="", help="额外允许的顶层文件名（如 README.txt,SHA256SUMS）")
     ap.add_argument("--terms", default="", help="逗号分隔的内部术语 / 列名 / 枚举值")
-    ap.add_argument("--terms-file", type=Path, default=None, help="每行一个术语")
-    ap.add_argument("--allow-terms", default="", help="允许出现的例外字符串（如软件名 diamond.py）")
+    ap.add_argument("--terms-file", type=Path, action="append", default=[], help="每行一个术语；可重复传入多个")
+    ap.add_argument("--allow-terms", default="", help="允许出现的例外字符串（如软件名 diamond.py、客户要求保留的原表表头）；对内置规则和自定义术语都生效")
     ap.add_argument("--max-show", type=int, default=40)
     args = ap.parse_args()
 
@@ -96,8 +99,8 @@ def main() -> int:
     allow_dirs = {d.strip() for d in args.allow_dir.split(",") if d.strip()}
     allow_files = {f.strip() for f in args.allow_file.split(",") if f.strip()}
     terms = [t.strip() for t in args.terms.split(",") if t.strip()]
-    if args.terms_file:
-        terms += [l.strip() for l in args.terms_file.read_text(encoding="utf-8").splitlines() if l.strip() and not l.startswith("#")]
+    for terms_file in args.terms_file:
+        terms += [l.strip() for l in terms_file.read_text(encoding="utf-8").splitlines() if l.strip() and not l.startswith("#")]
     allow = {a.strip() for a in args.allow_terms.split(",") if a.strip()}
 
     patterns = dict(DEFAULT_PATTERNS)
