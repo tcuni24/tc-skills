@@ -4,9 +4,16 @@ revised: 2026-09-27
 scope: 全仓库（6 个 skill + docs + 仓库工程化）
 baseline: 81881c7
 test-baseline: 183 passed, 69 subtests passed in 69.61s（`python3 -m pytest -q`，全绿；复核重跑 69.95s）
+remediated: 2026-09-27，PR #19（19 个提交），整改后 201 passed / 73 subtests（新增 18 个用例），详见文末「整改记录」
 ---
 
 # tc-skills 仓库体检报告（2026-09-27）
+
+> **行号与命令说明**：本文所有文件行号、`git ls-files` 计数与附录命令的「预期观察」都以 **baseline `81881c7`** 为准。
+> 整改落地后行号会漂移（例：`startup_replay` 已迁至 `tests/herdr-pair/support.py`，
+> `pairctl.py` 已拆为入口 + `scripts/pairctl/` 包，测试已从 `skills/*/tests/` 迁至 `tests/<skill>/`），
+> 附录中 V2/V4/V5 等「缺失即问题」的断言整改后应当翻转。
+> 复核基线请先 `git checkout 81881c7`；复核整改结果以文末「整改记录」为准。
 
 结论：内容质量与测试密度都不差（99 个受控文件里 9 个测试文件、共 5815 行，测试基线全绿），**问题集中在工程化外壳**——公开仓库没有任何许可证文件、没有 CI、依赖与 Python 下限未声明，以及 `herdr-pair` 的轮次记录随 skill 包一起分发。仓库卫生问题比初稿判断的轻：被忽略的本地残留不会进入分发包。下面每条都给了可复核的证据与命令。
 
@@ -167,8 +174,32 @@ skills/herdr-pair/scripts/pairctl/
 ## 待决问题（需人类决定，不宜由 agent 代答）
 
 1. **许可证基调**：整仓 MIT，还是保留 nextflow skill 的 Apache-2.0 并按目录分别声明？nextflow 内容若派生自第三方，上游来源是什么？
+   → **倾向整仓 MIT，待原作者确认**：nextflow 目录内容由 桂李暄 于 `79e4cb3` 一次性加入，未见上游来源。确认内容为原创并同意改许可后，删除 `skills/nextflow-workflow-skills/{LICENSE,NOTICE}`、frontmatter 改 `license: MIT`、同步两份 README；在此之前本 PR 暂保留 Apache-2.0，NOTICE 中的来源表述未经作者核实。
 2. **skill 包体边界**：`tests/` 是否随包分发？对 GitHub 源只有受控文件会被安装，所以"不分发"只能通过移出 skill 目录实现，`.gitignore` 无法做到"入库但不分发"。本地路径安装（`npx skills add ./path`）是否会带上被忽略文件未核实。
+   → **已决定：不随包分发**。测试迁至顶层 `tests/<skill>/`（`520f7d0`）；本机已安装副本 `~/.agents/skills/herdr-pair/` 实测带有 `tests/`（232K）与 `reports/`，证实此前会随包安装。
 3. **`reference/` 是否统一为 `references/`**：涉及 `test_skill_layout.py` 断言、`skills/herdr-pair/SKILL.md` 内 11 处 `reference/…` 链接，属于对外可见路径变更。
+   → **已决定：统一为 `references/`**（`4c57181`），与 Agent Skills 规范及其余 4 个 skill 一致；除 SKILL.md 内 11 处相对链接（已同步）外，未发现外部依赖该路径。未核实 `npx skills update` 是否会清理已安装副本中残留的旧 `reference/`。
+
+## 整改记录（2026-09-27，PR #19）
+
+| 报告项 | 状态 | 落地 |
+| --- | --- | --- |
+| A1 公开仓库没有许可证文件（P0） | 部分（待作者确认） | `006e49f` 根 `LICENSE`（MIT）；nextflow 目录 Apache-2.0 去留见待决问题 1 |
+| A2 没有 CI（P1） | 已修 | `ea76a37` `.github/workflows/test.yml`（3.11 / 3.13，`compileall` + `pytest`），PR #19 上两个 job 均通过 |
+| A3 第三方依赖与 Python 下限未声明（P1） | 已修 | `ea76a37` `pyproject.toml` + `requirements-dev.txt`；`1637682` 修复 `render_report.py` 在 3.11 上的 SyntaxError（由 `compileall` 暴露） |
+| A4 `create_gitee_pr.py` 的外部调用无超时 / 无禁交互兜底（P1） | 已修 | `0c9ba91`、`9fba280`、`eb7e217`：`GIT_TERMINAL_PROMPT=0` + `GCM_INTERACTIVE=never` + `stdin=DEVNULL`，网络类 git 命令与 `urlopen` 设超时 |
+| A5 `herdr-pair/reports/` 随 skill 包分发（P1） | 已修 | `9593cb8` 迁至 `docs/reports/herdr-pair/`，`96d6e39` 加索引说明 |
+| A6 herdr-bin 解析复制三份且已漂移（P2） | 已修 | `7e1f9ce` 唯一实现 `skills/herdr-pair/herdr_bin.py`，另有布局断言防止再复制 |
+| B1 `reference/` vs `references/`（P2） | 已修 | `4c57181` 见待决问题 3 |
+| B2–B5 openai.yaml 覆盖 / frontmatter 语言 / exec 位 / 悬空引用（P2） | 已修 | `80c038d` |
+| B6 README Layout 过期（P2） | 已修 | `006e49f` 两份 README 重写 Layout |
+| C1 `pairctl.py` 巨石（P3） | 已修 | `7e3fe80` 薄入口 + `scripts/pairctl/` 11 个模块 |
+| C2、C3 测试直接耦合 / 单条测试 10s 空等 | 已修 | `520f7d0` `tests/herdr-pair/support.py`；最慢用例 10.36s → 约 2.3s |
+| C4 缺根 `CONTEXT.md`（P3） | 已修 | `06f1af4` |
+| C5 仓库卫生：`analysis/` 与 `.nfs*`（P3） | 已修 | `f2f75c3`；`3733831` 修复迁移后断开的两条相对链接 |
+| C6 远端缺 3 个 triage 标签（P3） | 已修 | 远端已存在 `needs-triage` / `needs-info` / `ready-for-human`（无仓库文件变更） |
+
+整改后复验：`python3 -m pytest -q` → 201 passed, 73 subtests passed（基线 183 + 69；新增用例来自 gitee-pr 与布局断言）。
 
 ## 附录：复核命令
 
