@@ -1,0 +1,23 @@
+tc-skills — skills/nextflow-workflow-skills
+Copyright (c) 2026 tcuni24
+
+This directory is licensed under the Apache License, Version 2.0 (see the
+LICENSE file next to this notice), as declared by the `license:` field in
+SKILL.md.  Every other directory in this repository is licensed under the
+root MIT License.
+
+Third-party references
+----------------------
+
+The guidance in SKILL.md and references/ is original prose.  It borrows the
+structural conventions of the nf-core project (pipeline layout, module and
+subworkflow anatomy, config profiles, nf-test layout) and quotes short,
+idiomatic Nextflow snippets in that style.  No nf-core source file is
+redistributed here.
+
+    nf-core/rnaseq  https://github.com/nf-core/rnaseq
+    nf-core/sarek   https://github.com/nf-core/sarek
+    Copyright (c) nf-core contributors — MIT License
+
+Nextflow itself is an independent project of Seqera Labs / the Nextflow
+community and is not redistributed here.

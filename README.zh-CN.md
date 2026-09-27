@@ -86,7 +86,8 @@ npx skills@latest add tcuni24/tc-skills --all -g -y
 
 ## 📁 目录规范与设计结构
 
-本仓库组织方式与 [antfu/skills](https://github.com/antfu/skills) 一脉相承：
+本仓库组织方式与 [antfu/skills](https://github.com/antfu/skills) 一脉相承。测试放在技能包之外，
+因此安装到用户机器上的技能只包含运行所需的内容。
 
 ```text
 tc-skills/
@@ -95,15 +96,33 @@ tc-skills/
 │   │   ├── SKILL.md            # 核心指导文件：触发时机、操作规范与执行契约
 │   │   ├── references/         # 深度参考文档（规约、配色规范、样例等）
 │   │   ├── scripts/            # 可独立执行的自动化辅助工具（Python / Shell）
-│   │   └── tests/              # 自动化回归测试与断言用例
-│   ├── herdr-pair/
+│   │   └── agents/openai.yaml  # 面向读取该元数据的宿主入口信息
+│   ├── herdr-pair/             # 同时是 Herdr 插件
 │   │   ├── SKILL.md
-│   │   ├── scripts/
-│   │   └── tests/
+│   │   ├── references/
+│   │   ├── scripts/            # pairctl.py（薄入口）+ pairctl/ 包
+│   │   ├── hooks/              # 插件钩子与 pair-status 弹窗
+│   │   ├── herdr-plugin.toml   # 插件清单：事件、动作、窗格、启动项
+│   │   └── agents/openai.yaml
 │   └── ...
+├── tests/<skill>/              # 每个技能一个目录的单元与回归测试
+├── docs/
+│   ├── agents/                 # 面向 agent 的仓库约定（工单、标签、领域）
+│   ├── adr/                    # 架构决策记录
+│   ├── specs/                  # 工单规格
+│   ├── reports/                # herdr-pair 轮次记录（存档）
+│   ├── reviews/                # 仓库体检报告
+│   └── analysis/               # 一次性分析产物（存档）
+├── .github/workflows/test.yml  # CI：Python 3.11 与 3.13 上跑 pytest
+├── pyproject.toml              # Python 下限（>= 3.11）与依赖声明
+├── requirements-dev.txt        # 测试依赖
 ├── README.md                   # 英文说明文档
 └── README.zh-CN.md             # 中文说明文档
 ```
+
+`skills/herdr-pair/` 同时是一个 Herdr 插件，安装方式为
+`herdr plugin link <仓库根>/skills/herdr-pair --enabled`（详见
+[skills/herdr-pair/README.md](skills/herdr-pair/README.md)）。
 
 ### 模块设计约定
 
@@ -111,7 +130,17 @@ tc-skills/
 - `SKILL.md`：核心入口，开头包含 YAML frontmatter（`name`、`description`），正文明确操作协议、检查清单与异常防护。
 - `scripts/`：具备确定性逻辑的 CLI 脚本，供智能体在受控环境下直接调用。
 - `references/`：按需加载的长篇技术标准、样式规约或领域模型定义，避免污染上下文主窗口。
-- `tests/`：保障技能脚本鲁棒性的单元与回归测试套件。
+- `agents/openai.yaml`：面向读取该元数据的宿主的入口信息；可选，但需与 frontmatter 保持一致。
+
+唯一例外是测试：它们位于顶层 `tests/<skill>/`。因为安装时只会带上 `skills/` 内受版本控制的
+文件，而回归测试并不属于用户需要安装的内容。
+
+### 运行测试
+
+```bash
+python3 -m pip install -r requirements-dev.txt   # 需要 Python >= 3.11
+python3 -m pytest -q
+```
 
 ---
 
@@ -120,7 +149,7 @@ tc-skills/
 1. Fork 本仓库。
 2. 在 `skills/<skill-name>/` 下创建新的技能目录，遵循上述规范。
 3. 编写 `SKILL.md` 并包含准确的 frontmatter（`name` 与 `description`）。
-4. 若包含辅助脚本，请在 `tests/` 下补充自动化测试用例。
+4. 若包含辅助脚本，请在 `tests/<skill-name>/` 下补充自动化测试用例。
 5. 更新 `README.md` 与 `README.zh-CN.md` 中的技能表格与触发词。
 6. 提交 Pull Request！
 
@@ -129,3 +158,7 @@ tc-skills/
 ## 📄 开源许可
 
 本项目基于 [MIT License](LICENSE) 协议开源。
+
+唯一例外是 `skills/nextflow-workflow-skills/`：该目录沿用自身的
+[Apache-2.0 License](skills/nextflow-workflow-skills/LICENSE)，并在
+[NOTICE](skills/nextflow-workflow-skills/NOTICE) 中记录其示例所参考的 nf-core 项目。
