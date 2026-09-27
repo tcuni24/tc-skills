@@ -15,6 +15,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from herdr_bin import resolve_herdr  # noqa: E402  (skill root added to sys.path above)
+
 NOTIFIED_MARKER = "pairctl-failed-notified"
 FAILURE_TITLE = "herdr-pair pairctl failed"
 DEFAULT_STATE_HOME = "~/.local/state"
@@ -116,13 +119,9 @@ def notify_pairctl_failed(pane: str, pairctl_path: str, detail: str) -> None:
     try:
         if marker.is_file():
             return
-        # Same resolution as action.py: PAIRCTL_HERDR, then HERDR_BIN_PATH
-        # (plugin processes lack herdr on PATH), then the literal (issue #16).
-        herdr = (
-            os.environ.get("PAIRCTL_HERDR")
-            or os.environ.get("HERDR_BIN_PATH")
-            or "herdr"
-        )
+        # Same resolver as action.py and pairctl: PAIRCTL_HERDR, then
+        # HERDR_BIN_PATH (plugin processes lack herdr on PATH), then the literal.
+        herdr = resolve_herdr()
         subprocess.run(
             [herdr, "notification", "show", FAILURE_TITLE, "--body", line],
             text=True,

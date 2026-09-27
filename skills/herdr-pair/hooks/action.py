@@ -61,6 +61,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from herdr_bin import resolve_herdr  # noqa: E402  (skill root added to sys.path above)
+
 DEFAULT_STALE_HOURS = 12.0
 DEFAULT_STATE_HOME = "~/.local/state"
 HERDR_CALL_TIMEOUT = 30.0
@@ -226,11 +229,7 @@ def run_pairctl(cwd: str, state_dir: str, tail: list[str]) -> tuple[int, dict | 
 
 def herdr_bin() -> str:
     # Plugin subprocesses have HERDR_BIN_PATH but no herdr on PATH (issue #16).
-    return (
-        os.environ.get("PAIRCTL_HERDR")
-        or os.environ.get("HERDR_BIN_PATH")
-        or "herdr"
-    )
+    return resolve_herdr()
 
 
 def run_focus(pane: str) -> tuple[bool, str]:
