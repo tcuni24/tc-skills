@@ -2,7 +2,7 @@
 
 关联 issue：<https://github.com/tcuni24/tc-skills/issues/2>
 
-来源：[HYF 会话成本审计](../../analysis/herdr-pair-hyf-20260921/REPORT.md)（§2、§6、§9）。
+来源：[HYF 会话成本审计](../analysis/herdr-pair-hyf-20260921/REPORT.md)（§2、§6、§9）。
 关联：issue #1 的工单 04（冻结与漂移）、08（验证预算）——本 spec 的快照与验收条目为其前置最小版，命名与清单格式按 04 的 `review_epoch` 设计，04 直接扩展而不重做。
 
 状态：决策已定（下表），待实施。
