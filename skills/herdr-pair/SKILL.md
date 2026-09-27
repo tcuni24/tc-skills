@@ -1,6 +1,6 @@
 ---
 name: herdr-pair
-description: Use when the user asks to run a task with two Herdr agents splitting planning/review from execution — “你负责规划和审核，让 X 执行”, “协同两个 agent”, “把活派给 herdr 里的 X，你把关”, “让它把结论返回给你”, “你拆一下任务再派给 X”. Roles are agent-type agnostic — either side may be claude, opencode, codex, droid, cursor, hermes, omp, kimi, pi, grok or anything else on the roster. Covers role contracts, cutting the work into verifiable rounds, self-contained handoff prompts, the 131,071-byte prompt limit and “argument list too long” recovery, artifact-based verification with and without git, auditing an executor’s explanations and not just its numbers, the concurrent-writer hazard, and the quality kill-switch. Not for one-shot relays — use herdr-handoff for those.
+description: Use when the user asks to run a task with two Herdr agents splitting planning/review from execution — “你负责规划和审核，让 X 执行”, “协同两个 agent”, “把活派给 herdr 里的 X，你把关”, “让它把结论返回给你”, “你拆一下任务再派给 X”. Roles are agent-type agnostic — either side may be claude, opencode, codex, droid, cursor, hermes, omp, kimi, pi, grok or anything else on the roster. Covers role contracts, cutting the work into verifiable rounds, self-contained handoff prompts, the 131,071-byte prompt limit and “argument list too long” recovery, artifact-based verification with and without git, auditing an executor’s explanations and not just its numbers, the concurrent-writer hazard, and the quality kill-switch. Not for one-shot relays — use herdr-handoff for those (external skill; install it separately).
 ---
 
 # Herdr Pair: Planner + Executor (+ optional Verifier)
@@ -12,7 +12,7 @@ Roles are seats, independent of agent type.
 
 The agent holding the user's task is Planner; a scoped handoff makes you Executor (follow
 “If you are the executor”). A Verifier reviews read-only after writing stops and the Planner
-freezes a review epoch; follow [verification.md](reference/verification.md#stable-review-epochs).
+freezes a review epoch; follow [verification.md](references/verification.md#stable-review-epochs).
 A later write invalidates that review.
 
 ## The one rule that matters
@@ -55,7 +55,7 @@ Recovery commands: `resolve-pending --outcome delivered|not-delivered`,
 `adopt-contract --round-id <id> --file <contract>`, `compact-self`,
 `rollover --reason compact --new-session-id <id>`.
 Job commands: `job-add` and `job-update`; copy their exact fields from
-[handoff.md](reference/handoff.md#background-jobs-need-a-ledger). Use `--help` for arguments.
+[handoff.md](references/handoff.md#background-jobs-need-a-ledger). Use `--help` for arguments.
 
 ### Context budget and recovery
 
@@ -84,7 +84,7 @@ Resume steps. Use `note` for decisions rather than leaving them solely in chat.
 宿主是否支持 1h TTL 待核实。
 
 For uncertain delivery, freshness failures, compaction/rollover and watcher troubleshooting,
-read [recovery.md](reference/recovery.md). Do not enable global Factory/Cursor hooks or change
+read [recovery.md](references/recovery.md). Do not enable global Factory/Cursor hooks or change
 their settings for this workflow.
 
 ## 1. Resolve the executor
@@ -97,7 +97,7 @@ Respect whether the user's writer choice covers one round or the entire task.
 Status and quota banners are routing hints. Conflicting screen/status means unknown: inspect
 before clearing or resending. Re-list a missing/recycled pane; do not silently substitute.
 Before resolving ambiguity, unavailability or a fresh-command override, read
-[executor-resolution.md](reference/executor-resolution.md).
+[executor-resolution.md](references/executor-resolution.md).
 
 ## 2. Cut the work into rounds
 
@@ -107,7 +107,7 @@ raise conflicting requirements explicitly rather than having the executor reinte
 Drive rounds sequentially; isolated worktrees are required for separate writers.
 Use the five-round fallback above. Request an ETA once, check after it, then request stop/report
 if overdue; stop repeated polling. For spec audits and budget recovery, read
-[recovery.md](reference/recovery.md).
+[recovery.md](references/recovery.md).
 
 ## 3. Write a self-contained handoff
 
@@ -152,7 +152,7 @@ each fence line; keep prose and exceptions on other lines.
 
 Replace placeholders and fence paths with actual inputs, outputs and permitted task scratch paths.
 For precise data keys, checksums, publication, report size, job ledger and measurement requirements,
-read [handoff.md](reference/handoff.md) before dispatch.
+read [handoff.md](references/handoff.md) before dispatch.
 
 ## 4. Send
 
@@ -166,7 +166,7 @@ Never blindly resend. The snapshot is the **pre-dispatch working directory**, in
 files, not an old HEAD. `snapshot: null` with warnings means no paths were parsed; obtain a valid
 baseline before relying on it. Files above 50 MB are hashed without backup copies.
 `diff-round` returns changed/added/removed/unchanged and exit 1 for differences, exit 0 otherwise;
-read changed content as well. Details: [recovery.md](reference/recovery.md).
+read changed content as well. Details: [recovery.md](references/recovery.md).
 
 ## 5. Verify by artifact, never by status
 
@@ -176,7 +176,7 @@ Read every relevant diff and verify acceptance. Check scope, identifiers, suppli
 and the precise failure you warned about. Recompute reported numbers and evaluate explanations'
 preconditions over all affected records. A callback is a notification, not evidence.
 For full verification, non-Git work and review epochs, read
-[verification.md](reference/verification.md) before accepting.
+[verification.md](references/verification.md) before accepting.
 `finish-round --status accepted` requires nonblank artifacts and notes; any supplied
 `--report` must exist. Always supply the report path at acceptance.
 
@@ -193,7 +193,7 @@ Stop and report evidence when claimed edits are absent, numbers have no provenan
 instruction is missed twice, the fence is crossed, explanations fail twice, or you rewrite most
 output. First rule out fixture mismatch before calling a number fabricated.
 Recommend taking over or changing executor within the user's authorization.
-Read [verification.md](reference/verification.md#quality-gate) when judging disputed evidence.
+Read [verification.md](references/verification.md#quality-gate) when judging disputed evidence.
 
 ## 8. Close out
 
@@ -202,7 +202,7 @@ pass/fail/not-run. Record the report, artifacts and verification notes with fini
 Report actual changed files, verification, outstanding items and who did which work; include a
 commit SHA only if committed. Follow the user's authorization for publication.
 For request routing and troubleshooting examples, read
-[common-requests.md](reference/common-requests.md).
+[common-requests.md](references/common-requests.md).
 
 
 ## If you are the executor
@@ -235,5 +235,5 @@ For request routing and troubleshooting examples, read
 7. **发送短回报给 Planner**：通过 `herdr agent prompt` 回报结论与证据。
 
 For evidence, scope, reports, assumptions, numerical provenance and stale prompts, follow
-[Executor responsibilities](reference/handoff.md#executor-responsibilities). Always use the
+[Executor responsibilities](references/handoff.md#executor-responsibilities). Always use the
 Planner's cwd/state selection on every protocol command.

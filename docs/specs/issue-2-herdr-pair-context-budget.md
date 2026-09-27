@@ -29,7 +29,7 @@
 | D10 | 流程 | 先发 issue，分支实施 |
 | D11 | 缓存 TTL | 不在范围；核心里一句"宿主是否支持 1h TTL 待核实" |
 | D12 | `finish-round` fail-closed | `--status accepted` 时 `--artifacts`、`--notes` 为空拒绝；新增 `--report <path>` 且路径必须存在 |
-| D13 | 参考材料位置 | `skills/herdr-pair/reference/*.md` |
+| D13 | 参考材料位置 | `skills/herdr-pair/reference/*.md`（2026-09-27 更名：现为 `references/`，见体检报告 B1） |
 
 ## Solution
 
