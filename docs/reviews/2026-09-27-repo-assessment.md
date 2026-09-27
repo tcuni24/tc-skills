@@ -4,7 +4,7 @@ revised: 2026-09-27
 scope: 全仓库（6 个 skill + docs + 仓库工程化）
 baseline: 81881c7
 test-baseline: 183 passed, 69 subtests passed in 69.61s（`python3 -m pytest -q`，全绿；复核重跑 69.95s）
-remediated: 2026-09-27，PR #19（19 个提交），整改后 201 passed / 73 subtests（新增 18 个用例），详见文末「整改记录」
+remediated: 2026-09-27，PR #19（21 个提交），整改后 201 passed / 73 subtests（新增 18 个用例），详见文末「整改记录」
 ---
 
 # tc-skills 仓库体检报告（2026-09-27）
@@ -174,7 +174,7 @@ skills/herdr-pair/scripts/pairctl/
 ## 待决问题（需人类决定，不宜由 agent 代答）
 
 1. **许可证基调**：整仓 MIT，还是保留 nextflow skill 的 Apache-2.0 并按目录分别声明？nextflow 内容若派生自第三方，上游来源是什么？
-   → **倾向整仓 MIT，待原作者确认**：nextflow 目录内容由 桂李暄 于 `79e4cb3` 一次性加入，未见上游来源。确认内容为原创并同意改许可后，删除 `skills/nextflow-workflow-skills/{LICENSE,NOTICE}`、frontmatter 改 `license: MIT`、同步两份 README；在此之前本 PR 暂保留 Apache-2.0，NOTICE 中的来源表述未经作者核实。
+   → **已决定：整仓 MIT**。nextflow 目录内容由 桂李暄 于 `79e4cb3` 一次性加入，未见上游来源；`ef6b0de` 删除 `skills/nextflow-workflow-skills/{LICENSE,NOTICE}`、frontmatter 改 `license: MIT`，并同步两份 README。
 2. **skill 包体边界**：`tests/` 是否随包分发？对 GitHub 源只有受控文件会被安装，所以"不分发"只能通过移出 skill 目录实现，`.gitignore` 无法做到"入库但不分发"。本地路径安装（`npx skills add ./path`）是否会带上被忽略文件未核实。
    → **已决定：不随包分发**。测试迁至顶层 `tests/<skill>/`（`520f7d0`）；本机已安装副本 `~/.agents/skills/herdr-pair/` 实测带有 `tests/`（232K）与 `reports/`，证实此前会随包安装。
 3. **`reference/` 是否统一为 `references/`**：涉及 `test_skill_layout.py` 断言、`skills/herdr-pair/SKILL.md` 内 11 处 `reference/…` 链接，属于对外可见路径变更。
@@ -184,7 +184,7 @@ skills/herdr-pair/scripts/pairctl/
 
 | 报告项 | 状态 | 落地 |
 | --- | --- | --- |
-| A1 公开仓库没有许可证文件（P0） | 部分（待作者确认） | `006e49f` 根 `LICENSE`（MIT）；nextflow 目录 Apache-2.0 去留见待决问题 1 |
+| A1 公开仓库没有许可证文件（P0） | 已修 | `006e49f` 根 `LICENSE`（MIT）；`ef6b0de` nextflow 目录并入整仓 MIT |
 | A2 没有 CI（P1） | 已修 | `ea76a37` `.github/workflows/test.yml`（3.11 / 3.13，`compileall` + `pytest`），PR #19 上两个 job 均通过 |
 | A3 第三方依赖与 Python 下限未声明（P1） | 已修 | `ea76a37` `pyproject.toml` + `requirements-dev.txt`；`1637682` 修复 `render_report.py` 在 3.11 上的 SyntaxError（由 `compileall` 暴露） |
 | A4 `create_gitee_pr.py` 的外部调用无超时 / 无禁交互兜底（P1） | 已修 | `0c9ba91`、`9fba280`、`eb7e217`：`GIT_TERMINAL_PROMPT=0` + `GCM_INTERACTIVE=never` + `stdin=DEVNULL`，网络类 git 命令与 `urlopen` 设超时 |
