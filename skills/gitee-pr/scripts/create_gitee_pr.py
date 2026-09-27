@@ -80,9 +80,11 @@ def run(
 
     ``GIT_TERMINAL_PROMPT=0`` and ``stdin=DEVNULL`` keep git from blocking on a
     credential prompt when the script is driven by an agent. Callers may still
-    pass their own ``env``/``input``/``timeout``.
+    pass their own ``env``/``input``/``timeout``, but the prompt guard is applied
+    last: an explicit ``env`` cannot switch it back on.
     """
-    merged_env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", **(env or {})}
+    merged_env = {**os.environ, **(env or {})}
+    merged_env["GIT_TERMINAL_PROMPT"] = "0"
     kwargs: dict = {
         "capture_output": True,
         "text": True,

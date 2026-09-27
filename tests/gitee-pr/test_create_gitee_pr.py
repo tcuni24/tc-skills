@@ -251,6 +251,20 @@ class GiteePrSubprocessGuardTests(unittest.TestCase):
         self.assertEqual(kwargs["env"]["GIT_TERMINAL_PROMPT"], "0")
         self.assertEqual(kwargs["env"]["MY_FLAG"], "1")
 
+    def test_explicit_env_cannot_reenable_the_prompt_guard(self):
+        """A caller must not be able to switch the non-interactive guard back off."""
+        with self._spy_run() as spy:
+            gitee_pr.run(["git", "status"], env={"GIT_TERMINAL_PROMPT": "1"})
+        _, kwargs = spy.call_args
+        self.assertEqual(kwargs["env"]["GIT_TERMINAL_PROMPT"], "0")
+
+    def test_environment_inherits_the_prompt_guard_over_the_ambient_value(self):
+        with mock.patch.dict(os.environ, {"GIT_TERMINAL_PROMPT": "1"}):
+            with self._spy_run() as spy:
+                gitee_pr.run(["git", "status"])
+        _, kwargs = spy.call_args
+        self.assertEqual(kwargs["env"]["GIT_TERMINAL_PROMPT"], "0")
+
     def test_explicit_input_is_still_forwarded(self):
         with self._spy_run() as spy:
             gitee_pr.run(["git", "hash-object", "--stdin"], input="data")
