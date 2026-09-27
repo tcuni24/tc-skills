@@ -1,0 +1,4 @@
+interface:
+  display_name: "Customer Delivery Package"
+  short_description: "Turn finished analysis output into a customer-ready workbook, HTML report and plots"
+  default_prompt: "Use $customer-delivery to package this analysis into a customer deliverable and audit it for internal leaks."

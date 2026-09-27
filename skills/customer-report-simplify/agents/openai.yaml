@@ -1,0 +1,4 @@
+interface:
+  display_name: "Customer Report Simplify"
+  short_description: "Restructure an over-technical delivery report around the customer's own questions"
+  default_prompt: "Use $customer-report-simplify to rewrite this delivery report so a non-expert customer can read it."

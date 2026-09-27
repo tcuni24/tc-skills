@@ -1,0 +1,4 @@
+interface:
+  display_name: "Herdr Pair"
+  short_description: "Run a Planner/Executor pair in Herdr through verifiable rounds and artifact-based handoffs"
+  default_prompt: "Use $herdr-pair to split this task between a planner and an executor in Herdr, with verifiable rounds."
