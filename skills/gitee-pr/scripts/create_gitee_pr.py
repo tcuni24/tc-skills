@@ -28,14 +28,80 @@ REQUIRED_BODY_HEADINGS = [
     "## 注意事项",
 ]
 
+# Generous, overridable timeout for git commands that talk to a remote.
+# Local commands stay untimed so a slow push of a large repo is never killed.
+DEFAULT_NETWORK_TIMEOUT_S = 120
+NETWORK_TIMEOUT_ENV_VAR = "GITEE_PR_NETWORK_TIMEOUT_S"
+NETWORK_GIT_COMMANDS = frozenset({"push", "fetch", "pull", "ls-remote", "clone", "remote"})
+DEFAULT_HTTP_TIMEOUT_S = 30
+HTTP_TIMEOUT_ENV_VAR = "GITEE_PR_HTTP_TIMEOUT_S"
+
+
+def env_timeout_seconds(var_name: str, default: float) -> float:
+    raw = os.environ.get(var_name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        fail(f"Invalid {var_name} value '{raw}'. Expected a number of seconds.")
+        return default
+    if value <= 0:
+        fail(f"Invalid {var_name} value '{raw}'. Expected a positive number of seconds.")
+    return value
+
+
+def network_timeout_seconds() -> float:
+    return env_timeout_seconds(NETWORK_TIMEOUT_ENV_VAR, DEFAULT_NETWORK_TIMEOUT_S)
+
+
+def http_timeout_seconds() -> float:
+    return env_timeout_seconds(HTTP_TIMEOUT_ENV_VAR, DEFAULT_HTTP_TIMEOUT_S)
+
+
+def is_network_git_command(cmd: list[str]) -> bool:
+    args = cmd[1:] if cmd and cmd[0] == "git" else cmd
+    return bool(args) and args[0] in NETWORK_GIT_COMMANDS
+
 
 def fail(message: str, exit_code: int = 1) -> None:
     print(f"[ERROR] {message}", file=sys.stderr)
     raise SystemExit(exit_code)
 
 
-def run(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(cmd, capture_output=True, text=True)
+def run(
+    cmd: list[str],
+    check: bool = True,
+    env: Optional[dict[str, str]] = None,
+    input: Optional[str] = None,
+    timeout: Optional[float] = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run a command non-interactively.
+
+    ``GIT_TERMINAL_PROMPT=0`` and ``stdin=DEVNULL`` keep git from blocking on a
+    credential prompt when the script is driven by an agent. Callers may still
+    pass their own ``env``/``input``/``timeout``.
+    """
+    merged_env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", **(env or {})}
+    kwargs: dict = {
+        "capture_output": True,
+        "text": True,
+        "env": merged_env,
+        "timeout": timeout,
+    }
+    if input is None:
+        kwargs["stdin"] = subprocess.DEVNULL
+    else:
+        kwargs["input"] = input
+    try:
+        result = subprocess.run(cmd, **kwargs)
+    except subprocess.TimeoutExpired:
+        fail(
+            f"Command timed out after {timeout} seconds: {' '.join(cmd)}\n"
+            "Increase the timeout via the GITEE_PR_NETWORK_TIMEOUT_S environment variable "
+            "or check network/credential configuration."
+        )
+        raise
     if check and result.returncode != 0:
         joined = " ".join(cmd)
         stderr = result.stderr.strip() or result.stdout.strip()
@@ -44,7 +110,8 @@ def run(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:
 
 
 def git(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
-    return run(["git", *args], check=check)
+    timeout = network_timeout_seconds() if is_network_git_command(list(args)) else None
+    return run(["git", *args], check=check, timeout=timeout)
 
 
 def ensure_git_repo() -> None:
@@ -310,14 +377,27 @@ def create_pull_request(
         method="POST",
     )
     try:
-        with urlopen(request) as response:
+        with urlopen(request, timeout=http_timeout_seconds()) as response:
             raw = response.read().decode("utf-8")
             return json.loads(raw)
     except HTTPError as err:
         raw = err.read().decode("utf-8", errors="replace")
         fail(f"Gitee API returned HTTP {err.code}: {raw}")
     except URLError as err:
-        fail(f"Failed to reach Gitee API: {err.reason}")
+        reason = getattr(err, "reason", err)
+        if isinstance(reason, TimeoutError):
+            fail(
+                f"Gitee API request to {endpoint} timed out after "
+                f"{http_timeout_seconds()} seconds.\n"
+                "Increase the timeout via the GITEE_PR_HTTP_TIMEOUT_S environment variable."
+            )
+        fail(f"Failed to reach Gitee API: {reason}")
+    except TimeoutError:
+        fail(
+            f"Gitee API request to {endpoint} timed out after "
+            f"{http_timeout_seconds()} seconds.\n"
+            "Increase the timeout via the GITEE_PR_HTTP_TIMEOUT_S environment variable."
+        )
     return {}
 
 

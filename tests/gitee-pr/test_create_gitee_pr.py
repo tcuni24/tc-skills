@@ -3,20 +3,33 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 # Add scripts directory to sys.path
-SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SCRIPTS_DIR = REPO_ROOT / "skills" / "gitee-pr" / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
+
+import create_gitee_pr as gitee_pr  # noqa: E402
 
 from create_gitee_pr import (  # noqa: E402
     BRANCH_NAME_PATTERN,
     CHINESE_TEXT_PATTERN,
     COMMIT_SUBJECT_PATTERN,
+    DEFAULT_HTTP_TIMEOUT_S,
+    DEFAULT_NETWORK_TIMEOUT_S,
+    HTTP_TIMEOUT_ENV_VAR,
+    NETWORK_TIMEOUT_ENV_VAR,
     REQUIRED_BODY_HEADINGS,
+    git,
+    http_timeout_seconds,
+    network_timeout_seconds,
     validate_commit_subjects,
 )
 
@@ -208,6 +221,131 @@ class GiteePrBranchAndBodyTests(unittest.TestCase):
             "## 注意事项",
         ]
         self.assertEqual(REQUIRED_BODY_HEADINGS, expected_headings)
+
+
+class GiteePrSubprocessGuardTests(unittest.TestCase):
+    """Regression tests for A4: non-interactive guard and timeouts."""
+
+    def _spy_run(self, returncode: int = 0):
+        fake = subprocess.CompletedProcess(args=["git"], returncode=returncode, stdout="", stderr="")
+        return mock.patch.object(gitee_pr.subprocess, "run", return_value=fake)
+
+    def test_git_calls_disable_terminal_prompt_and_stdin(self):
+        with self._spy_run() as spy:
+            git("status", "--porcelain")
+        _, kwargs = spy.call_args
+        self.assertEqual(kwargs["env"]["GIT_TERMINAL_PROMPT"], "0")
+        self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
+
+    def test_run_does_not_prompt_or_inherit_stdin(self):
+        with self._spy_run() as spy:
+            gitee_pr.run(["git", "rev-parse", "HEAD"])
+        _, kwargs = spy.call_args
+        self.assertEqual(kwargs["env"]["GIT_TERMINAL_PROMPT"], "0")
+        self.assertIs(kwargs["stdin"], subprocess.DEVNULL)
+
+    def test_explicit_env_is_preserved_with_prompt_guard(self):
+        with self._spy_run() as spy:
+            gitee_pr.run(["git", "status"], env={"MY_FLAG": "1"})
+        _, kwargs = spy.call_args
+        self.assertEqual(kwargs["env"]["GIT_TERMINAL_PROMPT"], "0")
+        self.assertEqual(kwargs["env"]["MY_FLAG"], "1")
+
+    def test_explicit_input_is_still_forwarded(self):
+        with self._spy_run() as spy:
+            gitee_pr.run(["git", "hash-object", "--stdin"], input="data")
+        _, kwargs = spy.call_args
+        self.assertEqual(kwargs["input"], "data")
+        self.assertNotIn("stdin", kwargs)
+        self.assertEqual(kwargs["env"]["GIT_TERMINAL_PROMPT"], "0")
+
+    def test_real_subprocess_gets_prompt_guard_and_closed_stdin(self):
+        probe = (
+            "import os, sys;"
+            "print(os.environ.get('GIT_TERMINAL_PROMPT', '<unset>'));"
+            "print(sys.stdin.read())"
+        )
+        result = gitee_pr.run([sys.executable, "-c", probe], check=False)
+        stdout_lines = result.stdout.splitlines()
+        self.assertEqual(stdout_lines[0], "0")
+        self.assertEqual(stdout_lines[1], "")
+
+    def test_real_subprocess_pipes_explicit_input(self):
+        probe = "import sys; print(sys.stdin.read())"
+        result = gitee_pr.run([sys.executable, "-c", probe], input="piped-payload")
+        self.assertEqual(result.stdout.strip(), "piped-payload")
+
+    def test_network_git_command_gets_timeout(self):
+        with self._spy_run() as spy:
+            git("push", "-u", "origin", "zhangsan/fix-thing")
+        _, kwargs = spy.call_args
+        self.assertEqual(kwargs["timeout"], DEFAULT_NETWORK_TIMEOUT_S)
+
+    def test_local_git_command_has_no_timeout(self):
+        for args in (("status", "--porcelain"), ("rev-parse", "--abbrev-ref", "HEAD")):
+            with self.subTest(args=args):
+                with self._spy_run() as spy:
+                    git(*args)
+                _, kwargs = spy.call_args
+                self.assertIsNone(kwargs["timeout"])
+
+    def test_ls_remote_and_fetch_are_network_commands(self):
+        for args in (("ls-remote", "origin"), ("fetch", "origin")):
+            with self.subTest(args=args):
+                with self._spy_run() as spy:
+                    git(*args)
+                _, kwargs = spy.call_args
+                self.assertEqual(kwargs["timeout"], DEFAULT_NETWORK_TIMEOUT_S)
+
+    def test_network_timeout_override_from_env(self):
+        with mock.patch.dict(os.environ, {NETWORK_TIMEOUT_ENV_VAR: "7"}):
+            self.assertEqual(network_timeout_seconds(), 7.0)
+            with self._spy_run() as spy:
+                git("push", "origin", "head")
+        _, kwargs = spy.call_args
+        self.assertEqual(kwargs["timeout"], 7.0)
+
+    def test_http_timeout_override_from_env(self):
+        with mock.patch.dict(os.environ, {HTTP_TIMEOUT_ENV_VAR: "5"}):
+            self.assertEqual(http_timeout_seconds(), 5.0)
+
+    def test_invalid_timeout_env_value_fails_clearly(self):
+        with mock.patch.dict(os.environ, {NETWORK_TIMEOUT_ENV_VAR: "not-a-number"}):
+            with self.assertRaises(SystemExit) as ctx:
+                network_timeout_seconds()
+        self.assertEqual(ctx.exception.code, 1)
+
+    def test_git_timeout_surfaces_as_clear_error(self):
+        expired = subprocess.TimeoutExpired(cmd=["git", "push"], timeout=DEFAULT_NETWORK_TIMEOUT_S)
+        with mock.patch.object(gitee_pr.subprocess, "run", side_effect=expired):
+            with self.assertRaises(SystemExit) as ctx:
+                git("push", "-u", "origin", "head")
+        self.assertEqual(ctx.exception.code, 1)
+
+
+class GiteePrHttpTimeoutTests(unittest.TestCase):
+    """Regression tests for A4: urlopen timeout."""
+
+    def test_urlopen_receives_timeout(self):
+        response = mock.MagicMock()
+        response.read.return_value = b'{"html_url": "https://gitee.com/o/r/pulls/1"}'
+        response.__enter__ = mock.Mock(return_value=response)
+        response.__exit__ = mock.Mock(return_value=False)
+        with mock.patch.object(gitee_pr, "urlopen", return_value=response) as spy:
+            result = gitee_pr.create_pull_request(
+                "gitee.com", "owner/repo", "token", "feat: 标题", "head", "main", "body"
+            )
+        _, kwargs = spy.call_args
+        self.assertEqual(kwargs["timeout"], DEFAULT_HTTP_TIMEOUT_S)
+        self.assertEqual(result["html_url"], "https://gitee.com/o/r/pulls/1")
+
+    def test_urlopen_timeout_raises_clear_error(self):
+        with mock.patch.object(gitee_pr, "urlopen", side_effect=TimeoutError("timed out")):
+            with self.assertRaises(SystemExit) as ctx:
+                gitee_pr.create_pull_request(
+                    "gitee.com", "owner/repo", "token", "feat: 标题", "head", "main", "body"
+                )
+        self.assertEqual(ctx.exception.code, 1)
 
 
 if __name__ == "__main__":
