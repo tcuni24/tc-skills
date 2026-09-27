@@ -235,6 +235,7 @@ class GiteePrSubprocessGuardTests(unittest.TestCase):
             git("status", "--porcelain")
         _, kwargs = spy.call_args
         self.assertEqual(kwargs["env"]["GIT_TERMINAL_PROMPT"], "0")
+        self.assertEqual(kwargs["env"]["GCM_INTERACTIVE"], "never")
         self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
 
     def test_run_does_not_prompt_or_inherit_stdin(self):
@@ -242,6 +243,7 @@ class GiteePrSubprocessGuardTests(unittest.TestCase):
             gitee_pr.run(["git", "rev-parse", "HEAD"])
         _, kwargs = spy.call_args
         self.assertEqual(kwargs["env"]["GIT_TERMINAL_PROMPT"], "0")
+        self.assertEqual(kwargs["env"]["GCM_INTERACTIVE"], "never")
         self.assertIs(kwargs["stdin"], subprocess.DEVNULL)
 
     def test_explicit_env_is_preserved_with_prompt_guard(self):
@@ -249,21 +251,29 @@ class GiteePrSubprocessGuardTests(unittest.TestCase):
             gitee_pr.run(["git", "status"], env={"MY_FLAG": "1"})
         _, kwargs = spy.call_args
         self.assertEqual(kwargs["env"]["GIT_TERMINAL_PROMPT"], "0")
+        self.assertEqual(kwargs["env"]["GCM_INTERACTIVE"], "never")
         self.assertEqual(kwargs["env"]["MY_FLAG"], "1")
 
     def test_explicit_env_cannot_reenable_the_prompt_guard(self):
         """A caller must not be able to switch the non-interactive guard back off."""
         with self._spy_run() as spy:
-            gitee_pr.run(["git", "status"], env={"GIT_TERMINAL_PROMPT": "1"})
+            gitee_pr.run(
+                ["git", "status"],
+                env={"GIT_TERMINAL_PROMPT": "1", "GCM_INTERACTIVE": "always"},
+            )
         _, kwargs = spy.call_args
         self.assertEqual(kwargs["env"]["GIT_TERMINAL_PROMPT"], "0")
+        self.assertEqual(kwargs["env"]["GCM_INTERACTIVE"], "never")
 
     def test_environment_inherits_the_prompt_guard_over_the_ambient_value(self):
-        with mock.patch.dict(os.environ, {"GIT_TERMINAL_PROMPT": "1"}):
+        with mock.patch.dict(
+            os.environ, {"GIT_TERMINAL_PROMPT": "1", "GCM_INTERACTIVE": "always"}
+        ):
             with self._spy_run() as spy:
                 gitee_pr.run(["git", "status"])
         _, kwargs = spy.call_args
         self.assertEqual(kwargs["env"]["GIT_TERMINAL_PROMPT"], "0")
+        self.assertEqual(kwargs["env"]["GCM_INTERACTIVE"], "never")
 
     def test_explicit_input_is_still_forwarded(self):
         with self._spy_run() as spy:
@@ -272,17 +282,20 @@ class GiteePrSubprocessGuardTests(unittest.TestCase):
         self.assertEqual(kwargs["input"], "data")
         self.assertNotIn("stdin", kwargs)
         self.assertEqual(kwargs["env"]["GIT_TERMINAL_PROMPT"], "0")
+        self.assertEqual(kwargs["env"]["GCM_INTERACTIVE"], "never")
 
     def test_real_subprocess_gets_prompt_guard_and_closed_stdin(self):
         probe = (
             "import os, sys;"
             "print(os.environ.get('GIT_TERMINAL_PROMPT', '<unset>'));"
+            "print(os.environ.get('GCM_INTERACTIVE', '<unset>'));"
             "print(sys.stdin.read())"
         )
         result = gitee_pr.run([sys.executable, "-c", probe], check=False)
         stdout_lines = result.stdout.splitlines()
         self.assertEqual(stdout_lines[0], "0")
-        self.assertEqual(stdout_lines[1], "")
+        self.assertEqual(stdout_lines[1], "never")
+        self.assertEqual(stdout_lines[2], "")
 
     def test_real_subprocess_pipes_explicit_input(self):
         probe = "import sys; print(sys.stdin.read())"

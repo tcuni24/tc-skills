@@ -78,13 +78,16 @@ def run(
 ) -> subprocess.CompletedProcess[str]:
     """Run a command non-interactively.
 
-    ``GIT_TERMINAL_PROMPT=0`` and ``stdin=DEVNULL`` keep git from blocking on a
-    credential prompt when the script is driven by an agent. Callers may still
-    pass their own ``env``/``input``/``timeout``, but the prompt guard is applied
-    last: an explicit ``env`` cannot switch it back on.
+    ``GIT_TERMINAL_PROMPT=0``, ``GCM_INTERACTIVE=never`` and ``stdin=DEVNULL``
+    keep git from blocking on a credential prompt — including Git Credential
+    Manager's own interactive prompt, which does not honour
+    ``GIT_TERMINAL_PROMPT`` — when the script is driven by an agent. Callers
+    may still pass their own ``env``/``input``/``timeout``, but the prompt
+    guard is applied last: an explicit ``env`` cannot switch it back on.
     """
     merged_env = {**os.environ, **(env or {})}
     merged_env["GIT_TERMINAL_PROMPT"] = "0"
+    merged_env["GCM_INTERACTIVE"] = "never"
     kwargs: dict = {
         "capture_output": True,
         "text": True,
