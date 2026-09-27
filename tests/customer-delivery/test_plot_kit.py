@@ -14,7 +14,9 @@ import matplotlib.pyplot as plt
 from matplotlib import font_manager
 
 
-MODULE_PATH = Path(__file__).parents[1] / "scripts" / "plot_kit.py"
+MODULE_PATH = (
+    Path(__file__).resolve().parents[2] / "skills" / "customer-delivery" / "scripts" / "plot_kit.py"
+)
 SPEC = importlib.util.spec_from_file_location("customer_delivery_plot_kit", MODULE_PATH)
 plot_kit = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None

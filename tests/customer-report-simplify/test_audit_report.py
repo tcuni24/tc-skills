@@ -8,8 +8,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
-REFERENCES_DIR = Path(__file__).resolve().parent.parent / "references"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SCRIPTS_DIR = REPO_ROOT / "skills" / "customer-report-simplify" / "scripts"
+REFERENCES_DIR = REPO_ROOT / "skills" / "customer-report-simplify" / "references"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 

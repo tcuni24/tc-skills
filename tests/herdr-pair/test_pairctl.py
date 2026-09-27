@@ -1,302 +1,28 @@
 #!/usr/bin/env python3
+"""herdr-pair CLI, hook and plugin regression suite.
+
+The fixture lives in `support.py`; this module only holds `test_*` methods.
+"""
 
 from __future__ import annotations
 
 import datetime as dt
-import errno
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
-import signal
-import socket
 import stat
 import subprocess
 import sys
-import tempfile
-import threading
 import time
 import tomllib
-import unittest
+
+import support
+from support import HOOK, PLUGIN_HOOK, SCRIPT, SKILL  # noqa: F401  (test-module API)
 
 
-SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "pairctl.py"
-HOOK = Path(__file__).resolve().parents[1] / "scripts" / "claude_session_start_hook.py"
-PLUGIN_HOOK = Path(__file__).resolve().parents[1] / "hooks" / "on_planner_status.py"
-FAKE_HERDR = r'''#!/usr/bin/env python3
-import json
-import os
-import sys
-from pathlib import Path
-
-log = Path(sys.argv[0] + ".log.json")
-mode_path = Path(sys.argv[0] + ".mode")
-log.write_text(json.dumps({"argv": sys.argv}, ensure_ascii=False), encoding="utf-8")
-with Path(sys.argv[0] + ".calls.jsonl").open("a", encoding="utf-8") as handle:
-    handle.write(json.dumps({"argv": sys.argv}, ensure_ascii=False) + "\n")
-state_json = os.environ.get("PAIRCTL_STATE_JSON", "")
-if state_json and Path(state_json).is_file():
-    Path(sys.argv[0] + ".state-during-send.json").write_text(
-        Path(state_json).read_text(encoding="utf-8"), encoding="utf-8"
-    )
-
-
-def setting(name, default):
-    path = Path(sys.argv[0] + "." + name)
-    return path.read_text(encoding="utf-8").strip() if path.is_file() else default
-
-
-sub = sys.argv[1:3]
-if sub == ["agent", "get"]:
-    print(json.dumps({
-        "id": "cli:agent:get",
-        "result": {"agent": {
-            "agent": setting("kind", "pi"),
-            "agent_status": setting("status", "idle"),
-            "pane_id": sys.argv[3],
-        }},
-    }))
-    raise SystemExit(0)
-if sub == ["agent", "read"]:
-    screen_path = Path(sys.argv[0] + ".screen")
-    print(screen_path.read_text(encoding="utf-8") if screen_path.is_file() else "✓ New session started\n")
-    raise SystemExit(0)
-if sub == ["agent", "prompt"] and len(sys.argv) > 4 and sys.argv[4].startswith("/"):
-    # Slash commands (/new, /clear, /compact) are always delivered by the fake.
-    print(json.dumps({
-        "id": "cli:agent:prompt",
-        "result": {"type": "agent_prompted", "pane_id": sys.argv[3]},
-    }))
-    raise SystemExit(0)
-if sub == ["notification", "show"]:
-    # Notifications are best-effort; the default always succeeds so prompt-mode
-    # failures stay isolated. FAKE_HERDR_NOTIFY_REASON (issue #11) simulates a
-    # suppressed delivery: the four host failure reasons come back shown=false.
-    reason = os.environ.get("FAKE_HERDR_NOTIFY_REASON", "").strip() or "manual"
-    shown = reason not in (
-        "rate_limited", "busy", "no_foreground_client", "disabled",
-    )
-    print(json.dumps({
-        "id": "cli:notification:show",
-        "result": {"type": "notification_show", "shown": shown, "reason": reason},
-    }))
-    raise SystemExit(0)
-if sub == ["plugin", "list"] and "--json" in sys.argv[3:]:
-    # Issue #9: the mechanism probe reads <exe>.plugins.json (content: plugins array).
-    plugins_path = Path(sys.argv[0] + ".plugins.json")
-    if not plugins_path.is_file():
-        print(json.dumps({"id": "cli:plugin:list", "result": {"plugins": [], "type": "plugin_list"}}))
-        raise SystemExit(0)
-    try:
-        plugins = json.loads(plugins_path.read_text(encoding="utf-8"))
-    except (ValueError, OSError) as exc:
-        print(json.dumps({"error": {"code": "plugin_list_failed", "message": str(exc)}}))
-        raise SystemExit(1)
-    print(json.dumps({"id": "cli:plugin:list", "result": {"plugins": plugins, "type": "plugin_list"}}))
-    raise SystemExit(0)
-mode = mode_path.read_text(encoding="utf-8").strip() if mode_path.is_file() else "ok"
-if mode == "ok":
-    print(json.dumps({
-        "id": "cli:agent:prompt",
-        "result": {"type": "agent_prompted", "pane_id": sys.argv[3] if len(sys.argv) > 3 else ""},
-    }))
-    raise SystemExit(0)
-if mode == "fail":
-    print(json.dumps({"error": {"code": "agent_not_found"}}))
-    raise SystemExit(1)
-if mode == "sleep":
-    import time
-    time.sleep(2)
-    raise SystemExit(0)
-print(json.dumps({
-    "id": "cli:agent:prompt",
-    "result": {"type": "agent_prompt_stalled"},
-}))
-raise SystemExit(0)
-'''
-
-
-class PairctlTest(unittest.TestCase):
-    def setUp(self) -> None:
-        self.tmp = tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent)
-        self.root = Path(self.tmp.name)
-        self.cwd = self.root / "project"
-        self.cwd.mkdir()
-        self.state = self.root / "state"
-        # Issue #10: invoke() pins XDG_STATE_HOME into the case's own temporary
-        # directory so the pane index (and default state root) never touch the
-        # user's real ~/.local/state.
-        self.state_home = self.root / "xdg-state"
-        self.herdr = self.root / "fake-herdr"
-        self.herdr.write_text(FAKE_HERDR, encoding="utf-8")
-        os.chmod(self.herdr, 0o755)
-        self.invoke_ok("init", "--planner-pane", "w1:p1", "--session-id", "session-a")
-
-    def tearDown(self) -> None:
-        # Issue #9: any compact-continue watcher this test spawned must be stopped
-        # here, via the pid file pairctl writes; never left running after the test.
-        try:
-            pid = int((self.state / "compact-continue.pid").read_text(encoding="utf-8").strip())
-        except (OSError, ValueError):
-            pid = 0
-        if pid:
-            cmdline = Path(f"/proc/{pid}/cmdline")
-            try:
-                owned = b"watch-compact-continue" in cmdline.read_bytes()
-            except OSError:
-                owned = False
-            if owned:
-                try:
-                    os.kill(pid, signal.SIGTERM)
-                except OSError:
-                    pass
-                kill_deadline = time.time() + 5
-                while time.time() < kill_deadline and pid:
-                    try:
-                        os.kill(pid, 0)
-                    except OSError:
-                        break
-                    time.sleep(0.05)
-        # NFS can report ENOTEMPTY for a directory whose entries were just
-        # unlinked. The test body has already finished; retry only that race.
-        for attempt in range(5):
-            try:
-                self.tmp.cleanup()
-                break
-            except OSError as exc:
-                if exc.errno != errno.ENOTEMPTY or attempt == 4:
-                    raise
-                time.sleep(0.05)
-
-    def invoke(
-        self,
-        *args: str,
-        use_state_dir: bool = True,
-        extra_env: dict[str, str] | None = None,
-    ) -> subprocess.CompletedProcess[str]:
-        cmd = ["python3", str(SCRIPT), *args, "--cwd", str(self.cwd)]
-        if use_state_dir:
-            cmd += ["--state-dir", str(self.state)]
-        env = os.environ.copy()
-        env["XDG_STATE_HOME"] = str(self.state_home)
-        env["PAIRCTL_STATE_JSON"] = str(self.state / "state.json")
-        env["PAIRCTL_HERDR"] = str(self.herdr)
-        env.pop("PAIRCTL_AUTO_COMPACT", None)
-        env["PAIRCTL_CONTINUE_AFTER_COMPACT"] = "0"
-        if extra_env:
-            env.update(extra_env)
-        return subprocess.run(
-            cmd,
-            text=True,
-            capture_output=True,
-            check=False,
-            env=env,
-        )
-
-    def popen(self, *args: str, extra_env: dict[str, str] | None = None) -> subprocess.Popen[str]:
-        """Start pairctl without waiting, for overlap tests (same environment as invoke)."""
-        cmd = ["python3", str(SCRIPT), *args, "--cwd", str(self.cwd), "--state-dir", str(self.state)]
-        env = os.environ.copy()
-        env["XDG_STATE_HOME"] = str(self.state_home)
-        env["PAIRCTL_STATE_JSON"] = str(self.state / "state.json")
-        env["PAIRCTL_HERDR"] = str(self.herdr)
-        env.pop("PAIRCTL_AUTO_COMPACT", None)
-        env["PAIRCTL_CONTINUE_AFTER_COMPACT"] = "0"
-        if extra_env:
-            env.update(extra_env)
-        return subprocess.Popen(
-            cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
-        )
-
-    def invoke_ok(self, *args: str, **kwargs: object) -> dict:
-        proc = self.invoke(*args, **kwargs)  # type: ignore[arg-type]
-        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
-        return json.loads(proc.stdout)
-
-    def set_herdr_mode(self, mode: str) -> None:
-        (self.root / "fake-herdr.mode").write_text(mode + "\n", encoding="utf-8")
-
-    def herdr_log(self) -> dict:
-        return json.loads((self.root / "fake-herdr.log.json").read_text(encoding="utf-8"))
-
-    def herdr_calls(self) -> list[list[str]]:
-        path = self.root / "fake-herdr.calls.jsonl"
-        if not path.exists():
-            return []
-        return [
-            json.loads(line)["argv"][1:]
-            for line in path.read_text(encoding="utf-8").splitlines() if line.strip()
-        ]
-
-    def clear_calls(self) -> None:
-        path = self.root / "fake-herdr.calls.jsonl"
-        if path.exists():
-            path.unlink()
-
-    def set_kind(self, kind: str) -> None:
-        (self.root / "fake-herdr.kind").write_text(kind + "\n", encoding="utf-8")
-
-    def set_status(self, status: str) -> None:
-        (self.root / "fake-herdr.status").write_text(status + "\n", encoding="utf-8")
-
-    def set_screen(self, text: str) -> None:
-        (self.root / "fake-herdr.screen").write_text(text, encoding="utf-8")
-
-    def write_handoff(self, name: str, body: str) -> Path:
-        path = self.cwd / name
-        if body.strip() and "[环境]" not in body:
-            body = body.rstrip("\n") + "\n[环境] local lightweight test only\n"
-        path.write_text(body, encoding="utf-8")
-        return path
-
-    def start_finish(
-        self, n: int, extra_env: dict[str, str] | None = None,
-    ) -> tuple[str, subprocess.CompletedProcess[str]]:
-        contract = self.write_handoff(
-            f"start-{n}.md", f"# Round {n}\nComplete contract body {n}\n"
-        )
-        started = self.invoke_ok(
-            "start-round",
-            "--file", str(contract),
-            "--executor", f"w1:p{n + 1}",
-            "--scope", f"file-{n}",
-            "--acceptance", f"test-{n} exit 0",
-        )
-        proc = self.invoke(
-            "finish-round", "--round-id", started["round_id"],
-            "--status", "accepted", "--artifacts", f"artifact-{n}", "--notes", f"verified-{n}",
-            extra_env=extra_env,
-        )
-        return started["round_id"], proc
-
-    def send_round(self, n: int, body: str | None = None) -> dict:
-        handoff = self.write_handoff(
-            f"handoff-{n}.md",
-            body if body is not None else (
-                f"[轮次] round_id=<unique-id>\n"
-                f"work {n} and `docs/example.md`\n"
-                f"keep this round_id=example in the body\n"
-            ),
-        )
-        return self.invoke_ok(
-            "send-round",
-            "--target", f"w1:p{n + 1}",
-            "--file", str(handoff),
-            "--herdr", str(self.herdr),
-            "--executor", f"w1:p{n + 1}",
-            "--scope", f"file-{n}",
-            "--acceptance", f"test-{n} exit 0",
-        )
-
-    def send_finish(self, n: int) -> tuple[str, subprocess.CompletedProcess[str]]:
-        sent = self.send_round(n)
-        proc = self.invoke(
-            "finish-round", "--round-id", sent["round_id"],
-            "--status", "accepted", "--artifacts", f"artifact-{n}", "--notes", f"verified-{n}",
-        )
-        return sent["round_id"], proc
-
+class PairctlTest(support.PairctlCase):
     def test_round_checkpoint_and_rollover_gate(self) -> None:
         for n in range(1, 5):
             _, proc = self.start_finish(n)
@@ -317,7 +43,6 @@ class PairctlTest(unittest.TestCase):
         self.assertFalse(rolled["session_switched"])
         status = self.invoke_ok("status")
         self.assertEqual(status["phase_round_count"], 0)
-
     def test_job_ledger_and_checkpoint_carry_active_job(self) -> None:
         started = self.invoke_ok(
             "start-round", "--file", str(self.write_handoff("pipeline.md", "# Pipeline\nRun it\n")),
@@ -343,7 +68,6 @@ class PairctlTest(unittest.TestCase):
         self.invoke_ok("job-update", "--queue", "io", "--job-id", "177", "--state", "succeeded")
         self.invoke_ok("checkpoint", "--reason", "terminal")
         self.assertIn("None.", (self.state / "CHECKPOINT.md").read_text())
-
     def test_duplicate_job_and_active_round_are_refused(self) -> None:
         started = self.invoke_ok(
             "start-round", "--file", str(self.write_handoff("a.md", "# A\nFull contract\n")),
@@ -363,7 +87,6 @@ class PairctlTest(unittest.TestCase):
         self.invoke_ok(*args)
         duplicate = self.invoke(*args)
         self.assertEqual(duplicate.returncode, 2)
-
     def test_send_round_injects_id_via_argv_and_records_after_prompted(self) -> None:
         sent = self.send_round(1)
         self.assertEqual(sent["round_id"], "p01-r001")
@@ -378,7 +101,6 @@ class PairctlTest(unittest.TestCase):
         state = json.loads((self.state / "state.json").read_text(encoding="utf-8"))
         self.assertEqual(state["phase_round_count"], 1)
         self.assertEqual(state["rounds"][0]["status"], "active")
-
     def test_failed_send_does_not_consume_a_round(self) -> None:
         self.set_herdr_mode("fail")
         handoff = self.write_handoff("handoff-fail.md", "[轮次] round_id=<unique-id>\nfail\n")
@@ -399,7 +121,6 @@ class PairctlTest(unittest.TestCase):
         self.set_herdr_mode("ok")
         sent = self.send_round(1)
         self.assertEqual(sent["round_id"], "p01-r001")
-
     def test_stalled_prompt_does_not_consume_a_round(self) -> None:
         self.set_herdr_mode("stalled")
         handoff = self.write_handoff("handoff-stalled.md", "no id yet")
@@ -417,7 +138,6 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(status.returncode, 2)
         self.assertEqual(self.read_state()["phase_round_count"], 0)
         self.assertIsNotNone(self.read_state()["pending_dispatch"])
-
     def test_third_send_writes_checkpoint_fifth_blocks_next_send(self) -> None:
         for n in range(1, 3):
             _, proc = self.send_finish(n)
@@ -458,7 +178,6 @@ class PairctlTest(unittest.TestCase):
         after_log = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
         self.assertEqual(before_log, after_log)
         self.assertNotIn("should not send", after_log)
-
     def test_nonterminal_job_survives_rollover(self) -> None:
         started = self.invoke_ok(
             "start-round", "--file", str(self.write_handoff("long.md", "# Long job\nFull contract\n")),
@@ -486,7 +205,6 @@ class PairctlTest(unittest.TestCase):
         self.assertIn("sleep 9", ledger)
         checkpoint = (self.state / "CHECKPOINT.md").read_text()
         self.assertIn('"job_id": "99"', checkpoint)
-
     def test_state_files_are_private_and_follow_xdg(self) -> None:
         for name in ("state.json", "jobs.tsv", "state.lock"):
             mode = stat.S_IMODE((self.state / name).stat().st_mode)
@@ -506,22 +224,12 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(payload["state_root"], str(expected))
         self.assertTrue((expected / "state.json").is_file())
         self.assertEqual(stat.S_IMODE((expected / "state.json").stat().st_mode), 0o600)
-
     def test_handoff_without_round_id_is_prefixed(self) -> None:
         sent = self.send_round(1, body="do the work and leave `backticks` intact\n")
         message = self.herdr_log()["argv"][4]
         self.assertTrue(message.startswith("[轮次] round_id=p01-r001\n"))
         self.assertIn("`backticks`", message)
         self.assertEqual(sent["round_id"], "p01-r001")
-
-    def read_state(self) -> dict:
-        return json.loads((self.state / "state.json").read_text(encoding="utf-8"))
-
-    def write_state(self, data: dict) -> None:
-        (self.state / "state.json").write_text(
-            json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-        )
-
     def test_a_pending_not_counted_during_send_and_cleared_on_clean_fail(self) -> None:
         self.set_herdr_mode("fail")
         handoff = self.write_handoff("handoff-a.md", "[轮次] round_id=<unique-id>\nfail path\n")
@@ -547,7 +255,6 @@ class PairctlTest(unittest.TestCase):
         self.assertIsNone(after["pending_dispatch"])
         self.assertEqual(after["phase_round_count"], 0)
         self.assertEqual(after["rounds"], [])
-
     def test_a_leftover_pending_fail_closed_does_not_resend(self) -> None:
         data = self.read_state()
         data["pending_dispatch"] = {
@@ -588,7 +295,6 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(started.returncode, 2)
         self.assertEqual(self.read_state()["phase_round_count"], 0)
         self.assertIsNotNone(self.read_state()["pending_dispatch"])
-
     def test_b_body_round_id_examples_are_not_rewritten(self) -> None:
         body = (
             "[轮次] round_id=<unique-id>\n"
@@ -603,7 +309,6 @@ class PairctlTest(unittest.TestCase):
         self.assertIn("round_id=p99-r999", lines[2])
         self.assertEqual(message.count("round_id=p01-r001"), 1)
         self.assertEqual(sent["round_id"], "p01-r001")
-
     def test_c_init_reset_rejected_and_existing_state_not_cleared(self) -> None:
         started = self.invoke_ok(
             "start-round", "--file", str(self.write_handoff("keep.md", "# Keep\nFull contract\n")),
@@ -632,7 +337,6 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(data["rounds"][0]["round_id"], started["round_id"])
         self.assertEqual(data["jobs"][0]["job_id"], "7")
         self.assertEqual(data["planner_pane"], "w1:p8")
-
     def test_d_missing_or_stale_ledger_is_rebuilt_from_state_not_tsv(self) -> None:
         started = self.invoke_ok(
             "start-round", "--file", str(self.write_handoff("repair.md", "# Repair\nFull contract\n")),
@@ -668,7 +372,6 @@ class PairctlTest(unittest.TestCase):
         self.assertNotIn("ghost", repaired)
         self.assertNotIn("\t999\t", repaired)
         self.assertIn("\tio\t42\trepair\t", repaired)
-
     def test_e_rollover_rejects_bad_session_ids_without_mutating_state(self) -> None:
         for n in range(1, 6):
             self.start_finish(n)
@@ -683,7 +386,6 @@ class PairctlTest(unittest.TestCase):
         self.assertTrue(after["rollover_required"])
         rolled = self.invoke_ok("rollover", "--new-session-id", "session-b")
         self.assertEqual(rolled["phase"], 2)
-
     def test_resolve_pending_requires_explicit_delivery_outcome(self) -> None:
         self.set_herdr_mode("stalled")
         handoff = self.write_handoff("resolve.md", "ambiguous send\n")
@@ -700,7 +402,6 @@ class PairctlTest(unittest.TestCase):
         self.assertIsNone(state["pending_dispatch"])
         self.assertEqual(state["phase_round_count"], 1)
         self.assertEqual(state["rounds"][0]["round_id"], "p01-r001")
-
     def test_resolve_pending_not_delivered_keeps_round_number_free(self) -> None:
         self.set_herdr_mode("stalled")
         handoff = self.write_handoff("retry.md", "ambiguous send\n")
@@ -714,7 +415,6 @@ class PairctlTest(unittest.TestCase):
         self.set_herdr_mode("ok")
         retried = self.send_round(1)
         self.assertEqual(retried["round_id"], "p01-r001")
-
     def test_send_timeout_remains_pending_and_is_not_resent(self) -> None:
         self.set_herdr_mode("sleep")
         handoff = self.write_handoff("timeout.md", "slow send\n")
@@ -727,9 +427,6 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(payload["status"], "PENDING_DISPATCH_UNRESOLVED")
         self.assertEqual(payload["error"], "herdr_timeout")
         self.assertIsNotNone(self.read_state()["pending_dispatch"])
-
-    # --- fresh executor context per round -------------------------------------------
-
     def test_fresh_clears_executor_before_handoff_and_records_it(self) -> None:
         self.clear_calls()
         sent = self.send_round(1)
@@ -746,14 +443,12 @@ class PairctlTest(unittest.TestCase):
         self.assertFalse(calls[-1][3].startswith("/new"))
         state = self.read_state()
         self.assertEqual(state["rounds"][0]["fresh"]["command"], "/new")
-
     def test_fresh_uses_kind_specific_command(self) -> None:
         self.set_kind("claude")
         self.set_screen(" ▐▛███▛█   Claude Code v2.1.263\n❯ /clear\n")
         sent = self.send_round(1)
         self.assertEqual(sent["fresh"]["command"], "/clear")
         self.assertEqual(sent["fresh"]["verified"], "marker")
-
     def test_fresh_refuses_working_executor_without_consuming_round(self) -> None:
         self.set_status("working")
         self.clear_calls()
@@ -771,7 +466,6 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(state["phase_round_count"], 0)
         self.set_status("idle")
         self.assertEqual(self.send_round(1)["round_id"], "p01-r001")
-
     def test_fresh_fails_closed_when_screen_does_not_confirm(self) -> None:
         self.set_screen("\n".join(f"old transcript line {n}" for n in range(30)) + "\n")
         self.clear_calls()
@@ -786,7 +480,6 @@ class PairctlTest(unittest.TestCase):
         prompts = [c for c in self.herdr_calls() if c[:2] == ["agent", "prompt"]]
         self.assertEqual([p[3] for p in prompts], ["/new"])
         self.assertEqual(self.read_state()["phase_round_count"], 0)
-
     def test_fresh_unknown_kind_needs_override_and_heuristic_verifies(self) -> None:
         self.set_kind("cursor")
         handoff = self.write_handoff("cursor.md", "[轮次] round_id=<unique-id>\ncursor\n")
@@ -803,7 +496,6 @@ class PairctlTest(unittest.TestCase):
         )
         self.assertEqual(sent["fresh"]["command"], "/new-chat")
         self.assertEqual(sent["fresh"]["verified"], "heuristic")
-
     def test_no_fresh_sends_straight_into_existing_context(self) -> None:
         self.set_status("working")  # would be refused by --fresh; --no-fresh never asks
         self.clear_calls()
@@ -811,9 +503,6 @@ class PairctlTest(unittest.TestCase):
         sent = self.invoke_ok("send-round", "--target", "w1:p2", "--file", str(handoff), "--no-fresh")
         self.assertIsNone(sent["fresh"])
         self.assertEqual([c[:2] for c in self.herdr_calls()], [["agent", "prompt"]])
-
-    # --- planner compaction at the phase boundary -------------------------------------
-
     def test_fifth_finish_queues_planner_compact_then_rollover_by_compact_reason(self) -> None:
         self.set_kind("claude")
         self.set_screen("Claude Code v2\n")
@@ -857,7 +546,6 @@ class PairctlTest(unittest.TestCase):
         self.assertIsNone(state["compact_queued"])
         self.assertFalse(state["rollover_required"])
         self.assertEqual(self.invoke_ok("status")["phase_round_count"], 0)
-
     def test_planner_compact_bare_command_for_kind_without_instructions(self) -> None:
         self.set_kind("kimi")
         self.set_screen("Started a new session\n")
@@ -865,7 +553,6 @@ class PairctlTest(unittest.TestCase):
             self.send_finish(n)
         prompts = [c for c in self.herdr_calls() if c[:2] == ["agent", "prompt"] and c[2] == "w1:p1"]
         self.assertEqual([p[3] for p in prompts], ["/compact"])
-
     def test_cursor_planner_compact_queues_summarize(self) -> None:
         # Observed 2026-09-07: finish-round of a Cursor planner returned
         # "no compact command known for agent kind 'cursor'". Cursor's in-place
@@ -882,7 +569,6 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(compact["command"], "/summarize")
         prompts = [c for c in self.herdr_calls() if c[:2] == ["agent", "prompt"] and c[2] == "w1:p1"]
         self.assertEqual([p[3] for p in prompts], ["/summarize"])
-
     def test_watch_compact_continue_prompts_planner_after_idle(self) -> None:
         self.set_kind("cursor")
         for n in range(1, 6):
@@ -907,7 +593,6 @@ class PairctlTest(unittest.TestCase):
         self.assertIn("Do not wait for the user", prompts[0][3])
         self.assertIn("rollover --reason compact", prompts[0][3])
         self.assertIn("CHECKPOINT.md", prompts[0][3])
-
     def test_fifth_finish_spawns_continue_watcher_when_enabled(self) -> None:
         self.set_kind("cursor")
         for n in range(1, 5):
@@ -953,7 +638,6 @@ class PairctlTest(unittest.TestCase):
                 break
             time.sleep(0.05)
         self.assertEqual(status, "delivered")
-
     def test_auto_compact_can_be_disabled_by_env_and_init(self) -> None:
         for n in range(1, 5):
             self.start_finish(n)
@@ -980,7 +664,6 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(forced["command"], "/new")
         prompts = [c for c in self.herdr_calls() if c[:2] == ["agent", "prompt"]]
         self.assertEqual([p[2:4] for p in prompts], [["w1:p1", "/new"]])
-
     def test_compact_self_reports_unknown_planner_kind(self) -> None:
         self.set_kind("agy")
         proc = self.invoke("compact-self")
@@ -988,21 +671,6 @@ class PairctlTest(unittest.TestCase):
         payload = json.loads(proc.stdout)
         self.assertEqual(payload["status"], "planner_compact_not_queued")
         self.assertIn("agy", payload["reason"])
-
-    # --- Claude Code SessionStart hook ------------------------------------------------
-
-    def run_hook(self, payload: dict, xdg: Path, *, pane: str = "w1:p1") -> subprocess.CompletedProcess[str]:
-        env = os.environ.copy()
-        env.pop("HERDR_PANE_ID", None)
-        if pane:
-            env["HERDR_PANE_ID"] = pane
-        env["XDG_STATE_HOME"] = str(xdg)
-        env["PAIRCTL_HERDR"] = str(self.herdr)
-        return subprocess.run(
-            ["python3", str(HOOK)], input=json.dumps(payload), text=True,
-            capture_output=True, check=False, env=env,
-        )
-
     def test_hook_records_rollover_after_compact_and_injects_checkpoint(self) -> None:
         xdg = self.root / "xdg-hook"
         env = {"XDG_STATE_HOME": str(xdg)}
@@ -1053,7 +721,6 @@ class PairctlTest(unittest.TestCase):
         after = json.loads(self.invoke("status", use_state_dir=False, extra_env=env).stdout)
         self.assertEqual(after["phase"], 3)
         self.assertEqual(after["session_id"], "sess-2")
-
     def test_hook_is_silent_without_pairing_state_or_on_plain_startup(self) -> None:
         xdg = self.root / "xdg-empty"
         hook = self.run_hook({"session_id": "x", "source": "compact", "cwd": str(self.cwd)}, xdg)
@@ -1076,8 +743,6 @@ class PairctlTest(unittest.TestCase):
             ["python3", str(HOOK)], input="not json", text=True, capture_output=True, check=False, env=env2,
         )
         self.assertEqual(broken.returncode, 0)
-
-
     def test_cycle1_send_round_initializes_revision_contract_and_statuses(self) -> None:
         handoff = self.write_handoff("task1.md", "# Task 1\nDo precision work\n")
         sent = self.invoke_ok(
@@ -1110,7 +775,6 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(sent["contract_hash"], expected_hash)
         # Contract file mode is 0600
         self.assertEqual(stat.S_IMODE(Path(status["contract_path"]).stat().st_mode), 0o600)
-
     def test_resolve_pending_delivered_fails_closed_on_missing_or_corrupt_snapshot(self) -> None:
         for damage in ("missing", "corrupt"):
             with self.subTest(damage=damage):
@@ -1139,7 +803,6 @@ class PairctlTest(unittest.TestCase):
                 self.assertEqual(json.loads(rejected.stdout)["reason"], expected_reason)
                 self.assertEqual((self.state / "state.json").read_bytes(), before)
                 self.assertIsNotNone(self.read_state()["pending_dispatch"])
-
     def test_v1_pending_delivery_migrates_unconfirmed_without_recreating_contract(self) -> None:
         source = self.write_handoff("legacy.md", "# Legacy source\nMutable text\n")
         baseline = self.read_state()
@@ -1162,7 +825,6 @@ class PairctlTest(unittest.TestCase):
                 self.assertEqual(state["phase_round_count"], 1)
                 self.assertEqual(state["rounds"][0]["current_revision"], 0)
                 self.assertFalse(list((self.state / "contracts").glob("p01-r001*")))
-
     def test_cycle1_start_round_and_no_fresh_and_resolve_pending(self) -> None:
         # Test start-round
         started = self.invoke_ok(
@@ -1218,7 +880,6 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(resolved["work_status"], "pending_acceptance")
         self.assertEqual(resolved["dispatch_status"], "delivered")
         self.assertTrue(resolved["contract_hash"])
-
     def test_start_round_requires_nonempty_complete_utf8_file(self) -> None:
         absent = self.invoke(
             "start-round", "--executor", "w1:p2", "--scope", "x", "--acceptance", "y",
@@ -1232,7 +893,6 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(rejected.returncode, 2)
         self.assertIn("contract file is empty", rejected.stderr)
         self.assertEqual(self.read_state()["rounds"], [])
-
     def test_cycle1_contract_corrupted_or_missing(self) -> None:
         started = self.invoke_ok(
             "start-round",
@@ -1254,7 +914,6 @@ class PairctlTest(unittest.TestCase):
         contract_file.unlink()
         status3 = self.invoke_ok("status")
         self.assertEqual(status3["contract_status"], "contract_missing")
-
     def test_cycle2_ack_round_accept_and_start_transitions(self) -> None:
         started = self.invoke_ok(
             "start-round",
@@ -1344,7 +1003,6 @@ class PairctlTest(unittest.TestCase):
         )
         self.assertEqual(replay_accept["work_status"], "running")
         self.assertEqual(self.invoke_ok("status")["work_status"], "running")
-
     def test_cycle2_ack_round_validation_and_failures_do_not_modify_state(self) -> None:
         started = self.invoke_ok(
             "start-round",
@@ -1449,7 +1107,6 @@ class PairctlTest(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 2)
         self.assertEqual(json.loads(proc.stdout)["reason"], "round_terminal")
-
     def test_cycle3_check_round_allows_only_when_running_and_matching(self) -> None:
         started = self.invoke_ok(
             "start-round",
@@ -1513,7 +1170,6 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(chk3["reason"], "ok")
         self.assertEqual(chk3["work_status"], "running")
         self.assertEqual(chk3["revision"], 1)
-
     def test_check_round_returns_verified_contract_before_acceptance(self) -> None:
         body = "# Authoritative task\nEdit only alpha.txt\nRun exact-check\n"
         contract = self.write_handoff("authoritative.md", body)
@@ -1550,7 +1206,6 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(query_payload["reason"], "missing_revision_query_only")
         self.assertEqual(query_payload["contract_hash"], started["contract_hash"])
         self.assertEqual(query_payload["contract_text"], payload["contract_text"])
-
     def test_executor_writes_real_file_only_after_query_accept_start_and_check(self) -> None:
         contract = self.write_handoff(
             "executor-flow.md", "# Executor flow\nCreate result.txt containing done\n"
@@ -1582,7 +1237,6 @@ class PairctlTest(unittest.TestCase):
         self.assertTrue(allowed["allowed"])
         result.write_text("done\n", encoding="utf-8")
         self.assertEqual(result.read_text(encoding="utf-8"), "done\n")
-
     def test_cycle3_check_round_rejects_omitted_revision_wrong_pane_and_contract_drift(self) -> None:
         started = self.invoke_ok(
             "start-round",
@@ -1669,72 +1323,6 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(chk_drift.returncode, 2)
         self.assertFalse(json.loads(chk_drift.stdout)["allowed"])
         self.assertEqual(json.loads(chk_drift.stdout)["reason"], "contract_corrupted")
-
-    def legacy_v1_state(self) -> dict:
-        """A raw v1 (pre-migration) state file: rounds p01-r001/p01-r002 (r002 active)
-        plus one running background job, written straight to state.json."""
-        return {
-            "version": 1,
-            "cwd": str(self.cwd),
-            "planner_pane": "w1:p1",
-            "session_id": "session-v1",
-            "auto_compact": True,
-            "phase": 1,
-            "round_seq": 3,
-            "phase_round_count": 3,
-            "rollover_required": False,
-            "compaction_epoch": 0,
-            "compact_queued": None,
-            "rounds": [
-                {
-                    "round_id": "p01-r001",
-                    "phase": 1,
-                    "executor": "w1:p2",
-                    "scope": "old-scope-1",
-                    "acceptance": "exit 0",
-                    "status": "accepted",
-                    "started_at": "2026-09-18T10:00:00Z",
-                    "finished_at": "2026-09-18T10:10:00Z",
-                    "artifacts": "old-art-1",
-                    "notes": "",
-                    "fresh": None,
-                },
-                {
-                    "round_id": "p01-r002",
-                    "phase": 1,
-                    "executor": "w1:p2",
-                    "scope": "old-scope-2",
-                    "acceptance": "exit 0",
-                    "status": "active",
-                    "started_at": "2026-09-18T10:15:00Z",
-                    "finished_at": "",
-                    "artifacts": "",
-                    "notes": "",
-                    "fresh": None,
-                },
-            ],
-            "jobs": [
-                {
-                    "round_id": "p01-r002",
-                    "phase": 1,
-                    "queue": "default",
-                    "job_id": "j101",
-                    "label": "bg-job",
-                    "submitter": "w1:p2",
-                    "command": "sleep 10",
-                    "log": "/tmp/log",
-                    "expected_artifacts": "art",
-                    "completion_assertion": "ok",
-                    "state": "running",
-                    "cancel_retry_owner": "w1:p1",
-                    "created_at": "2026-09-18T10:16:00Z",
-                    "updated_at": "2026-09-18T10:16:00Z",
-                }
-            ],
-            "pending_dispatch": None,
-            "created_at": "2026-09-18T09:00:00Z",
-        }
-
     def test_cycle4_v1_migration_and_adopt_contract(self) -> None:
         # Create a v1 state file
         v1_state = self.legacy_v1_state()
@@ -1804,7 +1392,6 @@ class PairctlTest(unittest.TestCase):
         self.invoke_ok("status")
         state_text_2 = (self.state / "state.json").read_text(encoding="utf-8")
         self.assertEqual(json.loads(state_text_1)["version"], json.loads(state_text_2)["version"])
-
     def test_adopt_contract_rejects_already_bound_round_without_changes(self) -> None:
         original = self.write_handoff("bound.md", "# Bound contract\nOriginal instructions\n")
         started = self.invoke_ok(
@@ -1822,7 +1409,6 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(json.loads(rejected.stdout)["reason"], "already_bound")
         self.assertEqual((self.state / "state.json").read_bytes(), state_before)
         self.assertEqual(Path(started["contract_path"]).read_bytes(), snapshot_before)
-
     def test_cycle4_unsupported_future_version_and_corrupted_file_untouched(self) -> None:
         # Unsupported future version (e.g. 99)
         v99_state = {"version": 99, "cwd": str(self.cwd)}
@@ -1838,20 +1424,6 @@ class PairctlTest(unittest.TestCase):
         res2 = self.invoke("status")
         self.assertEqual(res2.returncode, 2)
         self.assertEqual((self.state / "state.json").read_text(encoding="utf-8"), "invalid json {{{")
-
-    # --- issue 2: planner context budget, recovery, snapshots, and lint ------------
-
-    def note_transcript(self, session_id: str, entries: list[dict], *, kind: str = "claude") -> Path:
-        transcript = self.root / f"{session_id}.jsonl"
-        transcript.write_text(
-            "\n".join(json.dumps(entry) for entry in entries) + "\n", encoding="utf-8"
-        )
-        self.invoke_ok(
-            "note-session", "--session-id", session_id, "--transcript-path", str(transcript),
-            "--kind", kind, "--source", "startup", "--pane", "w1:p1",
-        )
-        return transcript
-
     def test_context_usage_last_real_assistant_budget_stale_and_unknown(self) -> None:
         old = "2026-01-01T00:00:00+00:00"
         self.note_transcript("session-a", [
@@ -1885,7 +1457,6 @@ class PairctlTest(unittest.TestCase):
         non_claude = self.invoke_ok("context-usage")
         self.assertEqual(non_claude["status"], "unknown")
         self.assertIsNone(non_claude["context_tokens"])
-
     def test_budget_priority_init_queue_and_dispatch_gate(self) -> None:
         stamp = "2026-09-21T00:00:00+00:00"
         self.note_transcript("session-a", [{
@@ -1907,7 +1478,6 @@ class PairctlTest(unittest.TestCase):
         )
         self.assertEqual(blocked.returncode, 20)
         self.assertEqual(json.loads(blocked.stdout)["status"], "CONTEXT_COMPACT_QUEUED")
-
     def test_post_dispatch_compact_active_hook_recovery_preserves_round(self) -> None:
         xdg = self.root / "xdg-active"
         env = {"XDG_STATE_HOME": str(xdg), "PAIRCTL_CONTINUE_AFTER_COMPACT": "0"}
@@ -1965,7 +1535,6 @@ class PairctlTest(unittest.TestCase):
             use_state_dir=False, extra_env=env,
         )
         self.assertTrue(checked["allowed"])
-
     def test_finish_evidence_report_and_checkpoint_decisions(self) -> None:
         report = self.cwd / "report.md"
         started = self.invoke_ok(
@@ -1991,7 +1560,6 @@ class PairctlTest(unittest.TestCase):
         checkpoint = (self.state / "CHECKPOINT.md").read_text(encoding="utf-8")
         for value in ("Goal", "Context usage", "Revision", "Contract", "Report", "Snapshot", "artifact-a", "verified-a", "scope confirmed"):
             self.assertIn(value, checkpoint)
-
     def test_snapshot_diff_tracks_changed_added_removed_and_missing(self) -> None:
         tracked = self.cwd / "tracked.txt"
         tracked.write_text("one\n", encoding="utf-8")
@@ -2023,7 +1591,6 @@ class PairctlTest(unittest.TestCase):
         self.assertIn("tree/old.txt", payload["removed"])
         self.assertIn("tree/added.txt", payload["added"])
         self.assertIn("new.txt", payload["added"])
-
     def test_handoff_lint_rules_and_skip_reason(self) -> None:
         subprocess.run(["git", "init", "-q", str(self.root)], check=True)
         (self.cwd / "子 目录").mkdir()
@@ -2069,7 +1636,6 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(skipped.returncode, 0, skipped.stderr + skipped.stdout)
         state = json.loads((second_state / "state.json").read_text(encoding="utf-8"))
         self.assertEqual(state["rounds"][0]["skip_lint"], "legacy fixture")
-
     def test_hook_notes_all_sources_before_init_missing_fields_are_silent(self) -> None:
         xdg = self.root / "xdg-sources"
         transcript = self.root / "source.jsonl"
@@ -2092,7 +1658,6 @@ class PairctlTest(unittest.TestCase):
             self.assertEqual(hook.returncode, 0)
             self.assertEqual(hook.stdout, "")
             self.assertEqual(record.read_bytes(), before)
-
     def test_context_usage_derived_locator_and_invalid_latest_usage(self) -> None:
         fake_home = self.root / "home"
         base = self.cwd
@@ -2134,7 +1699,6 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(recorded["status"], "ok")
         self.assertEqual(recorded["source"], "recorded")
         self.assertEqual(recorded["context_tokens"], 15)
-
     def test_pending_unknown_and_disabled_never_auto_compact(self) -> None:
         self.note_transcript("session-a", [{
             "sessionId": "session-a", "timestamp": "2026-09-21T00:00:00Z",
@@ -2154,7 +1718,6 @@ class PairctlTest(unittest.TestCase):
         self.invoke_ok("init", "--no-auto-compact", "--no-context-check")
         disabled = self.send_round(1)
         self.assertNotIn("planner_compact", disabled)
-
     def test_stale_only_init_queues_compaction(self) -> None:
         self.note_transcript("session-a", [{
             "sessionId": "session-a", "timestamp": "2020-01-01T00:00:00Z",
@@ -2164,7 +1727,6 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(queued["status"], "CONTEXT_COMPACT_QUEUED")
         self.assertFalse(queued["context_usage"]["over_budget"])
         self.assertTrue(queued["context_usage"]["stale"])
-
     def test_snapshot_large_hash_only_and_manifest_name_collision(self) -> None:
         large = self.cwd / "large.bin"
         with large.open("wb") as handle:
@@ -2185,38 +1747,6 @@ class PairctlTest(unittest.TestCase):
         self.assertTrue(records["large.bin"]["sha256"])
         self.assertTrue((metadata.parent / "files" / "manifest.json").is_file())
         self.assertIsInstance(json.loads(metadata.read_text(encoding="utf-8")), list)
-
-    # --- resume_pending record (issue #8) ----------------------------------------------
-
-    REQUIRED_RECORD_KEYS = (
-        "armed_at", "epoch_at_arm", "planner_pane", "state_dir",
-        "mechanism", "deadline", "status", "attempts", "last_error",
-    )
-
-    # A record write requires auto-continue on (issue #9). INTERNAL marks the parent as
-    # an internal watcher so pairctl does not spawn one: the test drives watch /
-    # resume-deliver manually and must stay the only wake-up source.
-    RECORD_ENV = {
-        "PAIRCTL_CONTINUE_AFTER_COMPACT": "1",
-        "PAIRCTL_INTERNAL_WATCHER": "1",
-    }
-
-    def auto_continue_prompts(self) -> list[list[str]]:
-        """argv tails of delivered auto-continue prompts on the planner pane."""
-        return [
-            c for c in self.herdr_calls()
-            if c[:2] == ["agent", "prompt"] and c[2] == "w1:p1"
-            and "auto-continue after compaction" in c[3]
-        ]
-
-    def arm_and_advance_epoch(self) -> str:
-        """Arm the resume record via compact-self, then advance the epoch. Returns armed_at."""
-        queued = self.invoke_ok("compact-self", extra_env=self.RECORD_ENV)
-        self.assertTrue(queued["queued"], queued)
-        armed_at = self.read_state()["resume_pending"]["armed_at"]
-        self.invoke_ok("rollover", "--reason", "compact")
-        return armed_at
-
     def test_resume_pending_none_after_init_and_full_record_when_armed(self) -> None:
         self.assertIsNone(self.read_state().get("resume_pending"))
         self.assertIsNone(self.invoke_ok("status")["resume_pending"])
@@ -2252,7 +1782,6 @@ class PairctlTest(unittest.TestCase):
         deadline = dt.datetime.fromisoformat(record["deadline"])
         self.assertGreaterEqual(deadline.timestamp(), requeue_at + 28)
         self.assertLessEqual(deadline.timestamp(), time.time() + 31)
-
     def test_rollover_with_active_round_keeps_resume_record(self) -> None:
         for n in range(1, 5):
             self.start_finish(n)
@@ -2280,7 +1809,6 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(record["status"], "pending")
         self.assertEqual(record["armed_at"], armed_at)
         self.assertEqual(record["epoch_at_arm"], 0)
-
     def test_rollover_after_fifth_finish_keeps_resume_record(self) -> None:
         for n in range(1, 6):
             _, fifth = self.start_finish(n, extra_env=self.RECORD_ENV)
@@ -2301,7 +1829,6 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(record["status"], "pending")
         self.assertEqual(record["armed_at"], armed_at)
         self.assertEqual(record["epoch_at_arm"], 0)
-
     def test_resume_deliver_rejections_before_epoch_advance(self) -> None:
         self.clear_calls()
         missing = self.invoke("resume-deliver", "--pane", "w1:p1", "--via", "watcher")
@@ -2334,7 +1861,6 @@ class PairctlTest(unittest.TestCase):
         calls = self.herdr_calls()
         self.assertFalse([c for c in calls if c[:2] == ["agent", "prompt"]], calls)
         self.assertEqual(self.read_state()["resume_pending"]["status"], "pending")
-
     def test_resume_deliver_prompts_once_and_claims_record(self) -> None:
         self.arm_and_advance_epoch()
         self.set_status("idle")
@@ -2366,7 +1892,6 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(json.loads(again.stdout)["reason"], "not_claimable")
         self.assertEqual(self.herdr_calls(), [])
         self.assertEqual(self.read_state()["resume_pending"]["status"], "delivered")
-
     def test_resume_deliver_uncertain_retry_then_expired_notifies_once(self) -> None:
         self.arm_and_advance_epoch()
         self.set_herdr_mode("fail")
@@ -2400,7 +1925,6 @@ class PairctlTest(unittest.TestCase):
         calls = self.herdr_calls()
         self.assertFalse([c for c in calls if c[:2] == ["agent", "prompt"]], calls)
         self.assertFalse([c for c in calls if c[:2] == ["notification", "show"]], calls)
-
     def test_send_round_cancels_resume_record_after_epoch_advance(self) -> None:
         self.arm_and_advance_epoch()
         sent = self.send_round(1)
@@ -2409,7 +1933,6 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(record["status"], "cancelled")
         self.assertEqual(record["cancel_reason"], "send_round")
         self.assertTrue(record["cancelled_at"])
-
     def test_rollover_new_cancels_resume_record_after_epoch_advance(self) -> None:
         self.arm_and_advance_epoch()
         rolled = self.invoke_ok(
@@ -2420,7 +1943,6 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(record["status"], "cancelled")
         self.assertEqual(record["cancel_reason"], "rollover_new")
         self.assertTrue(record["cancelled_at"])
-
     def test_adopt_contract_cancels_resume_record_after_epoch_advance(self) -> None:
         v1_state = self.legacy_v1_state()
         (self.state / "state.json").write_text(json.dumps(v1_state, indent=2), encoding="utf-8")
@@ -2444,7 +1966,6 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(record["status"], "cancelled")
         self.assertEqual(record["cancel_reason"], "adopt_contract")
         self.assertTrue(record["cancelled_at"])
-
     def test_resume_prompt_is_identical_to_legacy_watcher(self) -> None:
         queued = self.invoke_ok("compact-self", extra_env={
             **self.RECORD_ENV, "PAIRCTL_RESUME_DEADLINE_S": "0",
@@ -2476,8 +1997,6 @@ class PairctlTest(unittest.TestCase):
         prompts = [c for c in self.herdr_calls() if c[:2] == ["agent", "prompt"]]
         self.assertEqual(len(prompts), 1, self.herdr_calls())
         self.assertEqual(prompts[0][3], legacy_text)
-
-
     def test_mechanism_plugin_only_when_linked_enabled_and_claude(self) -> None:
         # issue #9: mechanism is decided only on a new resume_pending write.
         plugins = Path(str(self.herdr) + ".plugins.json")
@@ -2507,7 +2026,6 @@ class PairctlTest(unittest.TestCase):
                 self.assertTrue(queued["queued"], queued)
                 record = self.read_state()["resume_pending"]
                 self.assertEqual(record["mechanism"], expected)
-
     def test_continue_disabled_skips_record_and_watcher(self) -> None:
         # invoke() defaults PAIRCTL_CONTINUE_AFTER_COMPACT=0: compact still queues,
         # but no record is written, no watcher spawns, and no probe runs.
@@ -2522,7 +2040,6 @@ class PairctlTest(unittest.TestCase):
             [c for c in self.herdr_calls() if c[:2] == ["plugin", "list"]],
             self.herdr_calls(),
         )
-
     def test_same_epoch_requeue_updates_deadline_only(self) -> None:
         first = self.invoke_ok("compact-self", extra_env=self.RECORD_ENV)
         self.assertTrue(first["queued"], first)
@@ -2556,7 +2073,6 @@ class PairctlTest(unittest.TestCase):
         # A requeue is not a new write: no watcher is spawned for it.
         self.assertFalse(requeued["continue_after_compact"]["spawned"], requeued)
         self.assertFalse((self.state / "compact-continue.pid").exists())
-
     def test_watcher_delivers_once_at_deadline_and_records_mechanism(self) -> None:
         queued = self.invoke_ok("compact-self", extra_env={
             "PAIRCTL_CONTINUE_AFTER_COMPACT": "1",
@@ -2587,7 +2103,6 @@ class PairctlTest(unittest.TestCase):
         record = self.read_state()["resume_pending"]
         self.assertEqual(record["status"], "delivered")
         self.assertEqual(record["mechanism"], "watcher")
-
     def test_concurrent_resume_deliver_single_prompt(self) -> None:
         queued = self.invoke_ok("compact-self", extra_env=self.RECORD_ENV)
         self.assertTrue(queued["queued"], queued)
@@ -2616,7 +2131,6 @@ class PairctlTest(unittest.TestCase):
         prompts = [c for c in self.herdr_calls() if c[:2] == ["agent", "prompt"]]
         self.assertEqual(len(prompts), 1, self.herdr_calls())
         self.assertEqual(self.read_state()["resume_pending"]["status"], "delivered")
-
     def test_watcher_child_env_uses_internal_marker(self) -> None:
         queued = self.invoke_ok("compact-self", extra_env={
             "PAIRCTL_CONTINUE_AFTER_COMPACT": "1",
@@ -2639,79 +2153,6 @@ class PairctlTest(unittest.TestCase):
             time.sleep(0.05)
         self.assertIn(b"PAIRCTL_INTERNAL_WATCHER=1", environ)
         self.assertNotIn(b"PAIRCTL_CONTINUE_AFTER_COMPACT=0", environ)
-
-
-    # --- pane index + plugin resume hook (issue #10) ----------------------------------
-
-    PLUGIN_STUB_NAME = "pairctl-stub.log.jsonl"
-
-    def pane_index_path(self, pane_id: str) -> Path:
-        return self.state_home / "herdr-pair" / "panes" / f"{pane_id}.json"
-
-    def read_pane_index(self, pane_id: str) -> list[dict]:
-        return json.loads(self.pane_index_path(pane_id).read_text(encoding="utf-8"))
-
-    def write_pane_index(self, pane_id: str, entries: list[dict]) -> None:
-        path = self.pane_index_path(pane_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(entries, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-        )
-
-    def fresh_stamp(self, hours: float = 0.0, seconds: float = 0.0) -> str:
-        stamp = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=hours, seconds=seconds)
-        return stamp.replace(microsecond=0).isoformat()
-
-    def write_pairctl_stub(self) -> Path:
-        """PAIRCTL target for the plugin hook: record the exact resume-deliver argv,
-        then exec the real pairctl so the delivery path still runs end to end."""
-        stub = self.root / "pairctl-stub.py"
-        stub.write_text(
-            "import json, os, sys\n"
-            f"log = {str(self.root / self.PLUGIN_STUB_NAME)!r}\n"
-            "with open(log, 'a', encoding='utf-8') as handle:\n"
-            "    handle.write(json.dumps(sys.argv[1:], ensure_ascii=False) + '\\n')\n"
-            f"os.execv(sys.executable, [sys.executable, {str(SCRIPT)!r}] + sys.argv[1:])\n",
-            encoding="utf-8",
-        )
-        return stub
-
-    def stub_calls(self) -> list[list[str]]:
-        path = self.root / self.PLUGIN_STUB_NAME
-        if not path.exists():
-            return []
-        return [
-            json.loads(line)
-            for line in path.read_text(encoding="utf-8").splitlines() if line.strip()
-        ]
-
-    def run_resume_hook(
-        self,
-        *,
-        pane_id: str = "w1:p1",
-        agent_status: str = "idle",
-        event: str = "pane.agent_status_changed",
-        extra_env: dict[str, str] | None = None,
-    ) -> subprocess.CompletedProcess[str]:
-        env = os.environ.copy()
-        env["XDG_STATE_HOME"] = str(self.state_home)
-        env["PAIRCTL_HERDR"] = str(self.herdr)
-        env.pop("PAIRCTL", None)
-        env.pop("PAIRCTL_SESSION_STALE_HOURS", None)
-        env.pop("HERDR_PLUGIN_STATE_DIR", None)
-        env["HERDR_PLUGIN_EVENT"] = event
-        env["HERDR_PLUGIN_EVENT_JSON"] = json.dumps({
-            "pane_id": pane_id,
-            "workspace_id": "ws-1",
-            "agent_status": agent_status,
-        })
-        if extra_env:
-            env.update(extra_env)
-        return subprocess.run(
-            ["python3", str(PLUGIN_HOOK)],
-            text=True, capture_output=True, check=False, env=env,
-        )
-
     def test_pane_index_five_write_points_include_custom_state_dir(self) -> None:
         # setUp already ran `init --planner-pane w1:p1 --state-dir self.state`.
         entries = self.read_pane_index("w1:p1")
@@ -2787,7 +2228,6 @@ class PairctlTest(unittest.TestCase):
             use_state_dir=False,
         )
         self.assertEqual(sorted(p.name for p in panes_dir.iterdir()), before)
-
     def test_pane_index_entry_expires_after_stale_hours(self) -> None:
         self.arm_and_advance_epoch()
         self.set_status("idle")
@@ -2825,7 +2265,6 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(len(calls), 1, calls)
         self.assertEqual(calls[0][0], "resume-deliver")
         self.assertEqual(self.read_state()["resume_pending"]["status"], "delivered")
-
     def test_resume_hook_calls_resume_deliver_once_when_idle_after_epoch(self) -> None:
         self.arm_and_advance_epoch()
         self.set_status("idle")
@@ -2857,7 +2296,6 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(hook.stdout, "")
         self.assertEqual(hook.stderr, "")
         self.assertEqual(len(self.stub_calls()), 1)
-
     def test_resume_hook_silent_on_miss_and_mismatch(self) -> None:
         stub = self.write_pairctl_stub()
         plugin_state = self.root / "plugin-state-silent"
@@ -2908,7 +2346,6 @@ class PairctlTest(unittest.TestCase):
         # nothing claimed, delivered or logged along the way
         self.assertEqual(self.read_state()["resume_pending"]["status"], "pending")
         self.assertFalse((plugin_state / "hook.log").exists())
-
     def test_resume_hook_ambiguous_pane_logs_and_does_not_deliver(self) -> None:
         self.arm_and_advance_epoch()
         self.set_status("idle")
@@ -2960,9 +2397,8 @@ class PairctlTest(unittest.TestCase):
             "--state-dir", str(self.state.resolve()),
         ])
         self.assertEqual(self.read_state()["resume_pending"]["status"], "delivered")
-
     def test_plugin_manifest_declares_resume_hook_only(self) -> None:
-        manifest_path = Path(__file__).resolve().parents[1] / "herdr-plugin.toml"
+        manifest_path = SKILL / "herdr-plugin.toml"
         manifest = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
         self.assertEqual(manifest.get("id"), "tc.herdr-pair")
         self.assertTrue(str(manifest.get("name") or "").strip())
@@ -3000,38 +2436,6 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(
             [a.get("id") for a in manifest.get("actions") or []][0], "pair-status"
         )
-
-    # --- issue #11: notices, wake, lock timeout, hook failure path ------------------
-
-    def notification_calls(self) -> list[list[str]]:
-        """argv tails of every `herdr notification show` this case produced."""
-        return [c for c in self.herdr_calls() if c[:2] == ["notification", "show"]]
-
-    def set_pending_dispatch(self, age_s: float, round_id: str = "p01-r007") -> str:
-        """Hand-write a pending_dispatch created age_s seconds ago; returns created_at.
-
-        send-round clears its own pending record on every tested path, so the
-        staleness cases plant the record directly in state.json instead.
-        """
-        created_at = (
-            dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=age_s)
-        ).replace(microsecond=0).isoformat()
-        state = self.read_state()
-        state["pending_dispatch"] = {
-            "status": "uncertain",
-            "counted": False,
-            "round_id": round_id,
-            "target": "w1:p2",
-            "executor": "w1:p2",
-            "scope": "stale-scope",
-            "acceptance": "stale-acceptance",
-            "handoff": str(self.cwd / "stale.md"),
-            "phase_round_count": 0,
-            "created_at": created_at,
-        }
-        self.write_state(state)
-        return created_at
-
     def test_notice_recorded_when_notification_is_rate_limited(self) -> None:
         # Two failed prompts expire the record; the expired notification goes
         # through the notice helper, which must record the suppression itself.
@@ -3073,7 +2477,6 @@ class PairctlTest(unittest.TestCase):
         # status carries the whole notices array
         shown_status = self.invoke_ok("status")
         self.assertEqual(shown_status["notices"], notices)
-
     def test_missing_pairctl_logs_and_notifies_once(self) -> None:
         # A selected candidate whose pairctl cannot run: log pairctl_failed, show
         # the host notification exactly once (marker file), exit 1 - never silent.
@@ -3119,7 +2522,6 @@ class PairctlTest(unittest.TestCase):
             (plugin_state / "hook.log").read_text(encoding="utf-8"),
         )
         self.assertEqual(self.notification_calls(), [])
-
     def test_pairctl_answer_resets_failure_notice(self) -> None:
         # One notice per failure episode: once pairctl answers the hook again,
         # the marker is cleared so the next failure notifies instead of being
@@ -3158,7 +2560,6 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(again.returncode, 1, again.stderr + again.stdout)
         self.assertEqual(len(self.notification_calls()), 1, self.herdr_calls())
         self.assertTrue(marker.is_file())
-
     def test_no_pane_match_stays_silent(self) -> None:
         # Issue #10 silence contract: no pairing matches this pane, so the hook
         # must not run pairctl at all - even though PAIRCTL points at nothing.
@@ -3175,7 +2576,6 @@ class PairctlTest(unittest.TestCase):
         self.assertFalse((plugin_state / "hook.log").exists())
         self.assertFalse((plugin_state / "pairctl-failed-notified").exists())
         self.assertEqual(self.herdr_calls(), [])
-
     def test_hook_silent_when_pairctl_reports_lock_timeout(self) -> None:
         # Issue #10 silence contract: a bounded lock makes resume-deliver answer
         # the exact lock_timeout JSON with exit 2. JSON on stdout is a completed
@@ -3232,7 +2632,6 @@ class PairctlTest(unittest.TestCase):
         )
         self.assertEqual(retry.returncode, 0, retry.stderr + retry.stdout)
         self.assertEqual(self.read_state()["resume_pending"]["status"], "delivered")
-
     def test_hook_silent_when_pairctl_prints_json_and_exits_nonzero(self) -> None:
         # A JSON object on stdout is a completed answer whatever the exit code:
         # planner_busy and lock_timeout both exit 2, yet neither is a failure.
@@ -3261,7 +2660,6 @@ class PairctlTest(unittest.TestCase):
             self.assertFalse((plugin_state / "pairctl-failed-notified").exists())
             self.assertEqual(self.notification_calls(), [])
             self.assertEqual(self.read_state()["resume_pending"]["status"], "pending")
-
     def test_rate_limited_stale_dispatch_still_reports_notified(self) -> None:
         # record_notice returns "a new notice was recorded", not "the host showed
         # it": a rate-limited delivery is still a notice, so wake reports True.
@@ -3285,7 +2683,6 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(second.returncode, 0, second.stderr + second.stdout)
         self.assertFalse(json.loads(second.stdout)["dispatch_stale_notified"])
         self.assertEqual(len(self.read_state()["notices"]), 1)
-
     def test_lock_timeout_abandons_event_and_later_wake_retries(self) -> None:
         lock = self.state / "state.lock"
         holder = subprocess.Popen(
@@ -3338,7 +2735,6 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(payload["notices"], [])
         self.assertEqual(self.read_state()["notices"], [])
         self.assertEqual(self.herdr_calls(), [])
-
     def test_stale_dispatch_notifies_once(self) -> None:
         created_at = self.set_pending_dispatch(age_s=1000)
         self.clear_calls()
@@ -3402,7 +2798,6 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(len(broken), 1, broken)
         self.assertEqual(broken[0]["reason"], "herdr_failed")
         self.assertIs(broken[0]["shown"], False)
-
     def test_dispatch_stale_threshold_is_configurable(self) -> None:
         # PAIRCTL_DISPATCH_STALE_S shrinks the window: 500 s old counts as stale.
         self.set_pending_dispatch(age_s=500)
@@ -3439,55 +2834,6 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(
             notices[0]["dedupe_key"], f"dispatch-stale:p01-r008:{created}",
         )
-
-
-    # --- executor reports, pane exits, executor-event (issue #12) ----------------------
-
-    PANE_EXITED_HOOK = Path(__file__).resolve().parents[1] / "hooks" / "on_pane_exited.py"
-    # Consecutive notices of one round are normally at least 60 s apart; the cases
-    # that deliberately push several times shrink the interval to zero.
-    ZERO_INTERVAL = {"PAIRCTL_EXECUTOR_NOTICE_MIN_S": "0"}
-
-    def executor_event(
-        self, status: str, *, pane: str = "w1:p2", extra_env: dict[str, str] | None = None,
-    ) -> subprocess.CompletedProcess[str]:
-        return self.invoke(
-            "executor-event", "--pane", pane, "--status", status, extra_env=extra_env,
-        )
-
-    def executor_prompts(self) -> list[list[str]]:
-        """argv tails of every short report pairctl sent to the planner pane."""
-        return [
-            c for c in self.herdr_calls()
-            if c[:2] == ["agent", "prompt"] and len(c) > 3
-            and str(c[3]).startswith("herdr-pair executor")
-        ]
-
-    def run_exited_hook(
-        self, *, pane_id: str = "w1:p2", extra_env: dict[str, str] | None = None,
-    ) -> subprocess.CompletedProcess[str]:
-        env = os.environ.copy()
-        env["XDG_STATE_HOME"] = str(self.state_home)
-        env["PAIRCTL_HERDR"] = str(self.herdr)
-        env.pop("PAIRCTL", None)
-        env.pop("HERDR_PLUGIN_STATE_DIR", None)
-        env["HERDR_PLUGIN_EVENT"] = "pane.exited"
-        env["HERDR_PLUGIN_EVENT_JSON"] = json.dumps({
-            "pane_id": pane_id,
-            "workspace_id": "ws-1",
-        })
-        if extra_env:
-            env.update(extra_env)
-        return subprocess.run(
-            ["python3", str(self.PANE_EXITED_HOOK)],
-            text=True, capture_output=True, check=False, env=env,
-        )
-
-    def clear_stub_calls(self) -> None:
-        path = self.root / self.PLUGIN_STUB_NAME
-        if path.exists():
-            path.unlink()
-
     def test_executor_done_and_blocked_prompt_and_notice(self) -> None:
         sent = self.send_round(1)
         round_id = sent["round_id"]
@@ -3535,7 +2881,6 @@ class PairctlTest(unittest.TestCase):
         # the pane binding is untouched by a status report
         self.assertEqual(state["rounds"][0]["executor"], "w1:p2")
         self.assertNotIn("executor_pane_gone_at", state["rounds"][0])
-
     def test_executor_idle_pushes_only_when_report_changes(self) -> None:
         sent = self.send_round(1, body=(
             "[轮次] round_id=<unique-id>\n"
@@ -3599,7 +2944,6 @@ class PairctlTest(unittest.TestCase):
             state["rounds"][0]["last_executor_report_hash"],
             hashlib.sha256(b"version two\n").hexdigest(),
         )
-
     def test_executor_event_ignores_working_and_unknown(self) -> None:
         self.send_round(1)
         self.clear_calls()
@@ -3612,7 +2956,6 @@ class PairctlTest(unittest.TestCase):
             self.assertEqual(self.herdr_calls(), [], status)
         self.assertEqual(self.read_state()["notices"], [])
         self.assertEqual((self.state / "state.json").read_bytes(), before)
-
     def test_executor_event_dedupes_and_respects_min_interval(self) -> None:
         sent = self.send_round(1)
         round_id = sent["round_id"]
@@ -3692,7 +3035,6 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(len(prompt_titles), 2, prompt_titles)
         self.assertTrue(prompt_titles[0].startswith("herdr-pair executor exited"), prompt_titles)
         self.assertTrue(prompt_titles[1].startswith("herdr-pair executor idle"), prompt_titles)
-
     def test_executor_notices_deferred_while_compact_queued(self) -> None:
         sent = self.send_round(1)
         round_id = sent["round_id"]
@@ -3726,7 +3068,6 @@ class PairctlTest(unittest.TestCase):
         state = self.read_state()
         self.assertEqual(state["deferred_notices"], [])
         self.assertEqual(state["resume_pending"]["status"], "delivered")
-
     def test_executor_pane_exit_records_time_and_blocks_next_fresh_send(self) -> None:
         sent = self.send_round(1)
         round_id = sent["round_id"]
@@ -3770,7 +3111,6 @@ class PairctlTest(unittest.TestCase):
         after = self.read_state()
         self.assertEqual(len(after["rounds"]), 1)
         self.assertIsNone(after["pending_dispatch"])
-
     def test_planner_pane_exit_expires_resume(self) -> None:
         self.arm_and_advance_epoch()
         self.assertEqual(self.read_state()["resume_pending"]["status"], "pending")
@@ -3804,7 +3144,6 @@ class PairctlTest(unittest.TestCase):
         state = self.read_state()
         self.assertIsNone(state["resume_pending"])
         self.assertEqual(len(state["notices"]), 2, state["notices"])
-
     def test_executor_event_silent_without_delivered_round(self) -> None:
         def assert_ignored(proc: subprocess.CompletedProcess[str], why: str) -> None:
             self.assertEqual(proc.returncode, 0, f"{why}: {proc.stderr}{proc.stdout}")
@@ -3838,7 +3177,6 @@ class PairctlTest(unittest.TestCase):
         assert_ignored(self.executor_event("exited", pane="w9:p9"), "foreign pane exit")
         self.assertEqual((self.state / "state.json").read_bytes(), before)
         self.assertEqual(self.read_state()["notices"], [])
-
     def test_pane_exited_hook_routes_through_executor_event(self) -> None:
         self.send_round(1)
         self.clear_calls()
@@ -3885,7 +3223,6 @@ class PairctlTest(unittest.TestCase):
             "executor-event", "--pane", "w1:p1", "--status", "exited",
         ])
         self.assertEqual(self.read_state()["resume_pending"]["status"], "expired")
-
     def test_planner_status_hook_routes_executor_to_executor_event(self) -> None:
         self.send_round(1)
         self.clear_calls()
@@ -3906,56 +3243,6 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(self.auto_continue_prompts(), [], self.herdr_calls())
         notes = [n for n in self.read_state()["notices"] if n["title"] == "herdr-pair executor done"]
         self.assertEqual(len(notes), 1, notes)
-
-    # --- section 6 plugin actions (issue #7, round p01-r005) -------------------------
-
-    ACTION_SCRIPT = Path(__file__).resolve().parents[1] / "hooks" / "action.py"
-    # The only values `resolution.source` may ever carry (round p01-r005 解析).
-    ACTION_SOURCES = {"explicit", "env", "pane_index", "focused_cwd", "workspace_cwd"}
-
-    def run_action(
-        self,
-        action: str,
-        *args: str,
-        context: dict | None = None,
-        extra_env: dict[str, str] | None = None,
-    ) -> subprocess.CompletedProcess[str]:
-        """Run hooks/action.py black-box: context arrives via env, never via a live host."""
-        env = os.environ.copy()
-        env["XDG_STATE_HOME"] = str(self.state_home)
-        env["PAIRCTL"] = str(SCRIPT)
-        env["PAIRCTL_STATE_JSON"] = str(self.state / "state.json")
-        env["PAIRCTL_HERDR"] = str(self.herdr)
-        env.pop("PAIRCTL_AUTO_COMPACT", None)
-        env["PAIRCTL_CONTINUE_AFTER_COMPACT"] = "0"
-        # The host machine may export a pair selection of its own; every resolution
-        # source under test is injected explicitly, so an ambient one must not leak.
-        env.pop("PAIRCTL_CWD", None)
-        env.pop("PAIRCTL_STATE_DIR", None)
-        env.pop("HERDR_PLUGIN_STATE_DIR", None)
-        if context is None:
-            env.pop("HERDR_PLUGIN_CONTEXT_JSON", None)
-        else:
-            env["HERDR_PLUGIN_CONTEXT_JSON"] = json.dumps(context)
-        if extra_env:
-            env.update(extra_env)
-        return subprocess.run(
-            ["python3", str(self.ACTION_SCRIPT), action, *args],
-            text=True, capture_output=True, check=False, env=env,
-        )
-
-    def action_context(self, focused_pane: str = "w1:p1", cwd: Path | None = None) -> dict:
-        where = str(cwd if cwd is not None else self.cwd)
-        return {
-            "focused_pane_id": focused_pane,
-            "focused_pane_cwd": where,
-            "workspace_cwd": where,
-        }
-
-    def prompts(self) -> list[list[str]]:
-        """argv tails of every `herdr agent prompt` this case produced."""
-        return [c for c in self.herdr_calls() if c[:2] == ["agent", "prompt"]]
-
     def test_action_resolution_priority_explicit_wins(self) -> None:
         # A lower-priority env pair and a context cwd both point elsewhere: only the
         # explicit --cwd/--state-dir pair may be honoured, and the real state must
@@ -3978,7 +3265,6 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(resolution["state_dir"], str(self.state))
         self.assertEqual(resolution["focused_pane"], "w1:p1")
         self.assertEqual(payload["status"], "ok")
-
     def test_action_resolution_uses_custom_state_dir_from_index(self) -> None:
         # setUp's `init --state-dir self.state --planner-pane w1:p1` recorded a pane
         # index entry; the index must beat focused_pane_cwd/workspace_cwd, which both
@@ -3995,7 +3281,6 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(resolution["cwd"], str(self.cwd.resolve()))
         self.assertEqual(resolution["focused_pane"], "w1:p1")
         self.assertEqual(payload["status"], "ok")
-
     def test_write_action_rejected_when_focus_is_executor(self) -> None:
         # send-round binds w1:p2 into the pane index as the executor, so the write
         # actions resolve a real state - and must still refuse the executor focus
@@ -4011,7 +3296,6 @@ class PairctlTest(unittest.TestCase):
             self.assertEqual(payload["reason"], "focus_not_planner", payload)
             self.assertEqual(payload["resolution"]["source"], "pane_index", payload)
         self.assertEqual(self.herdr_calls(), [], "no herdr call may happen before the focus gate")
-
     def test_action_output_includes_resolution_source(self) -> None:
         # Every action answers one JSON object carrying `resolution` with all four
         # fields, and pair.status is read-only: state.json survives byte for byte.
@@ -4035,7 +3319,6 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(json.loads(explicit.stdout)["resolution"]["source"], "explicit")
         self.assertEqual(json.loads(indexed.stdout)["resolution"]["source"], "pane_index")
         self.assertEqual(state_path.read_text(encoding="utf-8"), before)
-
     def test_resume_now_returns_reason_without_sending(self) -> None:
         # A record exists but its epoch has not advanced: resume-deliver's own
         # reason must reach the action's stdout verbatim, exit 2, no prompt sent.
@@ -4050,7 +3333,6 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(payload["via"], "plugin")
         self.assertEqual(payload["resolution"]["source"], "pane_index")
         self.assertEqual(self.prompts(), [], self.herdr_calls())
-
     def test_dispatch_prepared_sends_registered_handoff(self) -> None:
         # A first CLI round binds w1:p2 as this state's executor.
         first = self.send_round(1)
@@ -4105,7 +3387,6 @@ class PairctlTest(unittest.TestCase):
         state = self.read_state()
         self.assertEqual(state["rounds"][-1]["executor"], "w1:p2")
         self.assertEqual(state["rounds"][-1]["status"], "active")
-
     def test_dispatch_prepared_without_registration_reports_nothing_prepared(self) -> None:
         proc = self.run_action("pair.dispatch-prepared", context=self.action_context())
         self.assertEqual(proc.returncode, 2, proc.stderr + proc.stdout)
@@ -4113,9 +3394,8 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(payload["reason"], "nothing_prepared")
         self.assertIn("resolution", payload)
         self.assertEqual(self.prompts(), [], self.herdr_calls())
-
     def test_plugin_manifest_lists_section6_actions(self) -> None:
-        manifest_path = Path(__file__).resolve().parents[1] / "herdr-plugin.toml"
+        manifest_path = SKILL / "herdr-plugin.toml"
         manifest = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
         actions = manifest.get("actions")
         self.assertIsInstance(actions, list)
@@ -4148,35 +3428,6 @@ class PairctlTest(unittest.TestCase):
             ["pane.agent_status_changed", "pane.exited"],
             events,
         )
-
-    # --- issue #14: popup board + sidebar replay --------------------------------
-
-    STATUS_PANE = Path(__file__).resolve().parents[1] / "hooks" / "status_pane.py"
-    STARTUP_HOOK = Path(__file__).resolve().parents[1] / "hooks" / "on_startup.py"
-
-    def run_plugin_hook(
-        self, script: Path, extra_env: dict[str, str] | None = None
-    ) -> subprocess.CompletedProcess[str]:
-        """Run a hook script black-box with the same injected environment as invoke()."""
-        env = os.environ.copy()
-        env["XDG_STATE_HOME"] = str(self.state_home)
-        env["PAIRCTL"] = str(SCRIPT)
-        env["PAIRCTL_STATE_JSON"] = str(self.state / "state.json")
-        env["PAIRCTL_HERDR"] = str(self.herdr)
-        env.pop("PAIRCTL_AUTO_COMPACT", None)
-        env["PAIRCTL_CONTINUE_AFTER_COMPACT"] = "0"
-        env.pop("PAIRCTL_CWD", None)
-        env.pop("PAIRCTL_STATE_DIR", None)
-        env.pop("HERDR_PLUGIN_STATE_DIR", None)
-        env.pop("HERDR_PLUGIN_CONTEXT_JSON", None)
-        env.pop("HERDR_SOCKET_PATH", None)
-        if extra_env:
-            env.update(extra_env)
-        return subprocess.run(
-            ["python3", str(script)],
-            text=True, capture_output=True, check=False, env=env,
-        )
-
     def test_status_payload_includes_board_fields(self) -> None:
         sent = self.send_round(1)
         payload = self.invoke_ok("status")
@@ -4210,7 +3461,6 @@ class PairctlTest(unittest.TestCase):
         self.assertIsInstance(age, int, pending)
         self.assertGreaterEqual(age, 0, pending)
         self.assertLessEqual(abs(age - expect), 30, pending)
-
     def test_status_pane_prints_rate_limited_notice(self) -> None:
         state = self.read_state()
         state.setdefault("notices", []).append({
@@ -4229,7 +3479,6 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
         self.assertIn("herdr-pair resume expired", proc.stdout)
         self.assertIn("shown=false", proc.stdout)
-
     def test_pair_status_opens_popup_from_executor_focus(self) -> None:
         # send-round binds w1:p2 into the pane index as the executor: the
         # read-only status action resolves from that focus and still opens the
@@ -4257,42 +3506,6 @@ class PairctlTest(unittest.TestCase):
             self.herdr_calls(),
         )
         self.assertEqual(state_path.read_bytes(), before)
-
-    def startup_replay(self, plugin_state: Path, sock_path: str) -> list[dict]:
-        """Run on_startup.py against a one-shot unix listener; return received frames."""
-        received: list[bytes] = []
-        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        listener.bind(sock_path)
-        listener.listen(1)
-        listener.settimeout(10)
-
-        def serve() -> None:
-            try:
-                conn, _ = listener.accept()
-            except socket.timeout:
-                return
-            finally:
-                listener.close()
-            with conn:
-                conn.settimeout(5)
-                data = b""
-                while not data.endswith(b"\n"):
-                    chunk = conn.recv(4096)
-                    if not chunk:
-                        break
-                    data += chunk
-                received.append(data)
-
-        thread = threading.Thread(target=serve, daemon=True)
-        thread.start()
-        proc = self.run_plugin_hook(self.STARTUP_HOOK, extra_env={
-            "HERDR_PLUGIN_STATE_DIR": str(plugin_state),
-            "HERDR_SOCKET_PATH": sock_path,
-        })
-        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
-        thread.join(timeout=15)
-        return [json.loads(raw) for raw in received if raw.strip()]
-
     def test_startup_replays_saved_sidebar_view(self) -> None:
         self.send_round(1)
         plugin_state = self.root / "plugin-state"
@@ -4323,9 +3536,8 @@ class PairctlTest(unittest.TestCase):
         (plugin_state / "sidebar-view.json").unlink()
         frames = self.startup_replay(plugin_state, str(self.root / "herdr2.sock"))
         self.assertEqual(frames, [], frames)
-
     def test_plugin_manifest_lists_popup_pane_and_startup(self) -> None:
-        manifest_path = Path(__file__).resolve().parents[1] / "herdr-plugin.toml"
+        manifest_path = SKILL / "herdr-plugin.toml"
         manifest = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
         panes = [
             p for p in (manifest.get("panes") or []) if p.get("id") == "pair-status"
@@ -4358,56 +3570,6 @@ class PairctlTest(unittest.TestCase):
         )
         self.assertTrue(self.STATUS_PANE.resolve().is_file())
         self.assertTrue(self.STARTUP_HOOK.resolve().is_file())
-
-    # --- issue #16: herdr 0.8.0 real-machine fixes -----------------------------
-
-    # Round-15 finding: HERDR_PLUGIN_EVENT_JSON is an envelope
-    # {"event": "<snake_name>", "data": {pane_id, agent_status, ...}}, while the
-    # hooks used to read pane_id/agent_status at the top level. A stub pairctl
-    # records the argv each hook would run so flat and enveloped payloads can be
-    # compared call-for-call.
-    def run_status_hook_argv(
-        self,
-        event_json: dict,
-        pairctl: Path,
-        *,
-        extra_env: dict[str, str] | None = None,
-    ) -> subprocess.CompletedProcess[str]:
-        env = os.environ.copy()
-        env["XDG_STATE_HOME"] = str(self.state_home)
-        env["PAIRCTL_HERDR"] = str(self.herdr)
-        env["PAIRCTL"] = str(pairctl)
-        env["HERDR_PLUGIN_EVENT"] = "pane.agent_status_changed"
-        env["HERDR_PLUGIN_EVENT_JSON"] = json.dumps(event_json)
-        env.pop("HERDR_PLUGIN_STATE_DIR", None)
-        if extra_env:
-            env.update(extra_env)
-        return subprocess.run(
-            ["python3", str(PLUGIN_HOOK)],
-            text=True, capture_output=True, check=False, env=env,
-        )
-
-    def run_exited_hook_argv(
-        self,
-        event_json: dict,
-        pairctl: Path,
-        *,
-        extra_env: dict[str, str] | None = None,
-    ) -> subprocess.CompletedProcess[str]:
-        env = os.environ.copy()
-        env["XDG_STATE_HOME"] = str(self.state_home)
-        env["PAIRCTL_HERDR"] = str(self.herdr)
-        env["PAIRCTL"] = str(pairctl)
-        env["HERDR_PLUGIN_EVENT"] = "pane.exited"
-        env["HERDR_PLUGIN_EVENT_JSON"] = json.dumps(event_json)
-        env.pop("HERDR_PLUGIN_STATE_DIR", None)
-        if extra_env:
-            env.update(extra_env)
-        return subprocess.run(
-            ["python3", str(self.PANE_EXITED_HOOK)],
-            text=True, capture_output=True, check=False, env=env,
-        )
-
     def test_event_hooks_read_envelope_payload(self) -> None:
         stub = self.write_pairctl_stub()
 
@@ -4458,22 +3620,6 @@ class PairctlTest(unittest.TestCase):
         proc = self.run_exited_hook_argv(envelope, stub)
         self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
         self.assertEqual(self.stub_calls(), flat_calls, self.stub_calls())
-
-    def write_second_herdr(self) -> Path:
-        other = self.root / "fake-herdr-b"
-        other.write_text(FAKE_HERDR, encoding="utf-8")
-        os.chmod(other, 0o755)
-        return other
-
-    def second_herdr_calls(self, other: Path) -> list[list[str]]:
-        path = Path(str(other) + ".calls.jsonl")
-        if not path.exists():
-            return []
-        return [
-            json.loads(line)["argv"][1:]
-            for line in path.read_text(encoding="utf-8").splitlines() if line.strip()
-        ]
-
     def test_action_uses_herdr_bin_path(self) -> None:
         # Round-15 finding: plugin processes have HERDR_BIN_PATH but no herdr on
         # PATH. With PAIRCTL_HERDR unset the action's herdr calls must land on
@@ -4496,7 +3642,6 @@ class PairctlTest(unittest.TestCase):
         self.assertIn(["agent", "focus", "w1:p1"], calls, calls)
         # And the default binary must not have been touched.
         self.assertEqual(self.herdr_calls(), [], self.herdr_calls())
-
     def test_hook_notify_uses_herdr_bin_path(self) -> None:
         # notify.py's pairctl-failed notification goes through the same binary
         # resolution: no PAIRCTL_HERDR -> HERDR_BIN_PATH.
@@ -4520,7 +3665,6 @@ class PairctlTest(unittest.TestCase):
         calls = self.second_herdr_calls(other)
         notified = [c for c in calls if c[:2] == ["notification", "show"]]
         self.assertEqual(len(notified), 1, calls)
-
     def test_hook_resume_deliver_uses_herdr_bin_path(self) -> None:
         # Real plugin environment: no PAIRCTL_HERDR, no herdr on PATH, only
         # HERDR_BIN_PATH. The pairctl child spawned by the hook must still reach
@@ -4555,7 +3699,6 @@ class PairctlTest(unittest.TestCase):
         self.assertEqual(len(prompts), 1, self.second_herdr_calls(other))
         self.assertEqual(self.herdr_calls(), [], self.herdr_calls())
         self.assertEqual(self.read_state()["resume_pending"]["status"], "delivered")
-
     def test_spawned_watcher_receives_absolute_state_dir(self) -> None:
         # Round-15 finding: compact-self propagated a relative --state-dir into
         # the detached watcher, whose cwd is the state root -> the child looked
@@ -4591,7 +3734,6 @@ class PairctlTest(unittest.TestCase):
         log_path = self.state / "compact-continue.log"
         text = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
         self.assertNotIn("pair state is not initialized", text)
-
 
 if __name__ == "__main__":
     unittest.main()
