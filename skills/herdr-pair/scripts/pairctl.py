@@ -1686,7 +1686,11 @@ def compact_instructions(pp: dict[str, Path], data: dict[str, Any], kind: str) -
     rollover = (
         "The SessionStart hook records the pairctl rollover automatically."
         if kind == "claude"
-        else f"then run python3 {PAIRCTL_SCRIPT} rollover --reason compact --new-session-id <your session id>"
+        else ("The installed Pi bridge records rollover after session_compact; if absent or "
+              f"unsuccessful, run python3 {PAIRCTL_SCRIPT} rollover --reason compact "
+              "--new-session-id <your session id> after verifying compaction completed."
+              if kind == "pi" else
+              f"then run python3 {PAIRCTL_SCRIPT} rollover --reason compact --new-session-id <your session id>")
     )
     active = [r for r in data.get("rounds", []) if r.get("status") == "active"]
     if active:
@@ -1719,7 +1723,14 @@ def probe_resume_mechanism(args: argparse.Namespace, kind: str) -> str:
     exit, bad envelope, missing plugins, disabled plugin, non-Claude planner —
     means 'watcher'. Probing is best-effort and never fails the compact queue.
     """
-    if kind != "claude":
+    if kind == "pi":
+        # Only an actual installed bridge counts. A copied file is not tied to this
+        # skill's pairctl version; require a symlink to the maintained extension.
+        bridge = Path(__file__).resolve().parent.parent / "pi" / "herdr-pair.ts"
+        installed = Path(os.environ.get("PAIRCTL_PI_EXTENSION_PATH", "~/.pi/agent/extensions/herdr-pair.ts")).expanduser()
+        if not installed.is_symlink() or installed.resolve() != bridge.resolve():
+            return "watcher"
+    elif kind != "claude":
         return "watcher"
     try:
         code, _out, _err, payload = run_herdr(args, ["plugin", "list", "--json"])
