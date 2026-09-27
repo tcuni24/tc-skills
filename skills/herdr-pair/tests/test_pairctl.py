@@ -2508,6 +2508,20 @@ class PairctlTest(unittest.TestCase):
                 record = self.read_state()["resume_pending"]
                 self.assertEqual(record["mechanism"], expected)
 
+    def test_pi_plugin_requires_installed_bridge(self) -> None:
+        plugins = Path(str(self.herdr) + ".plugins.json")
+        plugins.write_text(json.dumps([{"plugin_id": "tc.herdr-pair", "enabled": True}]))
+        self.set_kind("pi")
+        with tempfile.TemporaryDirectory() as tmp:
+            installed = Path(tmp) / "herdr-pair.ts"
+            env = {**self.RECORD_ENV, "PAIRCTL_PI_EXTENSION_PATH": str(installed)}
+            self.invoke_ok("compact-self", extra_env=env)
+            self.assertEqual(self.read_state()["resume_pending"]["mechanism"], "watcher")
+            self.invoke_ok("rollover", "--reason", "compact")
+            installed.symlink_to(SCRIPT.parent.parent / "pi" / "herdr-pair.ts")
+            self.invoke_ok("compact-self", extra_env=env)
+            self.assertEqual(self.read_state()["resume_pending"]["mechanism"], "plugin")
+
     def test_continue_disabled_skips_record_and_watcher(self) -> None:
         # invoke() defaults PAIRCTL_CONTINUE_AFTER_COMPACT=0: compact still queues,
         # but no record is written, no watcher spawns, and no probe runs.
