@@ -1,7 +1,7 @@
 ---
 name: nextflow-workflow-skills
 description: Write your own Nextflow (DSL2 / 25.10+) pipelines — processes, channels, typed params, modular subworkflows, production-grade configs, executor profiles. Use when the user asks to author or refactor `.nf` scripts, design a samplesheet-driven pipeline, build modules/subworkflows, write a `nextflow.config`, set up `withLabel`/`withName` resource tiers, port to SLURM/AWS/K8s, or migrate to strict syntax / typed processes. NOT for running nf-core pipelines as a user — but the skill borrows the structural patterns proven by nf-core/rnaseq 3.26 and nf-core/sarek 3.8 as the reference layout for your own pipeline.
-license: Apache-2.0
+license: MIT
 ---
 
 # Nextflow Workflow Skills

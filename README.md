@@ -159,8 +159,3 @@ python3 -m pytest -q
 
 Distributed under the [MIT License](LICENSE).
 
-One exception: `skills/nextflow-workflow-skills/` ships under its own
-[Apache-2.0 License](skills/nextflow-workflow-skills/LICENSE), with a
-[NOTICE](skills/nextflow-workflow-skills/NOTICE) recording the nf-core
-references behind its examples.
-

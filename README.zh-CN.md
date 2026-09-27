@@ -158,7 +158,3 @@ python3 -m pytest -q
 ## 📄 开源许可
 
 本项目基于 [MIT License](LICENSE) 协议开源。
-
-唯一例外是 `skills/nextflow-workflow-skills/`：该目录沿用自身的
-[Apache-2.0 License](skills/nextflow-workflow-skills/LICENSE)，并在
-[NOTICE](skills/nextflow-workflow-skills/NOTICE) 中记录其示例所参考的 nf-core 项目。
