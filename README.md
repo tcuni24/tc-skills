@@ -86,7 +86,8 @@ This repository follows the open Agent Skill specification and works seamlessly 
 
 ## 📁 Repository Layout
 
-The structure follows the [antfu/skills](https://github.com/antfu/skills) pattern:
+The structure follows the [antfu/skills](https://github.com/antfu/skills) pattern. Tests live
+outside the skill packages, so an installed skill ships only what it needs at runtime.
 
 ```text
 tc-skills/
@@ -95,15 +96,33 @@ tc-skills/
 │   │   ├── SKILL.md            # Skill instructions, triggers, and execution protocol
 │   │   ├── references/         # Deep reference documents (specs, styles, templates)
 │   │   ├── scripts/            # Standalone automation tools (Python / Shell)
-│   │   └── tests/              # Regression and unit tests
-│   ├── herdr-pair/
+│   │   └── agents/openai.yaml  # Entry metadata for agent hosts that surface it
+│   ├── herdr-pair/             # Also a Herdr plugin
 │   │   ├── SKILL.md
-│   │   ├── scripts/
-│   │   └── tests/
+│   │   ├── references/
+│   │   ├── scripts/            # pairctl.py (thin entry) + the pairctl/ package
+│   │   ├── hooks/              # Plugin hooks and the pair-status popup
+│   │   ├── herdr-plugin.toml   # Plugin manifest: events, actions, panes, startup
+│   │   └── agents/openai.yaml
 │   └── ...
+├── tests/<skill>/              # Regression and unit tests, one directory per skill
+├── docs/
+│   ├── agents/                 # Repo conventions for agents (issue tracker, labels, domain)
+│   ├── adr/                    # Architectural decision records
+│   ├── specs/                  # Issue specs
+│   ├── reports/                # herdr-pair round reports, kept for the record
+│   ├── reviews/                # Repository assessments
+│   └── analysis/               # One-off analysis artifacts, kept for the record
+├── .github/workflows/test.yml  # CI: pytest on Python 3.11 and 3.13
+├── pyproject.toml              # Python floor (>= 3.11) and dependencies
+├── requirements-dev.txt        # Test dependencies
 ├── README.md                   # English documentation
 └── README.zh-CN.md             # Chinese documentation
 ```
+
+`skills/herdr-pair/` doubles as a Herdr plugin; install it with
+`herdr plugin link <repo>/skills/herdr-pair --enabled` (details in
+[skills/herdr-pair/README.md](skills/herdr-pair/README.md)).
 
 ### Skill Structure Conventions
 
@@ -111,7 +130,17 @@ Each skill in `skills/<name>/` is a self-contained, modular package:
 - `SKILL.md` — Mandatory entrypoint containing YAML frontmatter (`name`, `description`) and comprehensive operational guidance.
 - `scripts/` — Deterministic helper scripts invoked directly by agents or CI.
 - `references/` — Detailed background, domain models, or edge-case handling rules loaded on-demand.
-- `tests/` — Automated test suite verifying the skill scripts and contracts.
+- `agents/openai.yaml` — Entry metadata for hosts that surface it; optional, but keep it in sync with the frontmatter.
+
+Tests are the one exception: they live in the top-level `tests/<skill>/`, because only tracked
+files inside `skills/` are installed, and a regression suite is not part of what a user installs.
+
+### Running the tests
+
+```bash
+python3 -m pip install -r requirements-dev.txt   # Python >= 3.11
+python3 -m pytest -q
+```
 
 ---
 
@@ -120,7 +149,7 @@ Each skill in `skills/<name>/` is a self-contained, modular package:
 1. Fork this repository.
 2. Create a new skill directory under `skills/<skill-name>/` following the layout above.
 3. Ensure your `SKILL.md` includes clear `name` and `description` frontmatter metadata.
-4. Add automated tests under `skills/<skill-name>/tests/` if your skill includes scripts.
+4. Add automated tests under `tests/<skill-name>/` if your skill includes scripts.
 5. Update `README.md` and `README.zh-CN.md` with the new skill's summary.
 6. Submit a Pull Request!
 

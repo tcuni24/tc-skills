@@ -311,8 +311,13 @@ class Renderer:
 
     def b_table(self, b):
         cols = b["columns"]
+        # The class attribute is built outside the f-string: a backslash inside
+        # an f-string expression is PEP 701 (Python 3.12+) only and this script
+        # still runs on 3.11.
         ths = "".join(
-            f'<th{" class=\"number\"" if c.get("number") else ""}>{esc(c["header"])}</th>' for c in cols
+            f'<th{cls}>{esc(c["header"])}</th>'
+            for c in cols
+            for cls in (' class="number"' if c.get("number") else "",)
         )
         trs = []
         for row in b.get("rows", []):

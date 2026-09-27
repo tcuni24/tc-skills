@@ -12,7 +12,7 @@ herdr plugin link <仓库根>/skills/herdr-pair --enabled
 
 清单里的动作 id 用不含点号的名字（`pair-status`、`pair-focus-planner` 等；herdr 0.8.0 拒绝含点的动作 id，报 `invalid_plugin_action_id`），但每个 command 仍把带点号的动作名传给 `hooks/action.py`。link 仓库目录即可，不需要任何预处理。
 
-插件子进程的 `PATH` 里没有 `herdr`，但宿主注入 `HERDR_BIN_PATH`。`hooks/action.py` 与 `hooks/notify.py` 按 `PAIRCTL_HERDR` → `HERDR_BIN_PATH` → 字面量 `herdr` 的顺序解析可执行文件，所以在插件环境里能直接调通；调试时设 `PAIRCTL_HERDR` 可指向自己的假二进制。
+插件子进程的 `PATH` 里没有 `herdr`，但宿主注入 `HERDR_BIN_PATH`。解析顺序 **`--herdr` → `PAIRCTL_HERDR` → `HERDR_BIN_PATH` → 字面量 `herdr`** 只在 `herdr_bin.py` 里实现一次，`hooks/action.py`、`hooks/notify.py` 与 `pairctl` 都 import 它，所以在插件环境里能直接调通；调试时设 `PAIRCTL_HERDR` 可指向自己的假二进制。改顺序只需改 `herdr_bin.py`，不要再在调用点各写一份。
 
 ## pairctl 路径
 

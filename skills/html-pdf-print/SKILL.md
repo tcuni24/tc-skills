@@ -1,6 +1,6 @@
 ---
 name: html-pdf-print
-description: 优化 HTML 报告经浏览器打印为 PDF 时的分页、图文截断、表格续页与页脚位置。用于“报告打印被切断”“页脚不在页底”等问题，并以含真实图片的 PDF 验证；不用于仅编辑现有 PDF 或重设计报告内容。
+description: Use when a browser-printed HTML report gets clipped figures or tables, breaks mid-block, or puts the footer somewhere other than the page bottom — “报告打印被切断”, “页脚不在页底”, “PDF 分页优化”. Fixes print-to-PDF pagination for image-heavy HTML reports and verifies the result against a real PDF with real images; not for editing an existing PDF alone, or for redesigning report content.
 ---
 
 # HTML 报告打印优化

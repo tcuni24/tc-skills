@@ -1,0 +1,4 @@
+interface:
+  display_name: "Nextflow Workflow Skills"
+  short_description: "Author and refactor Nextflow DSL2 pipelines with typed params and production configs"
+  default_prompt: "Use $nextflow-workflow-skills to author or refactor this Nextflow pipeline."

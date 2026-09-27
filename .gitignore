@@ -10,3 +10,10 @@ __pycache__/
 .claude/
 skills-lock.json
 issue-snapshot.json
+
+# NFS silly-rename residue (a deleted file that was still open)
+.nfs*
+
+# Test scratch directories, created next to the test that uses them
+tests/**/tmp*/
+tests/**/plot-kit-*/

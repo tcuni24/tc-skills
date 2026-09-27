@@ -1,7 +1,7 @@
 # Issue 2 implementation acceptance
 
 Branch: `feat/herdr-pair-context-budget`; baseline: `f5e8126`.
-Formal specification: [issue-2-herdr-pair-context-budget.md](../../docs/specs/issue-2-herdr-pair-context-budget.md).
+Formal specification: [issue-2-herdr-pair-context-budget.md](../../specs/issue-2-herdr-pair-context-budget.md).
 All changes remain uncommitted. Pre-existing `AGENTS.md`, `docs/` and the HYF audit directory were preserved.
 
 ## Verification

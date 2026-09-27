@@ -9,7 +9,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SKILL_DIR = REPO_ROOT / "skills" / "customer-delivery"
+SCRIPTS_DIR = SKILL_DIR / "scripts"
 AUDIT_SCRIPT = SCRIPTS_DIR / "audit_delivery.py"
 
 
@@ -105,7 +107,7 @@ class AuditDeliveryTests(unittest.TestCase):
             self.assertIn("自定义术语", res.stdout)
 
     def test_voice_terms_and_repeated_terms_file(self):
-        voice_terms = Path(__file__).resolve().parent.parent / "references" / "voice-terms.txt"
+        voice_terms = SKILL_DIR / "references" / "voice-terms.txt"
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             (root / "project.xlsx").write_bytes(b"dummy")

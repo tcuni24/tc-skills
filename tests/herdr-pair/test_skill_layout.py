@@ -9,7 +9,7 @@ import tempfile
 import unittest
 
 
-SKILL = Path(__file__).resolve().parents[1]
+SKILL = Path(__file__).resolve().parents[2] / "skills" / "herdr-pair"
 PAIRCTL = SKILL / "scripts" / "pairctl.py"
 
 
@@ -20,7 +20,7 @@ class SkillLayoutTest(unittest.TestCase):
         for keyword in ("context-usage", "/tmp", "check-round", "ack-round", "finish-round --report"):
             self.assertIn(keyword, text)
         for name in ("handoff", "verification", "recovery", "executor-resolution", "common-requests"):
-            relative = f"reference/{name}.md"
+            relative = f"references/{name}.md"
             self.assertTrue((SKILL / relative).is_file(), relative)
             self.assertIn(relative, text)
 
@@ -50,3 +50,23 @@ class SkillLayoutTest(unittest.TestCase):
             self.assertEqual(started["status"], "round_started")
             state = json.loads((root / "state" / "state.json").read_text())
             self.assertEqual(state["rounds"][0]["report"], str(cwd / "reports" / "round-report.md"))
+
+    def test_herdr_binary_resolution_lives_in_one_module(self):
+        """A6: --herdr / PAIRCTL_HERDR / HERDR_BIN_PATH is resolved exactly once."""
+        resolver = SKILL / "herdr_bin.py"
+        self.assertTrue(resolver.is_file(), resolver)
+        self.assertIn('os.environ.get("HERDR_BIN_PATH")', resolver.read_text(encoding="utf-8"))
+        for consumer in (
+            SKILL / "hooks" / "action.py",
+            SKILL / "hooks" / "notify.py",
+            SKILL / "scripts" / "pairctl" / "herdr.py",
+        ):
+            self.assertIn("resolve_herdr", consumer.read_text(encoding="utf-8"), consumer)
+        offenders = sorted(
+            str(path.relative_to(SKILL))
+            for path in SKILL.rglob("*.py")
+            if "tests" not in path.parts
+            and path != resolver
+            and 'os.environ.get("HERDR_BIN_PATH")' in path.read_text(encoding="utf-8")
+        )
+        self.assertEqual(offenders, [], "herdr resolution duplicated outside herdr_bin.py")
