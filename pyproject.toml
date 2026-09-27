@@ -1,0 +1,22 @@
+[project]
+name = "tc-skills"
+version = "0.0.0"
+description = "A curated collection of production-grade agent skills."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+# The skills themselves are dependency-free Python scripts; these are the only
+# third-party packages any of them (or their tests) import.
+dependencies = [
+    "matplotlib>=3.8",
+    "openpyxl>=3.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--strict-markers"

@@ -1,0 +1,5 @@
+# Test and script dependencies. Python >= 3.11 is required (see pyproject.toml);
+# skills/herdr-pair/tests/test_pairctl.py imports tomllib from the stdlib.
+pytest>=8.0
+matplotlib>=3.8
+openpyxl>=3.1
