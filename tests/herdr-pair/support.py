@@ -16,13 +16,13 @@ import json
 import os
 from pathlib import Path
 import re
-import select
 import signal
 import socket
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import tomllib
 import unittest
@@ -31,6 +31,65 @@ import unittest
 # worktree) must put its case directories somewhere shorter than the tests dir.
 SOCKET_PATH_LIMIT = 100
 SOCKET_NAME = "herdr.sock"
+
+
+class ViewSocket:
+    """Tiny herdr socket server for hooks that validate the agent view.
+
+    Answers `agent.list` with the supplied live pane ids and records every
+    `agent.view.set` / `agent.view.clear` frame the hook sends, so a test can
+    assert both the query and the pruning without a real herdr.
+    """
+
+    def __init__(self, path: str, live: list[str]):
+        self.path = path
+        self.live = list(live)
+        self.frames: list[dict] = []
+        self._listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._listener.bind(path)
+        self._listener.listen(4)
+        self._listener.settimeout(0.2)
+        self._stop = False
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+
+    def __enter__(self) -> "ViewSocket":
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._stop = True
+        self._thread.join(timeout=3.0)
+        self._listener.close()
+
+    def _serve(self) -> None:
+        while not self._stop:
+            try:
+                conn, _ = self._listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            with conn:
+                conn.settimeout(5.0)
+                data = b""
+                while b"\n" not in data:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+                if not data.strip():
+                    continue
+                request = json.loads(data.split(b"\n", 1)[0])
+                if request.get("method") == "agent.list":
+                    result = {
+                        "type": "agent_list",
+                        "agents": [{"pane_id": pane_id} for pane_id in self.live],
+                    }
+                else:
+                    self.frames.append(request)
+                    result = {"type": "agent_view", "active": True}
+                reply = {"id": request.get("id"), "result": result}
+                conn.sendall((json.dumps(reply) + "\n").encode("utf-8"))
 
 
 def temp_root() -> tempfile.TemporaryDirectory[str]:
@@ -610,34 +669,24 @@ class PairctlCase(unittest.TestCase):
             ["python3", str(script)],
             text=True, capture_output=True, check=False, env=env,
         )
-    def startup_replay(self, plugin_state: Path, sock_path: str) -> list[dict]:
-        """Run on_startup.py against a one-shot unix listener; return received frames."""
-        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        listener.bind(sock_path)
-        listener.listen(1)
-        try:
+    def startup_replay(
+        self, plugin_state: Path, sock_path: str, live: list[str] | None = None,
+    ) -> list[dict]:
+        """Run on_startup.py against a view socket; return set/clear frames.
+
+        `live` is the agent list the hook sees (defaults to the fixture's two
+        panes). agent.list probes are answered, not returned, so callers keep
+        asserting only on the view the hook actually applies.
+        """
+        with ViewSocket(
+            sock_path, ["w1:p1", "w1:p2"] if live is None else live
+        ) as server:
             proc = self.run_plugin_hook(self.STARTUP_HOOK, extra_env={
                 "HERDR_PLUGIN_STATE_DIR": str(plugin_state),
                 "HERDR_SOCKET_PATH": sock_path,
             })
             self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
-            # The hook has already exited, so a connection it made is queued by
-            # now: the "hook writes nothing" case must not wait out a timeout.
-            ready, _, _ = select.select([listener], [], [], 2.0)
-            if not ready:
-                return []
-            conn, _ = listener.accept()
-            with conn:
-                conn.settimeout(5)
-                data = b""
-                while not data.endswith(b"\n"):
-                    chunk = conn.recv(4096)
-                    if not chunk:
-                        break
-                    data += chunk
-            return [json.loads(data)] if data.strip() else []
-        finally:
-            listener.close()
+        return server.frames
     def run_status_hook_argv(
         self,
         event_json: dict,

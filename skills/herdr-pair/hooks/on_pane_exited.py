@@ -12,8 +12,10 @@ and runs, once per distinct (cwd, state_dir) of every fresh entry:
 pairctl owns the whole decision: an executor pane records
 executor_pane_gone_at and short-reports the planner, a planner pane expires the
 owed resume and notifies the human, anything unmatched answers "ignored". The
-hook itself never reads or writes state.json and never imports pairctl. Its
-only herdr call is the one-time failure notification in notify.py.
+hook itself never reads or writes state.json and never imports pairctl. It also
+asks sidebar_view to drop the exited pane from the saved agent-panel filter, so
+a closed pane cannot leave the sidebar matching nothing; the only other herdr
+calls are the one-time failure notification in notify.py and that view upkeep.
 
 Contractual rules:
 
@@ -37,8 +39,10 @@ import sys
 from pathlib import Path
 
 # Same directory as this hook: log paths, the pairctl runner, and the one-time
-# failure notification live in notify.py so neither module imports the other's.
+# failure notification live in notify.py so neither module imports the other's;
+# sidebar_view keeps the saved agent-panel filter from outliving this pane.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import sidebar_view  # noqa: E402
 from notify import append_log, notify_pairctl_failed, run_pairctl  # noqa: E402
 
 DEFAULT_STALE_HOURS = 12.0
@@ -119,6 +123,9 @@ def main() -> int:
     pane_id = str(payload.get("pane_id") or "")
     if not pane_id:
         return 0
+    # The sidebar filter is a pane-id snapshot: drop this pane before any pair
+    # lookup, so an exit still heals the view when the pair index has no hit.
+    sidebar_view.pane_exited(pane_id)
     targets = fresh_targets(pane_id)
     if not targets:
         return 0  # zero hit or only stale entries: completely silent

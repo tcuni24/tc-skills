@@ -3536,6 +3536,85 @@ class PairctlTest(support.PairctlCase):
         (plugin_state / "sidebar-view.json").unlink()
         frames = self.startup_replay(plugin_state, str(self.root / "herdr2.sock"))
         self.assertEqual(frames, [], frames)
+    def test_startup_prunes_or_clears_stale_sidebar_panes(self) -> None:
+        plugin_state = self.root / "plugin-state-stale"
+        plugin_state.mkdir()
+        view_path = plugin_state / "sidebar-view.json"
+        def save(values: list[str]) -> None:
+            view_path.write_text(json.dumps({
+                "source": "tc.herdr-pair",
+                "label": "herdr-pair",
+                "filter": {"op": "in", "field": "pane_id", "values": values},
+            }) + "\n", encoding="utf-8")
+        # One live planner + one dead executor: replay only the live pane and
+        # narrow the snapshot so the dead id is not retried next time.
+        save(["w1:p1", "w9:p9"])
+        frames = self.startup_replay(
+            plugin_state, str(self.root / "stale1.sock"), live=["w1:p1"]
+        )
+        self.assertEqual([f.get("method") for f in frames], ["agent.view.set"], frames)
+        self.assertEqual(
+            frames[0]["params"]["filter"]["values"], ["w1:p1"], frames
+        )
+        saved = json.loads(view_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["filter"]["values"], ["w1:p1"])
+        # Every saved pane is gone: clear the view instead of applying a filter
+        # that can only answer "no matching agents".
+        save(["w9:p1", "w9:p2"])
+        frames = self.startup_replay(
+            plugin_state, str(self.root / "stale2.sock"), live=["w1:p1"]
+        )
+        self.assertEqual([f.get("method") for f in frames], ["agent.view.clear"], frames)
+        self.assertEqual(frames[0]["params"], {"source": "tc.herdr-pair"})
+        self.assertFalse(view_path.exists())
+        # Agent detection still settling: an empty list proves nothing, so the
+        # hook applies nothing and leaves the snapshot for the next start.
+        save(["w9:p1"])
+        frames = self.startup_replay(
+            plugin_state, str(self.root / "stale3.sock"), live=[]
+        )
+        self.assertEqual(frames, [], frames)
+        self.assertTrue(view_path.exists())
+    def test_pane_exit_prunes_or_clears_saved_sidebar_view(self) -> None:
+        plugin_state = self.root / "plugin-state-exit"
+        plugin_state.mkdir()
+        view_path = plugin_state / "sidebar-view.json"
+        def save(values: list[str]) -> None:
+            view_path.write_text(json.dumps({
+                "source": "tc.herdr-pair",
+                "label": "herdr-pair",
+                "filter": {"op": "in", "field": "pane_id", "values": values},
+            }) + "\n", encoding="utf-8")
+        save(["w1:p1", "w1:p2"])
+        sock_path = str(self.root / "exit1.sock")
+        with support.ViewSocket(sock_path, ["w1:p1"]) as server:
+            proc = self.run_exited_hook(pane_id="w1:p2", extra_env={
+                "HERDR_PLUGIN_STATE_DIR": str(plugin_state),
+                "HERDR_SOCKET_PATH": sock_path,
+            })
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(
+            [f.get("method") for f in server.frames], ["agent.view.set"], server.frames
+        )
+        self.assertEqual(
+            server.frames[0]["params"]["filter"]["values"], ["w1:p1"], server.frames
+        )
+        saved = json.loads(view_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["filter"]["values"], ["w1:p1"])
+        # The last filtered pane exits: clear and drop the snapshot.
+        save(["w1:p1"])
+        sock_path = str(self.root / "exit2.sock")
+        with support.ViewSocket(sock_path, []) as server:
+            proc = self.run_exited_hook(pane_id="w1:p1", extra_env={
+                "HERDR_PLUGIN_STATE_DIR": str(plugin_state),
+                "HERDR_SOCKET_PATH": sock_path,
+            })
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(
+            [f.get("method") for f in server.frames], ["agent.view.clear"], server.frames
+        )
+        self.assertEqual(server.frames[0]["params"], {"source": "tc.herdr-pair"})
+        self.assertFalse(view_path.exists())
     def test_plugin_manifest_lists_popup_pane_and_startup(self) -> None:
         manifest_path = SKILL / "herdr-plugin.toml"
         manifest = tomllib.loads(manifest_path.read_text(encoding="utf-8"))

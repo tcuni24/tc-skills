@@ -11,7 +11,9 @@
 # executor focused; pair.resume-now and pair.dispatch-prepared refuse any focus
 # that is not the state's planner pane. pair.status also opens the pair-status
 # popup board below and persists the sidebar view query for the startup hook to
-# replay (issue #14); the popup itself only renders `pairctl status`.
+# replay (issue #14); the saved pane ids are re-validated against live agents on
+# replay and pruned on pane exit, so a closed pair session cannot leave the
+# sidebar matching nothing. The popup itself only renders `pairctl status`.
 id = "tc.herdr-pair"
 name = "herdr-pair resume hook"
 version = "0.1.0"

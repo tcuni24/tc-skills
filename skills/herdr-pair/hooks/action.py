@@ -38,7 +38,10 @@ Action bodies:
                         sidebar view query to
                         $HERDR_PLUGIN_STATE_DIR/sidebar-view.json (replayed by
                         hooks/on_startup.py; the action itself never calls
-                        agent.view.set)
+                        agent.view.set). The snapshot is re-validated against
+                        live agents on replay and pruned on pane exit, so a
+                        stale executor cannot leave a filter that hides every
+                        agent.
 * pair.focus-planner    `herdr agent focus <planner_pane>`
 * pair.focus-executor   `herdr agent focus <active round executor>`; no active
                         executor => exit 2 `no_executor`
@@ -62,14 +65,13 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from herdr_bin import resolve_herdr  # noqa: E402  (skill root added to sys.path above)
+from sidebar_view import PLUGIN_ID, SIDEBAR_LABEL  # noqa: E402
 
 DEFAULT_STALE_HOURS = 12.0
 DEFAULT_STATE_HOME = "~/.local/state"
 HERDR_CALL_TIMEOUT = 30.0
-PLUGIN_ID = "tc.herdr-pair"
-SIDEBAR_LABEL = "herdr-pair"
-SIDEBAR_VIEW_FILE = "sidebar-view.json"
 STATUS_PANE_ENTRYPOINT = "pair-status"
 # Mutating actions: focus must equal the state's planner_pane or they refuse.
 WRITE_ACTIONS = frozenset({"pair.resume-now", "pair.dispatch-prepared"})
@@ -352,12 +354,16 @@ def sidebar_view_params(payload: dict, state: dict | None) -> dict | None:
 
 
 def write_sidebar_view(params: dict) -> None:
-    """Persist the view query for hooks/on_startup.py; failures stay silent."""
+    """Persist the view query for hooks/on_startup.py; failures stay silent.
+
+    The snapshot may name a pane that dies later; on_startup.py and
+    on_pane_exited.py re-validate it against live agents before applying it.
+    """
     base = (os.environ.get("HERDR_PLUGIN_STATE_DIR") or "").strip()
     if not base:
         return
     try:
-        path = Path(base).expanduser() / SIDEBAR_VIEW_FILE
+        path = Path(base).expanduser() / "sidebar-view.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(path.name + ".tmp")
         tmp.write_text(json.dumps(params, ensure_ascii=False) + "\n", encoding="utf-8")
