@@ -36,6 +36,7 @@
 | --- | --- | --- |
 | [`herdr-pair`](skills/herdr-pair/SKILL.md) | 在 Herdr 环境下编排双智能体协作任务（如 Planner/Reviewer 规划把关 + Executor 实施编码），包含严格角色契约、可验证的执行轮次切分、自包含产物交接及防并发冲突锁。 | *"你负责规划让X执行"*, *"协同两个agent"*, *"派给同项目Agent"*, *"你把关让它做"* |
 | [`gitee-pr`](skills/gitee-pr/SKILL.md) | 自动化本地代码提交、分支推送并一键创建 Gitee Pull Request，强制执行团队规范（分支命名检测、规范 commit 前缀、工作区防脏校验）。 | *"创建 Gitee PR"*, *"提交工单 PR"*, *"提交 PR 到 Gitee"* |
+| [`brainstorming-lite`](skills/brainstorming-lite/SKILL.md) | 仅手动触发的决策前头脑风暴：定框问题、发散备选方案（含非显而易见选项）、按最关键的 2–3 个视角比较、pre-mortem / steelman，最后给出推荐与决策摘要。只讨论，不改代码。 | `/brainstorming-lite`（手动调用） |
 
 ### 🧬 生信分析与流程管道 (Bioinformatics & Pipelines)
 

@@ -36,6 +36,7 @@ The skills are organized into focused operational domains:
 | --- | --- | --- |
 | [`herdr-pair`](skills/herdr-pair/SKILL.md) | Coordinate dual-agent tasks (e.g. Planner/Reviewer + Executor) in Herdr with strict role contracts, verifiable execution rounds, artifact-based handoffs, and concurrency safety. | *"你负责规划让X执行"*, *"协同两个agent"*, *"派给同项目Agent"* |
 | [`gitee-pr`](skills/gitee-pr/SKILL.md) | Automate Git commit/push and create Gitee pull requests with team conventions enforcement (branch naming, commit prefixes, clean working trees). | *"创建 Gitee PR"*, *"提交工单 PR"* |
+| [`brainstorming-lite`](skills/brainstorming-lite/SKILL.md) | Manual-only pre-decision brainstorming: frame the problem, diverge on options (including non-obvious ones), compare on the 2–3 lenses that matter, pre-mortem / steelman, then recommend and emit a decision summary. Discussion only, no code changes. | `/brainstorming-lite` (manual invocation) |
 
 ### 🧬 Bioinformatics & Pipelines
 
