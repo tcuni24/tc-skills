@@ -35,6 +35,7 @@
 | state root / `--state-dir` | 状态根 / 状态目录 | `state.json` 所在目录，默认 `$XDG_STATE_HOME/herdr-pair/<cwd-hash>`；所有方必须给出同一个绝对 `--cwd` 与 `--state-dir`。 | `skills/herdr-pair/SKILL.md` §0；`skills/herdr-pair/scripts/pairctl.py`（`default_root`） |
 | pane index | 窗格索引 | 记录"某个 pane 属于哪个 state 目录与角色"的每窗格文件 `$XDG_STATE_HOME/herdr-pair/panes/<pane_id>.json`，只服务插件续跑；`state.json` 仍是唯一事实来源。 | `skills/herdr-pair/scripts/pairctl.py`（`pane_index_path`、`record_pane`）；`skills/herdr-pair/herdr-plugin.toml` |
 | quality kill-switch | 质量停手开关 | §7 质量门：出现"声称改了却无改动、数字无出处、同一指令漏两次、越 fence、解释两次站不住、要重写它大部分产出"时停手并报证据。 | `skills/herdr-pair/SKILL.md` §7；`skills/herdr-pair/references/verification.md#quality-gate` |
+| fleet task (herdr-fleet) | 并行任务 | 主 agent 用 `fleet new` 开出的一个独立任务：`worktrees/<slug>/` 下每个仓库一个 git worktree（分支 `<type>/<slug>`）、一份 `TASK.md`、一个以 slug 命名并运行任务 agent 的 herdr tab；仓库布局由项目根的 `.herdr-fleet.toml` 声明。 | `skills/herdr-fleet/SKILL.md`；`skills/herdr-fleet/references/workflow.md` §配置 |
 | delivery package (customer-delivery) | 交付包 | 交给客户的目录产物：只含一个 Excel 工作簿、一个离线 HTML 报告和一个 `plot/` 目录，内部列名、路径、文件名、日志与流程细节必须剥离。 | `skills/customer-delivery/SKILL.md` §客户交付包生成 |
 | report simplification layer (customer-report-simplify) | 报告精简层 | 在不改交付原件的前提下，另开一份围绕客户问题重排的内容层：正文只回答问题，其余进折叠附录。 | `skills/customer-report-simplify/SKILL.md` §第二步；`skills/customer-report-simplify/scripts/audit_report.py` |
 | print contract (html-pdf-print) | 打印契约 | 打印前先定下的目标浏览器/打印引擎、纸张、缩放，以及页脚是每页重复还是仅末页底部；验收对象是实际生成的 PDF。 | `skills/html-pdf-print/SKILL.md` §先明确打印契约 |
