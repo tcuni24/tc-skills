@@ -125,6 +125,13 @@ const scenarios = {
 		const ctx = makeCtx({ input: async () => Promise.reject(new Error("boom")) });
 		return { results: [await run(tool, { question: "Name?" }, ctx)] };
 	},
+	"update-throw": async () => {
+		const ctx = makeCtx({ input: async () => "x" });
+		const result = await tool.execute("call-1", { question: "Name?" }, undefined, () => {
+			throw new Error("update boom");
+		}, ctx);
+		return { results: [summarize(result)] };
+	},
 	"pre-aborted": async () => {
 		const ctl = new AbortController();
 		ctl.abort();

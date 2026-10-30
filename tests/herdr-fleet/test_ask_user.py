@@ -129,6 +129,15 @@ def test_dialog_error_recovers_blocked(driver):
     assert 'boom' in result['content'][0]['text']
 
 
+def test_update_throw_recovers_blocked_and_skips_dialog(driver):
+    report = driver('update-throw')
+    assert [e['active'] for e in blocked_events(report)] == [True, False]
+    assert dialog_entries(report) == []
+    result = report['results'][0]
+    assert result['details']['status'] == 'error' and result['isError']
+    assert 'update boom' in result['content'][0]['text']
+
+
 def test_aborted_before_wait_emits_nothing(driver):
     report = driver('pre-aborted')
     assert blocked_events(report) == []

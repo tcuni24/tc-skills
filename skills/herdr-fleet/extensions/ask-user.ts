@@ -108,11 +108,11 @@ export default function askUserExtension(pi: ExtensionAPI) {
 		}
 
 		pi.events.emit(BLOCKED_EVENT, { active: true, label: params.question });
-		onUpdate?.({
-			content: [{ type: "text", text: `Waiting for user: ${params.question}` }],
-			details: { ...base, status: "waiting", answer: null },
-		});
 		try {
+			onUpdate?.({
+				content: [{ type: "text", text: `Waiting for user: ${params.question}` }],
+				details: { ...base, status: "waiting", answer: null },
+			});
 			const answer =
 				options.length > 0
 					? await ctx.ui.select(params.question, options, { signal, timeout: params.timeout })
