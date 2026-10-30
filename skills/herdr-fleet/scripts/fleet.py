@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import tomllib
+import unicodedata
 
 CONFIG = '.herdr-fleet.toml'
 HERDR = os.environ.get('FLEET_HERDR') or os.environ.get('HERDR_BIN_PATH') or 'herdr'
@@ -384,6 +385,28 @@ def display(rows, as_json):
             print('  '.join(v.ljust(widths[i]) for i, v in enumerate(row)))
 
 
+def display_ls(rows):
+    if not rows:
+        print('没有任务')
+        return
+    merges = {'unmerged': '未合并', 'merged': '已合并', 'squash-merged': '已合并(squash)',
+              'no-commits': '无提交', 'unknown': '未知'}
+    def repo_summary(key, info):
+        parts = [key]
+        for field, label in (('ahead', '领先'), ('behind', '落后'), ('dirty', '未提交')):
+            if info[field] > 0: parts.append(f'{label}{info[field]}')
+        parts.append(merges[info['merge']])
+        return ' '.join(parts)
+    headers = ['任务', 'tab', 'agent', '状态', '阶段', '仓库']
+    values = [[r['slug'], r['tab'], r['agent_kind'], r['agent'], r['phase'],
+               r.get('error') or '；'.join(repo_summary(k, v) for k, v in r['repos'].items())] for r in rows]
+    def width(text):
+        return sum(2 if unicodedata.east_asian_width(c) in ('W', 'F') else 1 for c in text)
+    widths = [max(width(row[i]) for row in [headers, *values]) for i in range(len(headers))]
+    for row in [headers, *values]:
+        print('  '.join(value + ' ' * (widths[i] - width(value)) for i, value in enumerate(row)).rstrip())
+
+
 def ls(a):
     tabs, agents = herdr_state()
     rows = []
@@ -398,8 +421,7 @@ def ls(a):
     if a.json:
         display(rows, True)
     else:
-        display([{'slug': r['slug'], 'tab': r['tab'], 'agent': f"{r['agent_kind']} {r['agent']}", 'phase': r['phase'],
-                  'repos': r.get('error') or '; '.join(f"{k} +{v['ahead']}/-{v['behind']} dirty{v['dirty']} {v['merge']}" for k, v in r['repos'].items())} for r in rows], False)
+        display_ls(rows)
 
 
 def task_agent(slug):

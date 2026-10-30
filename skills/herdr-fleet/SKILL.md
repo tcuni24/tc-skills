@@ -45,7 +45,7 @@ fleet new <slug> [-r <键>[,<键>]] [--fix] [--base <键>=<ref>] [--agent <种�
 
 ## 3. 看情况
 
-- `fleet ls`：查看各任务的 tab、agent 状态、phase 和仓库汇总。
+- `fleet ls`：文本表格列为任务、tab、agent 种类、状态、阶段（phase 英文原值）、仓库；仓库示例 `web 领先1 未合并`，多个仓库以 `；` 分隔，无任务时显示 `没有任务`。`--json` 输出结构化数据。
 - `fleet status <slug>`：查看下一步建议、提交、diff 统计、未提交文件、PR 和 agent 最近输出。仓库异常时显示 `phase=error` 和原因，并尽力显示其他仓库；`--lines` 不接受负数。
 - `fleet wait <slug> [--timeout SEC]`：等待 agent idle/done/blocked，返回码分别为 0/0/3；超时为 4，其他错误为 1。终态观察成功后仓库信息出错不改变返回码。若已经 idle 会立即返回；`fleet new` 后先用 `fleet status` 确认进入 working 再 wait。
 - `fleet peek <slug> [--lines N]`：查看任务 agent 的最近输出。

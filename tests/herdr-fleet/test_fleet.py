@@ -2,7 +2,9 @@ import json
 import os
 from pathlib import Path
 import re
+import runpy
 import subprocess
+import unicodedata
 
 import pytest
 
@@ -352,9 +354,11 @@ def test_phases_and_ls_errors(setup):
     git(path, 'add', 'file'); git(path, 'commit', '-m', 'work')
     assert phase() == 'review'
     text = fleet('ls').stdout
-    assert '{' not in text and 'web +1/-0 dirty0 unmerged' in text
+    assert '{' not in text and 'web 领先1 未合并' in text
     row = json.loads(fleet('ls', '--json').stdout)[0]
     assert {'slug', 'tab', 'agent', 'repos', 'agent_kind', 'phase'} <= row.keys()
+    assert (row['slug'], row['tab'], row['agent'], row['agent_kind'], row['phase']) == ('hello', 't', 'idle', 'pi', 'review')
+    assert (row['repos']['web']['ahead'], row['repos']['web']['behind'], row['repos']['web']['dirty'], row['repos']['web']['merge']) == (1, 0, 0, 'unmerged')
     assert {'branch', 'dirty', 'ahead', 'behind', 'merge'} <= row['repos']['web'].keys()
     git(root / 'app-web', 'merge', '--no-ff', 'feat/hello', '-m', 'merge')
     git(root / 'app-web', 'push', 'origin', 'develop')
@@ -420,9 +424,37 @@ def test_ls_table_distinguishes_tab_without_agent(setup):
     _, fleet, _ = setup
     fleet('new', 'hello', '-r', 'web', '--no-fetch')
     header, row = fleet('ls', NOAGENT='1').stdout.splitlines()
-    assert header.split()[:3] == ['slug', 'tab', 'agent']
+    assert header.split() == ['任务', 'tab', 'agent', '状态', '阶段', '仓库']
     assert row.split()[:4] == ['hello', 't', 'pi', '-']
     assert fleet('ls', NOTAB='1').stdout.splitlines()[1].split()[:2] == ['hello', '-']
+
+
+def test_ls_empty(setup):
+    _, fleet, _ = setup
+    assert fleet('ls').stdout == '没有任务\n'
+    assert fleet('ls', '--json').stdout == '[]\n'
+
+
+def test_ls_render_alignment_and_repository_summaries(capsys):
+    display_ls = runpy.run_path(str(SCRIPT))['display_ls']
+    def repo(ahead=0, behind=0, dirty=0, merge='no-commits'):
+        return dict(ahead=ahead, behind=behind, dirty=dirty, merge=merge)
+    rows = [
+        dict(slug='中文任务', tab='wB:t7', agent_kind='devin', agent='idle', phase='review',
+             repos={'web': repo(ahead=1, behind=2, dirty=3, merge='unmerged'), 'be': repo()}),
+        dict(slug='short', tab='t', agent_kind='pi', agent='blocked', phase='error', repos={}, error='仓库错误：失败'),
+        dict(slug='other', tab='t', agent_kind='pi', agent='done', phase='merged',
+             repos={'web': repo(merge='merged'), 'be': repo(merge='squash-merged'), 'api': repo(merge='unknown')}),
+    ]
+    display_ls(rows)
+    lines = capsys.readouterr().out.splitlines()
+    assert 'web 领先1 落后2 未提交3 未合并；be 无提交' in lines[1]
+    assert lines[2].endswith('仓库错误：失败')
+    assert lines[3].endswith('web 已合并；be 已合并(squash)；api 未知')
+    def starts(line):
+        return [sum(2 if unicodedata.east_asian_width(c) in ('W', 'F') else 1 for c in line[:m.start()])
+                for m in re.finditer(r'\S+', line)][:6]
+    assert starts(lines[0]) == starts(lines[1]) == starts(lines[2]) == starts(lines[3])
 
 
 def test_wait(setup):
