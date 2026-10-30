@@ -55,12 +55,18 @@ elif args[:2] == ['agent', 'get']:
             print(json.dumps({'error': {'code': 'pane_not_found'}})); sys.exit(1)
         status = Path(os.environ['COORD_STATUS_FILE']).read_text().strip() if os.environ.get('COORD_STATUS_FILE') else os.environ.get('COORD_STATUS', 'working')
         print(json.dumps({'result': {'agent': {'agent_status': status, 'state_change_seq': 1}}})); sys.exit(0)
+    if os.environ.get('FAKE_STATE_FILE') and Path(os.environ['FAKE_STATE_FILE']).exists():
+        print(json.dumps({'result': {'agent': json.loads(Path(os.environ['FAKE_STATE_FILE']).read_text())}})); sys.exit(0)
     gets = sum(json.loads(line)[:2] == ['agent', 'get'] for line in open(os.environ['LOG']))
     seq = os.environ.get('GET_AFTER_SEQ', '10') if gets > int(os.environ.get('GET_AFTER_N', '999999')) else os.environ.get('GET_SEQ', '10')
     result = {'agent': {'agent_status': os.environ.get('OTHER_STATUS', 'idle') if args[2] == 'q' else os.environ.get('GET_STATUS', 'idle'), 'state_change_seq': int(os.environ.get('OTHER_SEQ', seq) if args[2] == 'q' else seq)}}
 elif args[:2] == ['agent', 'prompt'] and '--wait' in args:
+    if args[4:] != ['--wait', '--until', 'working', '--until', 'blocked', '--timeout', '5000']:
+        print('invalid confirmation arguments', file=sys.stderr); sys.exit(1)
     if os.environ.get('PROMPT_FAIL'):
         print(json.dumps({'error': {'code': os.environ['PROMPT_FAIL']}})); sys.exit(1)
+    if os.environ.get('FAKE_STATE_FILE'):
+        Path(os.environ['FAKE_STATE_FILE']).write_text(json.dumps({'agent_status': 'working', 'state_change_seq': 11}))
     result = {'type': 'agent_prompted'}
 elif args[:2] == ['agent', 'prompt']:
     time.sleep(float(os.environ.get('DELIVERY_DELAY', '0')))
@@ -134,6 +140,7 @@ def test_new_and_rollback(setup):
     assert [c[:2] for c in calls] == [['tab', 'create'], ['agent', 'start'], ['pane', 'split'], ['agent', 'get'], ['agent', 'prompt']]
     assert calls[1] == ['agent', 'start', 'hello', '--kind', 'pi', '--pane', 'p', '--timeout', '60000']
     prompt = calls[-1][3]
+    assert calls[-1][4:] == ['--wait', '--until', 'working', '--until', 'blocked', '--timeout', '5000']
     assert str(dest / 'web') in prompt and 'app-web' in prompt and prompt.endswith('do work')
     assert all(field in prompt for field in ('FLEET-REPORT', 'END FLEET-REPORT', '结果', 'PR', '测试', '证据边界', '需要决策', '退出码'))
     p = fleet('new', 'bad', '--no-fetch', check=False, FAIL='pane split')
@@ -977,8 +984,29 @@ def test_send_and_peek_target_pane(setup):
     fleet('send', 'hello', '继续')
     fleet('peek', 'hello', '--lines', '5')
     calls = [json.loads(line) for line in log.read_text().splitlines()]
-    assert any(call[:4] == ['agent', 'prompt', 'p', '继续'] and '--wait' in call for call in calls)
+    assert ['agent', 'prompt', 'p', '继续', '--wait', '--until', 'working', '--until', 'blocked', '--timeout', '5000'] in calls
     assert ['agent', 'read', 'p', '--source', 'recent-unwrapped', '--lines', '5'] in calls
+
+
+@pytest.mark.parametrize('command', ['new', 'send'])
+def test_confirmation_changes_fake_agent_state(setup, command):
+    root, fleet, log = setup
+    if command == 'send': fleet('new', 'hello', '--no-fetch')
+    state = log.parent / 'agent-state.json'
+    args = ('new', 'hello', '--no-fetch', '--prompt', 'work') if command == 'new' else ('send', 'hello', 'work')
+    fleet(*args, FAKE_STATE_FILE=str(state))
+    assert json.loads(state.read_text()) == {'agent_status': 'working', 'state_change_seq': 11}
+    assert task_data(root, 'hello')['submit_seq'] == 10
+
+
+def test_skill_doctor_and_notification_rules():
+    text = (SKILL / 'SKILL.md').read_text(encoding='utf-8')
+    opening = text.split('## 2. 开任务', 1)[1].split('## 3. 看情况', 1)[0]
+    assert '通过时可以结束本轮' in opening and '会自动通知' in opening
+    assert '不通过时不得声称会自动通知' in opening
+    assert '必须在同一轮内执行 `fleet wait <slug>...` 直到任务结束或阻塞' in opening
+    assert '或明确' not in opening and '只说明不会自动通知' not in opening
+    assert re.search(r'收到.*自动通知后，先.*`fleet status <slug>` 核查，再向用户汇报', text)
 
 
 def test_gc_legacy_dependents(setup):

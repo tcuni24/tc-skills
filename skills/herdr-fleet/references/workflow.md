@@ -109,11 +109,11 @@ phase 按以下顺序判断（仓库异常时为 `error`）：
 | review | 任一仓库有领先提交且 unmerged |
 | idle-empty | 所有仓库 no-commits |
 
-`wait` 默认等待全部任务，`--any` 等首个终态；只认最近一次提交之后的终态。返回码：idle/done 为 0，blocked 为 3，超时为 4，无 agent 或其他错误为 1。观察到终态后，仓库信息读取失败仅报告错误，不改变终态返回码。当前没有自动通知，主 agent 结束本轮前必须 `fleet wait` 到任务结束或阻塞，不得声称完成后会自动通知。`done --dry-run` 预检通过返回 0，拒绝返回 1，且不删除或关闭 tab。
+`wait` 默认等待全部任务，`--any` 等首个终态；只认最近一次提交之后的终态。返回码：idle/done 为 0，blocked 为 3，超时为 4，无 agent 或其他错误为 1。观察到终态后，仓库信息读取失败仅报告错误，不改变终态返回码。开任务后运行 `fleet doctor`：通过时可以结束本轮并告知用户会自动通知；不通过时不得声称会自动通知，必须在同一轮内 `fleet wait` 到任务结束或阻塞，不能只说明不会自动通知就结束本轮。`done --dry-run` 预检通过返回 0，拒绝返回 1，且不删除或关闭 tab。
 
 ## 安全规则
 
-- `new` 中途任何一步失败（worktree、tab、agent、pane），都会回滚已建的 worktree、新建的分支和 tab。
+- `new` 创建 worktree、tab、agent 或 pane 失败时，回滚已建的 worktree、新建的分支和 tab；提交 prompt 后开始确认失败则保留 worktree 和 tab，供检查和恢复。
 - `done` 先对所有仓库预检，任何一项不过就什么都不删：
   - 任务目录里有 `TASK.md` 和各仓库子目录以外的东西：拒绝。
   - worktree 当前分支和 `TASK.md` 记录不符：拒绝。
