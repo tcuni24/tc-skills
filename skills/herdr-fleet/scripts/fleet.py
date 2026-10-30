@@ -19,7 +19,7 @@ import sys
 import tempfile
 import time
 import tomllib
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 from typing import Literal, TypedDict
 
 CONFIG = '.herdr-fleet.toml'
@@ -265,26 +265,46 @@ def bind():
     if not coordinator:
         raise RuntimeError('请在 herdr pane 中运行 fleet bind')
     tabs, agents = herdr_state()
-    with fleet_state(write=True) as (panes, inbox):
-        current = tasks()
-        for data in current:
-            data['coordinator_pane'] = coordinator
-            save(data)
-            tab = find_tab(data['slug'], tabs)
-            agent = next((item for item in agents if tab and item.get('tab_id') == tab['tab_id']), None)
-            if agent:
-                for pane, entry in list(panes.items()):
-                    if entry == {'root': str(ROOT), 'slug': data['slug'], 'role': 'task'}:
-                        del panes[pane]
-                panes[agent['pane_id']] = {'root': str(ROOT), 'slug': data['slug'], 'role': 'task'}
-        slugs = {data['slug'] for data in current}
-        for event in inbox:
-            if event.get('root') == str(ROOT) and event.get('slug') in slugs and event.get('delivery') == 'pending':
-                event['coordinator_pane'] = coordinator
-        if current:
-            if panes.get(coordinator, {}).get('root') != str(ROOT) or panes[coordinator].get('role') != 'coordinator':
-                panes[coordinator] = {'root': str(ROOT), 'role': 'coordinator'}
-        prune_coordinators(panes)
+    while True:
+        with fleet_state() as (_, inbox):
+            locks = bind_coordinators(coordinator, inbox)
+        with ExitStack() as stack:
+            for pane in sorted(locks):
+                stack.enter_context(delivery_lock(pane))
+            with fleet_state(write=True) as (panes, inbox):
+                if not bind_coordinators(coordinator, inbox) <= locks:
+                    continue
+                bind_locked(coordinator, tabs, agents, panes, inbox)
+                return
+
+
+def bind_coordinators(coordinator, inbox):
+    return ({coordinator}
+            | {data['coordinator_pane'] for data in tasks() if data.get('coordinator_pane')}
+            | {item['coordinator_pane'] for item in inbox if item.get('root') == str(ROOT)
+               and item.get('delivery') == 'pending' and item.get('coordinator_pane')})
+
+
+def bind_locked(coordinator, tabs, agents, panes, inbox):
+    current = tasks()
+    for data in current:
+        data['coordinator_pane'] = coordinator
+        save(data)
+        tab = find_tab(data['slug'], tabs)
+        agent = next((item for item in agents if tab and item.get('tab_id') == tab['tab_id']), None)
+        if agent:
+            for pane, entry in list(panes.items()):
+                if entry == {'root': str(ROOT), 'slug': data['slug'], 'role': 'task'}:
+                    del panes[pane]
+            panes[agent['pane_id']] = {'root': str(ROOT), 'slug': data['slug'], 'role': 'task'}
+    slugs = {data['slug'] for data in current}
+    for event in inbox:
+        if event.get('root') == str(ROOT) and event.get('slug') in slugs and event.get('delivery') == 'pending':
+            event['coordinator_pane'] = coordinator
+    if current:
+        if panes.get(coordinator, {}).get('root') != str(ROOT) or panes[coordinator].get('role') != 'coordinator':
+            panes[coordinator] = {'root': str(ROOT), 'role': 'coordinator'}
+    prune_coordinators(panes)
 
 
 def inbox_list(a):
@@ -385,17 +405,30 @@ def notice_text(events):
     return '\n'.join([header, *shown, *([f'另有 {remaining} 个任务'] if remaining else []), footer])
 
 
-def deliver(coordinator):
+@contextmanager
+def delivery_lock(coordinator):
     directory = Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local/state') / 'herdr-fleet'
     directory.mkdir(parents=True, exist_ok=True)
     name = hashlib.sha256(coordinator.encode()).hexdigest()
-    with (directory / ('delivery-' + name + '.lock')).open('a') as delivery_lock:
-        fcntl.flock(delivery_lock, fcntl.LOCK_EX)
-        while True:
+    with (directory / ('delivery-' + name + '.lock')).open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+def deliver(coordinator):
+    while True:
+        with fleet_state() as (_, inbox):
+            selected = [item.copy() for item in inbox if item.get('root') == str(ROOT) and item.get('coordinator_pane') == coordinator and item.get('delivery') == 'pending']
+        if not selected:
+            return
+        text = notice_text(selected)
+        keys = {item['dedup_key'] for item in selected}
+        with delivery_lock(coordinator):
             with fleet_state() as (_, inbox):
-                selected = [item.copy() for item in inbox if item.get('root') == str(ROOT) and item.get('coordinator_pane') == coordinator and item.get('delivery') == 'pending']
-            if not selected:
-                return
+                current = {item['dedup_key'] for item in inbox if item.get('root') == str(ROOT)
+                           and item.get('coordinator_pane') == coordinator and item.get('delivery') == 'pending'}
+            if not keys <= current:
+                continue
             code, payload, error = herdr_result('agent', 'get', coordinator)
             result = payload.get('result', {})
             if code:
@@ -415,14 +448,13 @@ def deliver(coordinator):
             status = result.get('agent', {}).get('agent_status')
             if status not in ('idle', 'done'):
                 return
-            text = notice_text(selected)
             code, payload, error = herdr_result('agent', 'prompt', coordinator, text)
             result = payload.get('result', payload)
             success = code == 0 and result.get('type') == 'agent_prompted'
-            keys = {item['dedup_key'] for item in selected}
             with fleet_state(write=True) as (_, inbox):
                 for item in inbox:
-                    if item.get('root') == str(ROOT) and item.get('dedup_key') in keys and item.get('delivery') == 'pending':
+                    if (item.get('root') == str(ROOT) and item.get('dedup_key') in keys
+                            and item.get('coordinator_pane') == coordinator and item.get('delivery') == 'pending'):
                         item['attempts'] += 1
                         item['last_error'] = None if success else (error or 'agent_prompted 未确认')
                         if success: item['delivery'] = 'delivered'

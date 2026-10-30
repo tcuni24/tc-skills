@@ -45,7 +45,8 @@ elif args[:2] == ['agent', 'get']:
     if args[2] in ('coordinator', 'old', 'new'):
         if os.environ.get('COORD_MISSING'):
             print(json.dumps({'error': {'code': 'pane_not_found'}})); sys.exit(1)
-        print(json.dumps({'result': {'agent': {'agent_status': os.environ.get('COORD_STATUS', 'working'), 'state_change_seq': 1}}})); sys.exit(0)
+        status = Path(os.environ['COORD_STATUS_FILE']).read_text().strip() if os.environ.get('COORD_STATUS_FILE') else os.environ.get('COORD_STATUS', 'working')
+        print(json.dumps({'result': {'agent': {'agent_status': status, 'state_change_seq': 1}}})); sys.exit(0)
     gets = sum(json.loads(line)[:2] == ['agent', 'get'] for line in open(os.environ['LOG']))
     seq = os.environ.get('GET_AFTER_SEQ', '10') if gets > int(os.environ.get('GET_AFTER_N', '999999')) else os.environ.get('GET_SEQ', '10')
     result = {'agent': {'agent_status': os.environ.get('OTHER_STATUS', 'idle') if args[2] == 'q' else os.environ.get('GET_STATUS', 'idle'), 'state_change_seq': int(os.environ.get('OTHER_SEQ', seq) if args[2] == 'q' else seq)}}
@@ -488,6 +489,99 @@ def test_delivery_truncates_oversized_notice(setup, tmp_path):
     prompts = [c for line in log.read_text().splitlines() if (c := json.loads(line))[:2] == ['agent', 'prompt']]
     assert len(prompts[0][3].encode()) < 131071
     assert '另有 1 个任务' in prompts[0][3] and 'fleet status' in prompts[0][3]
+
+
+def blocking_gh(tmp_path):
+    gh = tmp_path / 'blocking-gh'
+    gh.write_text('''#!/usr/bin/env python3
+import json, os, time
+from pathlib import Path
+barrier = Path(os.environ['GH_BARRIER'])
+barrier.touch()
+deadline = time.monotonic() + 8
+while not barrier.with_suffix('.release').exists():
+    if time.monotonic() >= deadline: raise SystemExit(2)
+    time.sleep(0.01)
+print(json.dumps([]))
+''')
+    gh.chmod(0o755)
+    return gh
+
+
+def wait_barrier(barrier):
+    deadline = time.monotonic() + 6
+    while not barrier.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert barrier.exists()
+
+
+def test_delivery_rebind_during_message_construction(setup, tmp_path):
+    root, fleet, log = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='old')
+    fleet('event', '--pane', 'p', '--status', 'idle', GET_SEQ='12')
+    log.write_text('')
+    barrier, gh = tmp_path / 'delivery-barrier', blocking_gh(tmp_path)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        old = pool.submit(fleet, 'event', '--pane', 'old', '--status', 'idle', COORD_STATUS='idle',
+                          FLEET_GH=str(gh), GH_BARRIER=str(barrier))
+        try:
+            wait_barrier(barrier)
+            fleet('bind', HERDR_PANE_ID='new')
+            fleet('event', '--pane', 'new', '--status', 'idle', COORD_STATUS='idle')
+        finally:
+            barrier.with_suffix('.release').touch()
+        old.result(timeout=10)
+    prompts = [c for line in log.read_text().splitlines() if (c := json.loads(line))[:2] == ['agent', 'prompt']]
+    assert [c[2] for c in prompts] == ['new']
+    events = json.loads(fleet('inbox', '--all', '--json').stdout)
+    assert len(events) == 1 and events[0]['delivery'] == 'delivered' and events[0]['coordinator_pane'] == 'new'
+
+
+def test_delivery_status_rechecked_after_message_construction(setup, tmp_path):
+    _, fleet, log = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='old')
+    fleet('event', '--pane', 'p', '--status', 'idle', GET_SEQ='12')
+    log.write_text('')
+    barrier, gh = tmp_path / 'delivery-barrier', blocking_gh(tmp_path)
+    status = tmp_path / 'status'
+    status.write_text('idle')
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        delivery = pool.submit(fleet, 'event', '--pane', 'old', '--status', 'idle', COORD_STATUS_FILE=str(status),
+                               FLEET_GH=str(gh), GH_BARRIER=str(barrier))
+        try:
+            wait_barrier(barrier)
+            status.write_text('working')
+        finally:
+            barrier.with_suffix('.release').touch()
+        delivery.result(timeout=10)
+    prompts = [c for line in log.read_text().splitlines() if (c := json.loads(line))[:2] == ['agent', 'prompt']]
+    assert prompts == []
+    assert len(json.loads(fleet('inbox', '--json').stdout)) == 1
+
+
+def test_bind_waits_for_inflight_delivery_and_does_not_redeliver(setup, tmp_path):
+    _, fleet, log = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='old')
+    fleet('event', '--pane', 'p', '--status', 'idle', GET_SEQ='12')
+    log.write_text('')
+    barrier = tmp_path / 'prompt-barrier'
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        delivery = pool.submit(fleet, 'event', '--pane', 'old', '--status', 'idle', COORD_STATUS='idle',
+                               BARRIER=str(barrier), BARRIER_CALL='agent prompt')
+        try:
+            wait_barrier(barrier)
+            binding = pool.submit(fleet, 'bind', HERDR_PANE_ID='new')
+            time.sleep(0.2)
+            assert not binding.done()
+        finally:
+            barrier.with_suffix('.release').touch()
+        delivery.result(timeout=10)
+        binding.result(timeout=10)
+    fleet('event', '--pane', 'new', '--status', 'idle', COORD_STATUS='idle')
+    prompts = [c for line in log.read_text().splitlines() if (c := json.loads(line))[:2] == ['agent', 'prompt']]
+    assert [c[2] for c in prompts] == ['old']
+    events = json.loads(fleet('inbox', '--all', '--json').stdout)
+    assert len(events) == 1 and events[0]['delivery'] == 'delivered' and events[0]['coordinator_pane'] == 'old'
 
 
 def starts(log):
