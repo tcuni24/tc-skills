@@ -3,6 +3,8 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -24,14 +26,27 @@ dir = "backend"
 '''
 
 FAKE_HERDR = '''#!/usr/bin/env python3
-import json, os, sys
+import json, os, sys, time
+from pathlib import Path
 args = sys.argv[1:]
 with open(os.environ['LOG'], 'a') as f: f.write(json.dumps(args) + '\\n')
+if os.environ.get('BARRIER') and args[:2] == os.environ.get('BARRIER_CALL', '').split():
+    barrier = Path(os.environ['BARRIER'])
+    barrier.touch()
+    deadline = time.monotonic() + 10
+    while not barrier.with_suffix('.release').exists():
+        if time.monotonic() >= deadline: sys.exit(2)
+        time.sleep(0.01)
 if os.environ.get('FAIL') and args[:2] == os.environ['FAIL'].split(): sys.exit(1)
 if args[:2] == ['workspace', 'list']: result = {'workspaces': [{'workspace_id': 'w', 'focused': True}]}
 elif args[:2] == ['tab', 'list']: result = {'tabs': [] if os.environ.get('NOTAB') else [{'tab_id': 't', 'label': 'hello', 'workspace_id': 'w'}] + ([{'tab_id': 'u', 'label': 'other', 'workspace_id': 'w'}] if os.environ.get('MULTI') else [])}
 elif args[:2] == ['agent', 'list']: result = {'agents': [] if os.environ.get('NOAGENT') else [{'agent': 'pi', 'pane_id': 'p', 'tab_id': 't', 'agent_status': os.environ.get('AGENT_STATUS', 'idle')}] + ([{'agent': 'pi', 'pane_id': 'q', 'tab_id': 'u', 'agent_status': os.environ.get('OTHER_STATUS', 'idle')}] if os.environ.get('MULTI') else [])}
 elif args[:2] == ['agent', 'get']:
+    if args[2] in ('coordinator', 'old', 'new'):
+        if os.environ.get('COORD_MISSING'):
+            print(json.dumps({'error': {'code': 'pane_not_found'}})); sys.exit(1)
+        status = Path(os.environ['COORD_STATUS_FILE']).read_text().strip() if os.environ.get('COORD_STATUS_FILE') else os.environ.get('COORD_STATUS', 'working')
+        print(json.dumps({'result': {'agent': {'agent_status': status, 'state_change_seq': 1}}})); sys.exit(0)
     gets = sum(json.loads(line)[:2] == ['agent', 'get'] for line in open(os.environ['LOG']))
     seq = os.environ.get('GET_AFTER_SEQ', '10') if gets > int(os.environ.get('GET_AFTER_N', '999999')) else os.environ.get('GET_SEQ', '10')
     result = {'agent': {'agent_status': os.environ.get('OTHER_STATUS', 'idle') if args[2] == 'q' else os.environ.get('GET_STATUS', 'idle'), 'state_change_seq': int(os.environ.get('OTHER_SEQ', seq) if args[2] == 'q' else seq)}}
@@ -39,6 +54,9 @@ elif args[:2] == ['agent', 'prompt'] and '--wait' in args:
     if os.environ.get('PROMPT_FAIL'):
         print(json.dumps({'error': {'code': os.environ['PROMPT_FAIL']}})); sys.exit(1)
     result = {'type': 'agent_prompted'}
+elif args[:2] == ['agent', 'prompt']:
+    time.sleep(float(os.environ.get('DELIVERY_DELAY', '0')))
+    result = {'type': os.environ.get('DELIVERY_RESULT', 'agent_prompted')}
 elif args[:2] == ['agent', 'wait']:
     if os.environ.get('WAIT_STDOUT'):
         print(os.environ['WAIT_STDOUT']); sys.exit(1)
@@ -47,7 +65,7 @@ elif args[:2] == ['agent', 'wait']:
     result = {}  # The real wait response schema is not specified by --help.
 elif args[:2] == ['agent', 'read']:
     print(os.environ.get('AGENT_OUTPUT', 'agent output tail')); sys.exit(0)
-elif args[:2] == ['tab', 'create']: result = {'tab': {'tab_id': 't'}, 'root_pane': {'pane_id': 'p'}}
+elif args[:2] == ['tab', 'create']: result = {'tab': {'tab_id': 't'}, 'root_pane': {'pane_id': os.environ.get('NEW_PANE', 'p')}}
 elif args[:2] == ['pane', 'split']: result = {'pane': {'pane_id': 'q'}}
 else: result = {}
 print(json.dumps({'result': result}))
@@ -86,8 +104,8 @@ def setup(tmp_path):
     fake = tmp_path / 'herdr'
     fake.write_text(FAKE_HERDR)
     fake.chmod(0o755)
-    env = {k: v for k, v in os.environ.items() if k not in ('HERDR_BIN_PATH', 'FLEET_ROOT')}
-    env.update(FLEET_ROOT=str(root), FLEET_HERDR=str(fake), LOG=str(tmp_path / 'log'), HERDR_ENV='1', HERDR_WORKSPACE_ID='w')
+    env = {k: v for k, v in os.environ.items() if k not in ('HERDR_BIN_PATH', 'FLEET_ROOT', 'HERDR_PANE_ID')}
+    env.update(FLEET_ROOT=str(root), FLEET_HERDR=str(fake), LOG=str(tmp_path / 'log'), HERDR_ENV='1', HERDR_WORKSPACE_ID='w', XDG_STATE_HOME=str(tmp_path / 'state'))
 
     def fleet(*args, check=True, cwd=None, drop=(), **updates):
         run_env = {k: v for k, v in {**env, **updates}.items() if k not in drop}
@@ -171,6 +189,489 @@ def test_round_wait_multiple_and_blocked(setup):
 def task_data(root, slug):
     text = (root / 'worktrees' / slug / 'TASK.md').read_text()
     return json.loads(text.split('```json\n', 1)[1].split('\n```', 1)[0])
+
+
+def test_registration_open_and_dry_run(setup):
+    root, fleet, log = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', HERDR_PANE_ID='coordinator')
+    assert task_data(root, 'hello')['coordinator_pane'] == 'coordinator'
+    index = json.loads((log.parent / 'state/herdr-fleet/panes.json').read_text())
+    assert index['p'] == {'root': str(root), 'slug': 'hello', 'role': 'task'}
+    assert index['coordinator'] == {'root': str(root), 'role': 'coordinator'}
+    assert {p.name for p in (root / 'worktrees/hello').iterdir()} == {'TASK.md', 'web'}
+    fleet('done', 'hello', '--dry-run', '--no-fetch')
+    fleet('open', 'hello', NOTAB='1', NEW_PANE='new-task', HERDR_PANE_ID='new-coordinator')
+    assert task_data(root, 'hello')['coordinator_pane'] == 'new-coordinator'
+    index = json.loads((log.parent / 'state/herdr-fleet/panes.json').read_text())
+    assert 'p' not in index and 'coordinator' not in index
+    assert index['new-task']['slug'] == 'hello' and 'new-coordinator' in index
+
+
+def test_inbox_bind_and_cleanup(setup):
+    root, fleet, log = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', HERDR_PANE_ID='old')
+    path = log.parent / 'state/herdr-fleet/inbox.json'
+    events = [dict(root=str(root), slug='hello', coordinator_pane='old', status=s, delivery=d,
+                   created='2026-01-01', dedup_key=str(i), attempts=0, last_error=None)
+              for i, (s, d) in enumerate([('idle', 'pending'), ('blocked', 'delivered')])]
+    path.write_text(json.dumps(events))
+    before = path.read_bytes()
+    assert json.loads(fleet('inbox', '--json').stdout) == events[:1]
+    assert json.loads(fleet('inbox', '--all', '--json').stdout) == events
+    assert 'hello' in fleet('inbox').stdout and path.read_bytes() == before
+    fleet('bind', HERDR_PANE_ID='new')
+    assert task_data(root, 'hello')['coordinator_pane'] == 'new'
+    assert [event['coordinator_pane'] for event in json.loads(path.read_text())] == ['new', 'old']
+    fleet('done', 'hello', '--no-fetch')
+    assert json.loads(path.read_text()) == []
+    assert not json.loads((path.parent / 'panes.json').read_text())
+
+
+def test_open_retains_old_coordinator_for_pending_delivery(setup):
+    root, fleet, log = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='old')
+    fleet('event', '--pane', 'p', '--status', 'idle', GET_SEQ='12')
+    assert len(json.loads(fleet('inbox', '--json').stdout)) == 1
+    fleet('open', 'hello', HERDR_PANE_ID='new')
+    assert task_data(root, 'hello')['coordinator_pane'] == 'new'
+    index_path = log.parent / 'state/herdr-fleet/panes.json'
+    assert json.loads(index_path.read_text())['old']['role'] == 'coordinator'
+    log.write_text('')
+    fleet('event', '--pane', 'old', '--status', 'idle', COORD_STATUS='idle')
+    fleet('event', '--pane', 'old', '--status', 'idle', COORD_STATUS='idle')
+    prompts = [c for line in log.read_text().splitlines() if (c := json.loads(line))[:2] == ['agent', 'prompt']]
+    assert len(prompts) == 1 and prompts[0][2] == 'old'
+    assert json.loads(fleet('inbox', '--json').stdout) == []
+    fleet('open', 'hello', HERDR_PANE_ID='new')
+    assert 'old' not in json.loads(index_path.read_text())
+
+
+def test_concurrent_done_preserves_unrelated_inbox_records(setup):
+    root, fleet, log = setup
+    for slug in ('hello', 'other'):
+        fleet('new', slug, '-r', 'web', '--no-fetch', HERDR_PANE_ID='coordinator', NEW_PANE=slug)
+    path = log.parent / 'state/herdr-fleet/inbox.json'
+    events = [dict(root=str(root), slug=s, coordinator_pane='coordinator', status='idle', delivery='pending',
+                   created='2026-01-01', dedup_key=s, attempts=0, last_error=None) for s in ('hello', 'other', 'keep')]
+    path.write_text(json.dumps(events))
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda s: fleet('done', s, '--no-fetch'), ('hello', 'other')))
+    assert all(r.returncode == 0 for r in results)
+    assert json.loads(path.read_text()) == events[2:]
+
+
+def test_legacy_task_without_coordinator_and_bind_requires_pane(setup):
+    root, fleet, log = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch')
+    assert 'coordinator_pane' not in task_data(root, 'hello')
+    assert fleet('bind', check=False).returncode == 1
+    assert json.loads(fleet('inbox', '--json').stdout) == []
+    fleet('done', 'hello', '--no-fetch')
+    assert not (root / 'worktrees/hello').exists()
+
+
+def test_event_ignores_unknown_and_legacy_without_herdr(setup):
+    root, fleet, log = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', HERDR_PANE_ID='coordinator')
+    path = root / 'worktrees/hello/TASK.md'
+    text = path.read_text()
+    data = task_data(root, 'hello')
+    del data['coordinator_pane']
+    before, rest = text.split('```json\n', 1)
+    _, after = rest.split('\n```', 1)
+    path.write_text(before + '```json\n' + json.dumps(data) + '\n```' + after)
+    log.write_text('')
+    for pane in ('unknown', 'p'):
+        result = fleet('event', '--pane', pane, '--status', 'idle')
+        assert result.stdout == result.stderr == ''
+    assert log.read_text() == ''
+
+
+def test_event_fast_completion_stale_and_next_round(setup):
+    _, fleet, log = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
+    def event(status, seq, current=None):
+        fleet('event', '--pane', 'p', '--status', status, GET_STATUS=current or status, GET_SEQ=str(seq))
+    event('idle', 10)
+    assert json.loads(fleet('inbox', '--json').stdout) == []
+    event('idle', 12)
+    event('working', 11)
+    event('idle', 12)
+    rows = json.loads(fleet('inbox', '--all', '--json').stdout)
+    assert len(rows) == 1 and rows[0]['status'] == 'idle' and rows[0]['delivery'] == 'pending'
+    event('working', 13)
+    event('blocked', 14)
+    rows = json.loads(fleet('inbox', '--all', '--json').stdout)
+    assert [r['status'] for r in rows] == ['idle', 'blocked']
+    assert len({r['dedup_key'] for r in rows}) == 2
+
+
+@pytest.mark.parametrize('status', ['blocked', 'exited'])
+def test_event_terminal_statuses(setup, status):
+    _, fleet, _ = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
+    for _ in range(2):
+        fleet('event', '--pane', 'p', '--status', status, GET_STATUS=status, GET_SEQ='11')
+    rows = json.loads(fleet('inbox', '--json').stdout)
+    assert len(rows) == 1 and rows[0]['status'] == status
+
+
+def test_event_concurrent_distinct_and_duplicate(setup):
+    _, fleet, _ = setup
+    for slug, pane in [('hello', 'p'), ('other', 'q')]:
+        fleet('new', slug, '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator', NEW_PANE=pane)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(lambda pane: fleet('event', '--pane', pane, '--status', 'idle', GET_SEQ='12', OTHER_SEQ='12'), ['p', 'q', 'p', 'q']))
+    assert all(result.returncode == 0 for result in results)
+    rows = json.loads(fleet('inbox', '--json').stdout)
+    assert {row['slug'] for row in rows} == {'hello', 'other'} and len(rows) == 2
+
+
+def test_event_manual_working_and_stale_status(setup):
+    _, fleet, _ = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', HERDR_PANE_ID='coordinator')
+    fleet('event', '--pane', 'p', '--status', 'idle', GET_SEQ='12')
+    assert json.loads(fleet('inbox', '--json').stdout) == []
+    fleet('event', '--pane', 'p', '--status', 'working', GET_STATUS='working', GET_SEQ='13')
+    fleet('event', '--pane', 'p', '--status', 'done', GET_STATUS='done', GET_SEQ='14')
+    fleet('event', '--pane', 'p', '--status', 'working', GET_STATUS='done', GET_SEQ='14')
+    assert [r['status'] for r in json.loads(fleet('inbox', '--json').stdout)] == ['done']
+
+
+@pytest.mark.parametrize('terminal', ['done', 'idle', 'blocked'])
+def test_first_manual_round_working_processed_after_terminal(setup, terminal):
+    _, fleet, _ = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', HERDR_PANE_ID='coordinator')
+    fleet('event', '--pane', 'p', '--status', 'working', GET_STATUS=terminal, GET_SEQ='14')
+    fleet('event', '--pane', 'p', '--status', terminal, GET_STATUS=terminal, GET_SEQ='14')
+    rows = json.loads(fleet('inbox', '--json').stdout)
+    assert len(rows) == 1 and rows[0]['status'] == terminal
+
+
+def test_manual_round_delayed_working_and_done_to_idle(setup):
+    _, fleet, _ = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
+    fleet('event', '--pane', 'p', '--status', 'done', GET_STATUS='done', GET_SEQ='12')
+    fleet('event', '--pane', 'p', '--status', 'working', GET_STATUS='done', GET_SEQ='12')
+    fleet('event', '--pane', 'p', '--status', 'idle', GET_STATUS='idle', GET_SEQ='13')
+    assert len(json.loads(fleet('inbox', '--json').stdout)) == 1
+    fleet('event', '--pane', 'p', '--status', 'working', GET_STATUS='done', GET_SEQ='16')
+    fleet('event', '--pane', 'p', '--status', 'done', GET_STATUS='done', GET_SEQ='16')
+    fleet('event', '--pane', 'p', '--status', 'idle', GET_STATUS='idle', GET_SEQ='17')
+    assert [e['status'] for e in json.loads(fleet('inbox', '--json').stdout)] == ['done', 'done']
+
+
+def test_ambiguous_late_working_after_done_to_idle_prefers_notice(setup):
+    _, fleet, _ = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
+    fleet('event', '--pane', 'p', '--status', 'done', GET_STATUS='done', GET_SEQ='12')
+    fleet('event', '--pane', 'p', '--status', 'idle', GET_STATUS='idle', GET_SEQ='13')
+    fleet('event', '--pane', 'p', '--status', 'working', GET_STATUS='idle', GET_SEQ='13')
+    assert [e['status'] for e in json.loads(fleet('inbox', '--json').stdout)] == ['done', 'idle']
+
+
+def test_same_task_fast_event_waits_for_submission_confirmation(setup, tmp_path):
+    _, fleet, _ = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', HERDR_PANE_ID='coordinator')
+    barrier = tmp_path / 'submit-barrier'
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        submitting = pool.submit(fleet, 'send', 'hello', 'go', BARRIER=str(barrier), BARRIER_CALL='agent prompt')
+        try:
+            wait_barrier(barrier)
+            completion = pool.submit(fleet, 'event', '--pane', 'p', '--status', 'done', GET_STATUS='done', GET_SEQ='12')
+            time.sleep(0.2)
+            assert not completion.done()
+        finally:
+            barrier.with_suffix('.release').touch()
+        submitting.result(timeout=10)
+        completion.result(timeout=10)
+    rows = json.loads(fleet('inbox', '--json').stdout)
+    assert len(rows) == 1 and rows[0]['status'] == 'done'
+
+
+def test_manual_round_not_blocked_by_other_task_submit(setup, tmp_path):
+    _, fleet, _ = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
+    fleet('event', '--pane', 'p', '--status', 'done', GET_STATUS='done', GET_SEQ='12')
+    fleet('new', 'other', '-r', 'web', '--no-fetch', NEW_PANE='q', HERDR_PANE_ID='coordinator')
+    barrier = tmp_path / 'submit-barrier'
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        submit = pool.submit(fleet, 'send', 'other', 'go', MULTI='1', BARRIER=str(barrier), BARRIER_CALL='agent prompt')
+        working = None
+        try:
+            wait_barrier(barrier)
+            working = pool.submit(fleet, 'event', '--pane', 'p', '--status', 'working', GET_STATUS='done', GET_SEQ='14')
+            working.result(timeout=2)
+            fleet('event', '--pane', 'p', '--status', 'done', GET_STATUS='done', GET_SEQ='14')
+        finally:
+            barrier.with_suffix('.release').touch()
+        submit.result(timeout=10)
+    assert [e['status'] for e in json.loads(fleet('inbox', '--json').stdout)] == ['done', 'done']
+
+
+def test_event_failed_submission_does_not_start_round(setup):
+    _, fleet, _ = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', HERDR_PANE_ID='coordinator')
+    assert fleet('send', 'hello', 'go', PROMPT_FAIL='agent_blocked', check=False).returncode == 1
+    fleet('event', '--pane', 'p', '--status', 'idle', GET_SEQ='12')
+    assert json.loads(fleet('inbox', '--json').stdout) == []
+
+
+def test_event_send_starts_next_round_without_working_event(setup):
+    _, fleet, _ = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
+    fleet('event', '--pane', 'p', '--status', 'idle', GET_SEQ='12')
+    fleet('send', 'hello', 'again', GET_SEQ='12')
+    fleet('event', '--pane', 'p', '--status', 'idle', GET_SEQ='12')
+    fleet('event', '--pane', 'p', '--status', 'idle', GET_SEQ='14')
+    rows = json.loads(fleet('inbox', '--json').stdout)
+    assert len(rows) == 2 and rows[0]['dedup_key'] != rows[1]['dedup_key']
+
+
+def test_event_exited_without_agent_get(setup):
+    _, fleet, log = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
+    log.write_text('')
+    fleet('event', '--pane', 'p', '--status', 'exited', FAIL='agent get')
+    assert not any(json.loads(line) == ['agent', 'get', 'p'] for line in log.read_text().splitlines())
+    assert json.loads(fleet('inbox', '--json').stdout)[0]['status'] == 'exited'
+
+
+@pytest.mark.parametrize(('call', 'reopen'), [('tab focus', False), ('pane split', True)])
+def test_open_race_with_event_preserves_round_and_deduplicates(setup, tmp_path, call, reopen):
+    root, fleet, log = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
+    barrier = tmp_path / 'barrier'
+    log.write_text('')
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        opening = pool.submit(fleet, 'open', 'hello', HERDR_PANE_ID='coordinator', BARRIER=str(barrier),
+                              BARRIER_CALL=call, **({'NOTAB': '1'} if reopen else {}))
+        try:
+            deadline = time.monotonic() + 8
+            while not barrier.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert barrier.exists(), 'open did not reach the fake herdr barrier'
+            fleet('event', '--pane', 'p', '--status', 'idle', GET_SEQ='12', COORD_STATUS='idle')
+        finally:
+            barrier.with_suffix('.release').touch()
+        opening.result(timeout=10)
+    assert task_data(root, 'hello')['event_round']['notified'] is True
+    fleet('event', '--pane', 'p', '--status', 'idle', GET_SEQ='12', COORD_STATUS='idle')
+    assert len(json.loads(fleet('inbox', '--all', '--json').stdout)) == 1
+    prompts = [c for line in log.read_text().splitlines() if (c := json.loads(line))[:2] == ['agent', 'prompt']]
+    assert len(prompts) == 1
+    assert {p.name for p in (root / 'worktrees/hello').iterdir()} == {'TASK.md', 'web'}
+
+
+def test_event_dedup_key_survives_stale_round_state(setup):
+    root, fleet, _ = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
+    fleet('event', '--pane', 'p', '--status', 'idle', GET_SEQ='12', COORD_STATUS='idle')
+    path = root / 'worktrees/hello/TASK.md'
+    text = path.read_text().replace('"notified": true', '"notified": false')
+    path.write_text(text)
+    fleet('event', '--pane', 'p', '--status', 'idle', GET_SEQ='12', COORD_STATUS='idle')
+    assert len(json.loads(fleet('inbox', '--all', '--json').stdout)) == 1
+    assert task_data(root, 'hello')['event_round']['notified'] is True
+
+
+def test_atomic_task_save_with_concurrent_cli_readers(setup):
+    root, fleet, _ = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', HERDR_PANE_ID='coordinator')
+    path = root / 'worktrees/hello/TASK.md'
+    with path.open('a') as f:
+        f.write('\n' + 'x' * 3000000)
+    def writer():
+        for _ in range(30):
+            fleet('bind', HERDR_PANE_ID='coordinator')
+    def reader():
+        for _ in range(30):
+            rows = json.loads(fleet('ls', '--json').stdout)
+            assert [row['slug'] for row in rows] == ['hello']
+            assert json.loads(fleet('status', 'hello', '--json', '--lines', '0').stdout)['slug'] == 'hello'
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        jobs = [pool.submit(writer), pool.submit(reader)]
+        for job in jobs: job.result(timeout=60)
+    assert {p.name for p in path.parent.iterdir()} == {'TASK.md', 'web'}
+
+
+def test_delivery_idle_and_inbox_history(setup):
+    _, fleet, log = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
+    log.write_text('')
+    fleet('event', '--pane', 'p', '--status', 'idle', GET_SEQ='12', COORD_STATUS='idle')
+    calls = [json.loads(line) for line in log.read_text().splitlines()]
+    prompts = [c for c in calls if c[:2] == ['agent', 'prompt']]
+    assert len(prompts) == 1 and prompts[0][2] == 'coordinator'
+    assert prompts[0][3].splitlines()[0] == 'herdr-fleet 自动通知（非用户消息）'
+    assert 'hello idle' in prompts[0][3] and 'fleet status' in prompts[0][3]
+    assert json.loads(fleet('inbox', '--json').stdout) == []
+    assert json.loads(fleet('inbox', '--all', '--json').stdout)[0]['delivery'] == 'delivered'
+
+
+def test_delivery_busy_then_coordinator_idle_merges(setup):
+    _, fleet, log = setup
+    for slug, pane in [('hello', 'p'), ('other', 'q')]:
+        fleet('new', slug, '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator', NEW_PANE=pane)
+        fleet('event', '--pane', pane, '--status', 'idle', GET_SEQ='12', OTHER_SEQ='12')
+    assert len(json.loads(fleet('inbox', '--json').stdout)) == 2
+    log.write_text('')
+    fleet('event', '--pane', 'coordinator', '--status', 'idle', COORD_STATUS='idle')
+    prompts = [c for line in log.read_text().splitlines() if (c := json.loads(line))[:2] == ['agent', 'prompt']]
+    assert len(prompts) == 1 and all(slug in prompts[0][3] for slug in ('hello', 'other'))
+    assert json.loads(fleet('inbox', '--json').stdout) == []
+
+
+def test_delivery_missing_pane_warns_once(setup):
+    _, fleet, log = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
+    log.write_text('')
+    fleet('event', '--pane', 'p', '--status', 'idle', GET_SEQ='12', COORD_MISSING='1')
+    fleet('event', '--pane', 'coordinator', '--status', 'idle', COORD_MISSING='1')
+    calls = [json.loads(line) for line in log.read_text().splitlines()]
+    assert sum(c[:2] == ['notification', 'show'] for c in calls) == 1
+    assert len(json.loads(fleet('inbox', '--json').stdout)) == 1
+
+
+def test_delivery_unconfirmed_records_failure(setup):
+    _, fleet, _ = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
+    fleet('event', '--pane', 'p', '--status', 'idle', GET_SEQ='12', COORD_STATUS='idle', DELIVERY_RESULT='unknown')
+    event = json.loads(fleet('inbox', '--json').stdout)[0]
+    assert event['attempts'] == 1 and event['last_error']
+
+
+def test_delivery_concurrent_hooks_do_not_repeat_prompt(setup):
+    _, fleet, log = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
+    fleet('event', '--pane', 'p', '--status', 'idle', GET_SEQ='12')
+    log.write_text('')
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(lambda _: fleet('event', '--pane', 'coordinator', '--status', 'idle', COORD_STATUS='idle', DELIVERY_DELAY='0.3'), range(2)))
+    calls = [json.loads(line) for line in log.read_text().splitlines()]
+    assert sum(c[:2] == ['agent', 'prompt'] for c in calls) == 1
+
+
+def test_delivery_does_not_hold_global_lock_during_prompt(setup):
+    _, fleet, log = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
+    fleet('event', '--pane', 'p', '--status', 'idle', GET_SEQ='12')
+    log.write_text('')
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        delivery = pool.submit(fleet, 'event', '--pane', 'coordinator', '--status', 'idle', COORD_STATUS='idle', DELIVERY_DELAY='2')
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and 'agent", "prompt' not in log.read_text():
+            time.sleep(0.02)
+        assert 'agent", "prompt' in log.read_text()
+        assert len(json.loads(fleet('inbox', '--json').stdout)) == 1
+        assert not delivery.done()
+        delivery.result()
+
+
+def test_delivery_truncates_oversized_notice(setup, tmp_path):
+    _, fleet, log = setup
+    gh = tmp_path / 'fake-gh'
+    gh.write_text('#!/usr/bin/env python3\nimport json\nprint(json.dumps([{"url": "x" * 125000}]))\n')
+    gh.chmod(0o755)
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
+    log.write_text('')
+    fleet('event', '--pane', 'p', '--status', 'idle', GET_SEQ='12', COORD_STATUS='idle', FLEET_GH=str(gh))
+    prompts = [c for line in log.read_text().splitlines() if (c := json.loads(line))[:2] == ['agent', 'prompt']]
+    assert len(prompts[0][3].encode()) < 131071
+    assert '另有 1 个任务' in prompts[0][3] and 'fleet status' in prompts[0][3]
+
+
+def blocking_gh(tmp_path):
+    gh = tmp_path / 'blocking-gh'
+    gh.write_text('''#!/usr/bin/env python3
+import json, os, time
+from pathlib import Path
+barrier = Path(os.environ['GH_BARRIER'])
+barrier.touch()
+deadline = time.monotonic() + 8
+while not barrier.with_suffix('.release').exists():
+    if time.monotonic() >= deadline: raise SystemExit(2)
+    time.sleep(0.01)
+print(json.dumps([]))
+''')
+    gh.chmod(0o755)
+    return gh
+
+
+def wait_barrier(barrier):
+    deadline = time.monotonic() + 6
+    while not barrier.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert barrier.exists()
+
+
+def test_delivery_rebind_during_message_construction(setup, tmp_path):
+    root, fleet, log = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='old')
+    fleet('event', '--pane', 'p', '--status', 'idle', GET_SEQ='12')
+    log.write_text('')
+    barrier, gh = tmp_path / 'delivery-barrier', blocking_gh(tmp_path)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        old = pool.submit(fleet, 'event', '--pane', 'old', '--status', 'idle', COORD_STATUS='idle',
+                          FLEET_GH=str(gh), GH_BARRIER=str(barrier))
+        try:
+            wait_barrier(barrier)
+            fleet('bind', HERDR_PANE_ID='new')
+            fleet('event', '--pane', 'new', '--status', 'idle', COORD_STATUS='idle')
+        finally:
+            barrier.with_suffix('.release').touch()
+        old.result(timeout=10)
+    prompts = [c for line in log.read_text().splitlines() if (c := json.loads(line))[:2] == ['agent', 'prompt']]
+    assert [c[2] for c in prompts] == ['new']
+    events = json.loads(fleet('inbox', '--all', '--json').stdout)
+    assert len(events) == 1 and events[0]['delivery'] == 'delivered' and events[0]['coordinator_pane'] == 'new'
+
+
+def test_delivery_status_rechecked_after_message_construction(setup, tmp_path):
+    _, fleet, log = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='old')
+    fleet('event', '--pane', 'p', '--status', 'idle', GET_SEQ='12')
+    log.write_text('')
+    barrier, gh = tmp_path / 'delivery-barrier', blocking_gh(tmp_path)
+    status = tmp_path / 'status'
+    status.write_text('idle')
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        delivery = pool.submit(fleet, 'event', '--pane', 'old', '--status', 'idle', COORD_STATUS_FILE=str(status),
+                               FLEET_GH=str(gh), GH_BARRIER=str(barrier))
+        try:
+            wait_barrier(barrier)
+            status.write_text('working')
+        finally:
+            barrier.with_suffix('.release').touch()
+        delivery.result(timeout=10)
+    prompts = [c for line in log.read_text().splitlines() if (c := json.loads(line))[:2] == ['agent', 'prompt']]
+    assert prompts == []
+    assert len(json.loads(fleet('inbox', '--json').stdout)) == 1
+
+
+def test_bind_waits_for_inflight_delivery_and_does_not_redeliver(setup, tmp_path):
+    _, fleet, log = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='old')
+    fleet('event', '--pane', 'p', '--status', 'idle', GET_SEQ='12')
+    log.write_text('')
+    barrier = tmp_path / 'prompt-barrier'
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        delivery = pool.submit(fleet, 'event', '--pane', 'old', '--status', 'idle', COORD_STATUS='idle',
+                               BARRIER=str(barrier), BARRIER_CALL='agent prompt')
+        try:
+            wait_barrier(barrier)
+            binding = pool.submit(fleet, 'bind', HERDR_PANE_ID='new')
+            time.sleep(0.2)
+            assert not binding.done()
+        finally:
+            barrier.with_suffix('.release').touch()
+        delivery.result(timeout=10)
+        binding.result(timeout=10)
+    fleet('event', '--pane', 'new', '--status', 'idle', COORD_STATUS='idle')
+    prompts = [c for line in log.read_text().splitlines() if (c := json.loads(line))[:2] == ['agent', 'prompt']]
+    assert [c[2] for c in prompts] == ['old']
+    events = json.loads(fleet('inbox', '--all', '--json').stdout)
+    assert len(events) == 1 and events[0]['delivery'] == 'delivered' and events[0]['coordinator_pane'] == 'old'
 
 
 def starts(log):

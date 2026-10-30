@@ -7,6 +7,8 @@ holding .herdr-fleet.toml (or FLEET_ROOT); see references/workflow.md.
 """
 import argparse
 import datetime
+import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -17,6 +19,8 @@ import sys
 import tempfile
 import time
 import tomllib
+from contextlib import contextmanager, ExitStack
+from typing import Literal, TypedDict
 
 CONFIG = '.herdr-fleet.toml'
 HERDR = os.environ.get('FLEET_HERDR') or os.environ.get('HERDR_BIN_PATH') or 'herdr'
@@ -29,6 +33,18 @@ SETTINGS = {}
 
 class SubmissionError(RuntimeError):
     pass
+
+
+class InboxEvent(TypedDict):
+    root: str
+    slug: str
+    coordinator_pane: str
+    status: str
+    created: str
+    dedup_key: str
+    delivery: Literal['pending', 'delivered']
+    attempts: int
+    last_error: str | None
 
 
 def run(*args, cwd=None, check=True, input=None):
@@ -188,31 +204,332 @@ def save(data):
     path = task_dir(data['slug']) / 'TASK.md'
     before, rest = path.read_text().split('```json\n', 1)
     _, after = rest.split('\n```', 1)
-    path.write_text(before + '```json\n' + json.dumps(data, ensure_ascii=False, indent=2) + '\n```' + after)
+    text = before + '```json\n' + json.dumps(data, ensure_ascii=False, indent=2) + '\n```' + after
+    temp = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', dir=path.parent, prefix='.TASK.md.', delete=False) as out:
+            temp = Path(out.name)
+            os.fchmod(out.fileno(), path.stat().st_mode & 0o7777)
+            out.write(text)
+        os.replace(temp, path)
+    finally:
+        if temp is not None:
+            temp.unlink(missing_ok=True)
+
+
+@contextmanager
+def fleet_state(write=False):
+    directory = Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local/state') / 'herdr-fleet'
+    directory.mkdir(parents=True, exist_ok=True)
+    with (directory / 'lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        def read(name, default):
+            path = directory / name
+            return json.loads(path.read_text()) if path.exists() else default
+        panes, inbox = read('panes.json', {}), read('inbox.json', [])
+        yield panes, inbox
+        if write:
+            for name, value in (('panes.json', panes), ('inbox.json', inbox)):
+                with tempfile.NamedTemporaryFile(mode='w', dir=directory, delete=False) as out:
+                    json.dump(value, out, ensure_ascii=False, indent=2)
+                    temp = out.name
+                os.replace(temp, directory / name)
+
+
+def prune_coordinators(panes, inbox):
+    active = ({d.get('coordinator_pane') for d in tasks()}
+              | {event.get('coordinator_pane') for event in inbox
+                 if event.get('root') == str(ROOT) and event.get('delivery') == 'pending'})
+    for pane, entry in list(panes.items()):
+        if entry.get('root') == str(ROOT) and entry.get('role') == 'coordinator' and pane not in active:
+            del panes[pane]
+
+
+def register_task(data, pane):
+    coordinator = os.environ.get('HERDR_PANE_ID')
+    if not coordinator:
+        return
+    with fleet_state(write=True) as (panes, inbox):
+        data = load(data['slug'])
+        data['coordinator_pane'] = coordinator
+        save(data)
+        for old, entry in list(panes.items()):
+            if entry == {'root': str(ROOT), 'slug': data['slug'], 'role': 'task'}:
+                del panes[old]
+        panes[pane] = {'root': str(ROOT), 'slug': data['slug'], 'role': 'task'}
+        if panes.get(coordinator, {}).get('root') != str(ROOT) or panes[coordinator].get('role') != 'coordinator':
+            panes[coordinator] = {'root': str(ROOT), 'role': 'coordinator'}
+        prune_coordinators(panes, inbox)
+
+
+def bind():
+    coordinator = os.environ.get('HERDR_PANE_ID')
+    if not coordinator:
+        raise RuntimeError('请在 herdr pane 中运行 fleet bind')
+    tabs, agents = herdr_state()
+    while True:
+        with fleet_state() as (_, inbox):
+            locks = bind_coordinators(coordinator, inbox)
+        with ExitStack() as stack:
+            for pane in sorted(locks):
+                stack.enter_context(delivery_lock(pane))
+            with fleet_state(write=True) as (panes, inbox):
+                if not bind_coordinators(coordinator, inbox) <= locks:
+                    continue
+                bind_locked(coordinator, tabs, agents, panes, inbox)
+                return
+
+
+def bind_coordinators(coordinator, inbox):
+    return ({coordinator}
+            | {data['coordinator_pane'] for data in tasks() if data.get('coordinator_pane')}
+            | {item['coordinator_pane'] for item in inbox if item.get('root') == str(ROOT)
+               and item.get('delivery') == 'pending' and item.get('coordinator_pane')})
+
+
+def bind_locked(coordinator, tabs, agents, panes, inbox):
+    current = tasks()
+    for data in current:
+        data['coordinator_pane'] = coordinator
+        save(data)
+        tab = find_tab(data['slug'], tabs)
+        agent = next((item for item in agents if tab and item.get('tab_id') == tab['tab_id']), None)
+        if agent:
+            for pane, entry in list(panes.items()):
+                if entry == {'root': str(ROOT), 'slug': data['slug'], 'role': 'task'}:
+                    del panes[pane]
+            panes[agent['pane_id']] = {'root': str(ROOT), 'slug': data['slug'], 'role': 'task'}
+    slugs = {data['slug'] for data in current}
+    for event in inbox:
+        if event.get('root') == str(ROOT) and event.get('slug') in slugs and event.get('delivery') == 'pending':
+            event['coordinator_pane'] = coordinator
+    if current:
+        if panes.get(coordinator, {}).get('root') != str(ROOT) or panes[coordinator].get('role') != 'coordinator':
+            panes[coordinator] = {'root': str(ROOT), 'role': 'coordinator'}
+    prune_coordinators(panes, inbox)
+
+
+def inbox_list(a):
+    with fleet_state() as (_, inbox):
+        events = [event for event in inbox if event.get('root') == str(ROOT) and (a.all or event.get('delivery') == 'pending')]
+    display(events, a.json)
+
+
+def task_event(a):
+    with fleet_state(write=True) as (panes, inbox):
+        entry = panes.get(a.pane)
+        if not entry or entry.get('role') != 'task' or entry.get('root') != str(ROOT):
+            return
+        try:
+            data = load(entry['slug'])
+        except RuntimeError:
+            return
+        coordinator = data.get('coordinator_pane')
+        if not coordinator:
+            return
+        round_state = data.get('event_round')
+        if a.status == 'exited':
+            if not round_state or round_state['notified']:
+                return
+            seq = None
+        else:
+            agent = herdr('agent', 'get', a.pane)['agent']
+            seq = agent['state_change_seq']
+            if not isinstance(seq, int):
+                raise RuntimeError('agent 未提供有效的 state_change_seq')
+            status = agent['agent_status']
+            if a.status == 'working':
+                if status not in ('working', 'idle', 'done', 'blocked'):
+                    return
+                if round_state is None or (round_state['notified'] and seq > round_state['last_terminal_seq']):
+                    last = round_state['last_terminal_seq'] if round_state else -1
+                    # Hooks lack a sequence: a late old working edge followed by
+                    # done->idle is indistinguishable from a new fast round.
+                    # Prefer an extra notice over silently losing that round.
+                    round_state = {'baseline': seq if status == 'working' else seq - 1,
+                                   'notified': False, 'last_terminal_seq': last}
+                elif round_state['notified']:
+                    return
+                if status == 'working':
+                    data['event_round'] = round_state
+                    save(data)
+                    return
+                a.status = status
+            elif status != a.status:
+                return
+            if not round_state or round_state['notified'] or seq <= round_state['baseline']:
+                return
+        round_state['notified'] = True
+        round_state['last_terminal_seq'] = seq if seq is not None else round_state['baseline']
+        key = json.dumps([str(ROOT), data['slug'], round_state['baseline']], ensure_ascii=False)
+        exists = any(item.get('dedup_key') == key for item in inbox)
+        if not exists:
+            inbox.append({'root': str(ROOT), 'slug': data['slug'], 'coordinator_pane': coordinator,
+                          'status': a.status, 'created': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                          'dedup_key': key, 'delivery': 'pending', 'attempts': 0, 'last_error': None})
+        data['event_round'] = round_state
+        save(data)
+        if not exists:
+            return coordinator
+
+
+def herdr_result(*args):
+    try:
+        p = subprocess.run([HERDR, *map(str, args)], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 1, {}, str(e)
+    try:
+        payload = json.loads(p.stdout or p.stderr)
+    except ValueError:
+        payload = {}
+    return p.returncode, payload, (p.stderr or p.stdout).strip()
+
+
+def notice_text(events):
+    header = 'herdr-fleet 自动通知（非用户消息）'
+    footer = '请逐个使用 fleet status <slug> 核查。'
+    lines = []
+    for item in events:
+        phase, prs = 'unknown', []
+        try:
+            data = load(item['slug'])
+            repos = {}
+            for key, info in data['repos'].items():
+                repo = REPOS[key]['path']
+                repos[key] = repo_info(repo, task_dir(item['slug']) / REPOS[key]['dir'], info['branch'], info['base'], info['base_commit'])
+                pr = pr_info(repo, info['branch'])
+                if pr and pr.get('url'): prs.append(pr['url'])
+            phase = task_phase(item['status'], repos)
+        except (RuntimeError, OSError, ValueError, KeyError):
+            pass
+        lines.append(f"{item['slug']} {item['status']} {phase} {','.join(prs) or '-'}".replace('\n', ' '))
+    shown = []
+    for line in lines:
+        remaining = len(lines) - len(shown) - 1
+        suffix = [f'另有 {remaining} 个任务' if remaining else '', footer]
+        candidate = '\n'.join([header, *shown, line, *filter(None, suffix)])
+        if len(candidate.encode()) > 120000:
+            break
+        shown.append(line)
+    remaining = len(lines) - len(shown)
+    return '\n'.join([header, *shown, *([f'另有 {remaining} 个任务'] if remaining else []), footer])
+
+
+@contextmanager
+def delivery_lock(coordinator):
+    directory = Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local/state') / 'herdr-fleet'
+    directory.mkdir(parents=True, exist_ok=True)
+    name = hashlib.sha256(coordinator.encode()).hexdigest()
+    with (directory / ('delivery-' + name + '.lock')).open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+def deliver(coordinator):
+    while True:
+        with fleet_state() as (_, inbox):
+            selected = [item.copy() for item in inbox if item.get('root') == str(ROOT) and item.get('coordinator_pane') == coordinator and item.get('delivery') == 'pending']
+        if not selected:
+            return
+        text = notice_text(selected)
+        keys = {item['dedup_key'] for item in selected}
+        with delivery_lock(coordinator):
+            with fleet_state() as (_, inbox):
+                current = {item['dedup_key'] for item in inbox if item.get('root') == str(ROOT)
+                           and item.get('coordinator_pane') == coordinator and item.get('delivery') == 'pending'}
+            if not keys <= current:
+                continue
+            code, payload, error = herdr_result('agent', 'get', coordinator)
+            result = payload.get('result', {})
+            if code:
+                error_code = payload.get('error', {}).get('code')
+                missing = error_code == 'pane_not_found'
+                if error_code == 'agent_not_found':
+                    pane_code, pane_payload, _ = herdr_result('pane', 'get', coordinator)
+                    missing = bool(pane_code and pane_payload.get('error', {}).get('code') == 'pane_not_found')
+                if missing:
+                    with fleet_state(write=True) as (panes, _):
+                        entry = panes.get(coordinator, {})
+                        warn = not entry.get('missing_notified')
+                        if warn: entry['missing_notified'] = True
+                    if warn:
+                        herdr_result('notification', 'show', 'herdr-fleet 通知未送达', '--body', f'主 agent pane {coordinator} 不存在，请检查 fleet inbox')
+                return
+            status = result.get('agent', {}).get('agent_status')
+            if status not in ('idle', 'done'):
+                return
+            code, payload, error = herdr_result('agent', 'prompt', coordinator, text)
+            result = payload.get('result', payload)
+            success = code == 0 and result.get('type') == 'agent_prompted'
+            with fleet_state(write=True) as (_, inbox):
+                for item in inbox:
+                    if (item.get('root') == str(ROOT) and item.get('dedup_key') in keys
+                            and item.get('coordinator_pane') == coordinator and item.get('delivery') == 'pending'):
+                        item['attempts'] += 1
+                        item['last_error'] = None if success else (error or 'agent_prompted 未确认')
+                        if success: item['delivery'] = 'delivered'
+            if not success:
+                return
+
+
+def event(a):
+    with fleet_state() as (panes, _):
+        entry = panes.get(a.pane, {})
+        coordinator = entry.get('role') == 'coordinator' and entry.get('root') == str(ROOT)
+    if coordinator:
+        if a.status in ('idle', 'done'):
+            deliver(a.pane)
+        return
+    if entry.get('role') != 'task' or entry.get('root') != str(ROOT):
+        return
+    with task_lock(entry['slug']):
+        target = task_event(a)
+    if target:
+        deliver(target)
+
+
+@contextmanager
+def task_lock(slug):
+    directory = Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local/state') / 'herdr-fleet'
+    directory.mkdir(parents=True, exist_ok=True)
+    name = hashlib.sha256(json.dumps([str(ROOT), slug]).encode()).hexdigest()
+    with (directory / ('task-' + name + '.lock')).open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
 
 
 def submit(data, pane, text):
-    agent = herdr('agent', 'get', pane)['agent']
-    if agent['agent_status'] == 'blocked':
-        raise RuntimeError(f"agent 已 blocked，请先 fleet peek {data['slug']}")
-    seq = agent['state_change_seq']
-    if not isinstance(seq, int):
-        raise RuntimeError('agent 未提供有效的 state_change_seq')
-    data['submit_seq'] = seq
-    save(data)
-    p = subprocess.run([HERDR, 'agent', 'prompt', pane, text, '--wait', '--until', 'working', '--until', 'blocked', '--timeout', '5000'], capture_output=True, text=True)
-    if p.returncode:
-        try:
-            error = json.loads(p.stdout or p.stderr).get('error', {}).get('code')
-        except ValueError:
-            error = None
-        if error in ('timeout', 'agent_prompt_stalled'):
-            current = herdr('agent', 'get', pane)['agent']
-            if current['state_change_seq'] > seq and current['agent_status'] in ('idle', 'done', 'blocked'):
-                return
-        if error == 'agent_blocked':
+    # Only the same task's event handlers wait for submission confirmation.
+    with task_lock(data['slug']):
+        agent = herdr('agent', 'get', pane)['agent']
+        if agent['agent_status'] == 'blocked':
             raise RuntimeError(f"agent 已 blocked，请先 fleet peek {data['slug']}")
-        raise RuntimeError(f'开始确认失败：{p.stderr or p.stdout}')
+        seq = agent['state_change_seq']
+        if not isinstance(seq, int):
+            raise RuntimeError('agent 未提供有效的 state_change_seq')
+        with fleet_state():
+            data = load(data['slug'])
+            data['submit_seq'] = seq
+            save(data)
+        p = subprocess.run([HERDR, 'agent', 'prompt', pane, text, '--wait', '--until', 'working', '--until', 'blocked', '--timeout', '5000'], capture_output=True, text=True)
+        if p.returncode:
+            try:
+                error = json.loads(p.stdout or p.stderr).get('error', {}).get('code')
+            except ValueError:
+                error = None
+            if error in ('timeout', 'agent_prompt_stalled'):
+                current = herdr('agent', 'get', pane)['agent']
+                if current['state_change_seq'] > seq and current['agent_status'] in ('idle', 'done', 'blocked'):
+                    p = None
+            if p is not None:
+                if error == 'agent_blocked':
+                    raise RuntimeError(f"agent 已 blocked，请先 fleet peek {data['slug']}")
+                raise RuntimeError(f'开始确认失败：{p.stderr or p.stdout}')
+        with fleet_state():
+            data = load(data['slug'])
+            previous = data.get('event_round', {})
+            data['event_round'] = {'baseline': seq, 'notified': False, 'last_terminal_seq': previous.get('last_terminal_seq', -1)}
+            save(data)
 
 
 def tasks():
@@ -293,6 +610,7 @@ def create_tab(data, agent, focus=False, explicit=None, prompt=None):
     except Exception:
         herdr('tab', 'close', tid)
         raise
+    register_task(data, pane)
     if prompt and agent['kind'] != 'none':
             context = [f'任务目录：{dest}']
             for key, details in data['repos'].items():
@@ -653,6 +971,12 @@ def done(a):
         git(repo, 'worktree', 'prune')
     (dest / 'TASK.md').unlink()
     dest.rmdir()
+    with fleet_state(write=True) as (panes, inbox):
+        for pane, entry in list(panes.items()):
+            if entry == {'root': str(ROOT), 'slug': a.slug, 'role': 'task'}:
+                del panes[pane]
+        inbox[:] = [event for event in inbox if not (event.get('root') == str(ROOT) and event.get('slug') == a.slug)]
+        prune_coordinators(panes, inbox)
     print('完成', flush=True)
     if tab:
         herdr('tab', 'close', tab['tab_id'])
@@ -726,6 +1050,9 @@ def main():
     o.add_argument('--agent-arg', action='append', metavar='ARG', help='agent 启动参数，可重复；以 - 开头的值须写成 --agent-arg=--flag')
     d = sub.add_parser('done'); d.add_argument('slug'); d.add_argument('--force', action='store_true'); d.add_argument('--discard', action='store_true'); d.add_argument('--no-fetch', action='store_true'); d.add_argument('--dry-run', action='store_true')
     g = sub.add_parser('gc'); g.add_argument('--apply', action='store_true'); g.add_argument('--json', action='store_true')
+    i = sub.add_parser('inbox'); i.add_argument('--all', action='store_true'); i.add_argument('--json', action='store_true')
+    sub.add_parser('bind')
+    e = sub.add_parser('event'); e.add_argument('--pane', required=True); e.add_argument('--status', required=True, choices=('working', 'idle', 'done', 'blocked', 'exited'))
     a = p.parse_args()
     try:
         ROOT = find_root()
@@ -736,21 +1063,26 @@ def main():
         elif a.command == 'wait': return wait(a)
         elif a.command == 'done': return done(a)
         elif a.command == 'gc': gc(a)
+        elif a.command == 'inbox': inbox_list(a)
+        elif a.command == 'bind': bind()
+        elif a.command == 'event': event(a)
         elif a.command == 'peek': print(herdr('agent', 'read', task_agent(a.slug), '--source', 'recent-unwrapped', '--lines', a.lines, json_output=False))
         elif a.command == 'send': submit(load(a.slug), task_agent(a.slug), a.text)
         elif a.command == 'open':
             data = load(a.slug)
-            tab = find_tab(a.slug, herdr_state()[0])
-            if tab: herdr('tab', 'focus', tab['tab_id'])
+            tabs, agents = herdr_state()
+            tab = find_tab(a.slug, tabs)
+            if tab:
+                herdr('tab', 'focus', tab['tab_id'])
+                live = next((agent for agent in agents if agent.get('tab_id') == tab['tab_id']), None)
+                if live: register_task(data, live['pane_id'])
             else:
                 agent = agent_options(a, data)
                 if create_tab(data, agent, focus=True):
-                    data['agent'] = agent
-                    path = task_dir(a.slug) / 'TASK.md'
-                    text = path.read_text()
-                    before, rest = text.split('```json\n', 1)
-                    _, after = rest.split('\n```', 1)
-                    path.write_text(before + '```json\n' + json.dumps(data, ensure_ascii=False, indent=2) + '\n```' + after)
+                    with fleet_state():
+                        data = load(a.slug)
+                        data['agent'] = agent
+                        save(data)
     except (RuntimeError, OSError, ValueError, KeyError) as e:
         print(f'错误：{e}', file=sys.stderr)
         return 1
