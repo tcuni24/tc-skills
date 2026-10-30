@@ -234,6 +234,102 @@ def test_legacy_task_without_coordinator_and_bind_requires_pane(setup):
     assert not (root / 'worktrees/hello').exists()
 
 
+def test_event_ignores_unknown_and_legacy_without_herdr(setup):
+    root, fleet, log = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', HERDR_PANE_ID='coordinator')
+    path = root / 'worktrees/hello/TASK.md'
+    text = path.read_text()
+    data = task_data(root, 'hello')
+    del data['coordinator_pane']
+    before, rest = text.split('```json\n', 1)
+    _, after = rest.split('\n```', 1)
+    path.write_text(before + '```json\n' + json.dumps(data) + '\n```' + after)
+    log.write_text('')
+    for pane in ('unknown', 'p'):
+        result = fleet('event', '--pane', pane, '--status', 'idle')
+        assert result.stdout == result.stderr == ''
+    assert log.read_text() == ''
+
+
+def test_event_fast_completion_stale_and_next_round(setup):
+    _, fleet, log = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
+    def event(status, seq, current=None):
+        fleet('event', '--pane', 'p', '--status', status, GET_STATUS=current or status, GET_SEQ=str(seq))
+    event('idle', 10)
+    assert json.loads(fleet('inbox', '--json').stdout) == []
+    event('idle', 12)
+    event('working', 11)
+    event('idle', 12)
+    rows = json.loads(fleet('inbox', '--all', '--json').stdout)
+    assert len(rows) == 1 and rows[0]['status'] == 'idle' and rows[0]['delivery'] == 'pending'
+    event('working', 13)
+    event('blocked', 14)
+    rows = json.loads(fleet('inbox', '--all', '--json').stdout)
+    assert [r['status'] for r in rows] == ['idle', 'blocked']
+    assert len({r['dedup_key'] for r in rows}) == 2
+
+
+@pytest.mark.parametrize('status', ['blocked', 'exited'])
+def test_event_terminal_statuses(setup, status):
+    _, fleet, _ = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
+    for _ in range(2):
+        fleet('event', '--pane', 'p', '--status', status, GET_STATUS=status, GET_SEQ='11')
+    rows = json.loads(fleet('inbox', '--json').stdout)
+    assert len(rows) == 1 and rows[0]['status'] == status
+
+
+def test_event_concurrent_distinct_and_duplicate(setup):
+    _, fleet, _ = setup
+    for slug, pane in [('hello', 'p'), ('other', 'q')]:
+        fleet('new', slug, '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator', NEW_PANE=pane)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(lambda pane: fleet('event', '--pane', pane, '--status', 'idle', GET_SEQ='12', OTHER_SEQ='12'), ['p', 'q', 'p', 'q']))
+    assert all(result.returncode == 0 for result in results)
+    rows = json.loads(fleet('inbox', '--json').stdout)
+    assert {row['slug'] for row in rows} == {'hello', 'other'} and len(rows) == 2
+
+
+def test_event_manual_working_and_stale_status(setup):
+    _, fleet, _ = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', HERDR_PANE_ID='coordinator')
+    fleet('event', '--pane', 'p', '--status', 'idle', GET_SEQ='12')
+    fleet('event', '--pane', 'p', '--status', 'working', GET_STATUS='idle', GET_SEQ='12')
+    assert json.loads(fleet('inbox', '--json').stdout) == []
+    fleet('event', '--pane', 'p', '--status', 'working', GET_STATUS='working', GET_SEQ='13')
+    fleet('event', '--pane', 'p', '--status', 'done', GET_STATUS='done', GET_SEQ='14')
+    assert [r['status'] for r in json.loads(fleet('inbox', '--json').stdout)] == ['done']
+
+
+def test_event_failed_submission_does_not_start_round(setup):
+    _, fleet, _ = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', HERDR_PANE_ID='coordinator')
+    assert fleet('send', 'hello', 'go', PROMPT_FAIL='agent_blocked', check=False).returncode == 1
+    fleet('event', '--pane', 'p', '--status', 'idle', GET_SEQ='12')
+    assert json.loads(fleet('inbox', '--json').stdout) == []
+
+
+def test_event_send_starts_next_round_without_working_event(setup):
+    _, fleet, _ = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
+    fleet('event', '--pane', 'p', '--status', 'idle', GET_SEQ='12')
+    fleet('send', 'hello', 'again', GET_SEQ='12')
+    fleet('event', '--pane', 'p', '--status', 'idle', GET_SEQ='12')
+    fleet('event', '--pane', 'p', '--status', 'idle', GET_SEQ='14')
+    rows = json.loads(fleet('inbox', '--json').stdout)
+    assert len(rows) == 2 and rows[0]['dedup_key'] != rows[1]['dedup_key']
+
+
+def test_event_exited_without_agent_get(setup):
+    _, fleet, log = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
+    log.write_text('')
+    fleet('event', '--pane', 'p', '--status', 'exited', FAIL='agent get')
+    assert log.read_text() == ''
+    assert json.loads(fleet('inbox', '--json').stdout)[0]['status'] == 'exited'
+
+
 def starts(log):
     return [call for line in log.read_text().splitlines() if (call := json.loads(line))[:2] == ['agent', 'start']]
 

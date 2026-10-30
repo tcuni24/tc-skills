@@ -279,28 +279,82 @@ def inbox_list(a):
     display(events, a.json)
 
 
-def submit(data, pane, text):
-    agent = herdr('agent', 'get', pane)['agent']
-    if agent['agent_status'] == 'blocked':
-        raise RuntimeError(f"agent 已 blocked，请先 fleet peek {data['slug']}")
-    seq = agent['state_change_seq']
-    if not isinstance(seq, int):
-        raise RuntimeError('agent 未提供有效的 state_change_seq')
-    data['submit_seq'] = seq
-    save(data)
-    p = subprocess.run([HERDR, 'agent', 'prompt', pane, text, '--wait', '--until', 'working', '--until', 'blocked', '--timeout', '5000'], capture_output=True, text=True)
-    if p.returncode:
+def event(a):
+    with fleet_state(write=True) as (panes, inbox):
+        entry = panes.get(a.pane)
+        if not entry or entry.get('role') != 'task' or entry.get('root') != str(ROOT):
+            return
         try:
-            error = json.loads(p.stdout or p.stderr).get('error', {}).get('code')
-        except ValueError:
-            error = None
-        if error in ('timeout', 'agent_prompt_stalled'):
-            current = herdr('agent', 'get', pane)['agent']
-            if current['state_change_seq'] > seq and current['agent_status'] in ('idle', 'done', 'blocked'):
+            data = load(entry['slug'])
+        except RuntimeError:
+            return
+        coordinator = data.get('coordinator_pane')
+        if not coordinator:
+            return
+        round_state = data.get('event_round')
+        if a.status == 'exited':
+            if not round_state or round_state['notified']:
                 return
-        if error == 'agent_blocked':
+            seq = None
+        else:
+            agent = herdr('agent', 'get', a.pane)['agent']
+            seq = agent['state_change_seq']
+            if not isinstance(seq, int):
+                raise RuntimeError('agent 未提供有效的 state_change_seq')
+            if agent['agent_status'] != a.status:
+                return
+            if a.status == 'working':
+                if round_state is None:
+                    round_state = {'baseline': seq, 'notified': False, 'last_terminal_seq': -1}
+                elif round_state['notified'] and seq > round_state['last_terminal_seq']:
+                    round_state = {'baseline': seq, 'notified': False, 'last_terminal_seq': round_state['last_terminal_seq']}
+                else:
+                    return
+                data['event_round'] = round_state
+                save(data)
+                return
+            if not round_state or round_state['notified'] or seq <= round_state['baseline']:
+                return
+        round_state['notified'] = True
+        round_state['last_terminal_seq'] = seq if seq is not None else round_state['baseline']
+        key = json.dumps([str(ROOT), data['slug'], round_state['baseline']], ensure_ascii=False)
+        inbox.append({'root': str(ROOT), 'slug': data['slug'], 'coordinator_pane': coordinator,
+                      'status': a.status, 'created': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                      'dedup_key': key, 'delivery': 'pending', 'attempts': 0, 'last_error': None})
+        data['event_round'] = round_state
+        save(data)
+
+
+def submit(data, pane, text):
+    # Serialize submission confirmation with event processing so fast completions
+    # cannot be mistaken for a failed or previous submission.
+    with fleet_state():
+        data = load(data['slug'])
+        agent = herdr('agent', 'get', pane)['agent']
+        if agent['agent_status'] == 'blocked':
             raise RuntimeError(f"agent 已 blocked，请先 fleet peek {data['slug']}")
-        raise RuntimeError(f'开始确认失败：{p.stderr or p.stdout}')
+        seq = agent['state_change_seq']
+        if not isinstance(seq, int):
+            raise RuntimeError('agent 未提供有效的 state_change_seq')
+        data['submit_seq'] = seq
+        save(data)
+        p = subprocess.run([HERDR, 'agent', 'prompt', pane, text, '--wait', '--until', 'working', '--until', 'blocked', '--timeout', '5000'], capture_output=True, text=True)
+        if p.returncode:
+            try:
+                error = json.loads(p.stdout or p.stderr).get('error', {}).get('code')
+            except ValueError:
+                error = None
+            if error in ('timeout', 'agent_prompt_stalled'):
+                current = herdr('agent', 'get', pane)['agent']
+                if current['state_change_seq'] > seq and current['agent_status'] in ('idle', 'done', 'blocked'):
+                    p = None
+            if p is not None:
+                if error == 'agent_blocked':
+                    raise RuntimeError(f"agent 已 blocked，请先 fleet peek {data['slug']}")
+                raise RuntimeError(f'开始确认失败：{p.stderr or p.stdout}')
+        previous = data.get('event_round', {})
+        data['event_round'] = {'baseline': seq, 'notified': False, 'last_terminal_seq': previous.get('last_terminal_seq', -1)}
+        save(data)
 
 
 def tasks():
@@ -823,6 +877,7 @@ def main():
     g = sub.add_parser('gc'); g.add_argument('--apply', action='store_true'); g.add_argument('--json', action='store_true')
     i = sub.add_parser('inbox'); i.add_argument('--all', action='store_true'); i.add_argument('--json', action='store_true')
     sub.add_parser('bind')
+    e = sub.add_parser('event'); e.add_argument('--pane', required=True); e.add_argument('--status', required=True, choices=('working', 'idle', 'done', 'blocked', 'exited'))
     a = p.parse_args()
     try:
         ROOT = find_root()
@@ -835,6 +890,7 @@ def main():
         elif a.command == 'gc': gc(a)
         elif a.command == 'inbox': inbox_list(a)
         elif a.command == 'bind': bind()
+        elif a.command == 'event': event(a)
         elif a.command == 'peek': print(herdr('agent', 'read', task_agent(a.slug), '--source', 'recent-unwrapped', '--lines', a.lines, json_output=False))
         elif a.command == 'send': submit(load(a.slug), task_agent(a.slug), a.text)
         elif a.command == 'open':
