@@ -240,8 +240,8 @@ def test_plugin_hook_event(tmp_path, event, payload, status):
 def test_doctor_checks_readiness(setup):
     root, fleet, log = setup
     fleet('new', 'hello', '-r', 'web', '--no-fetch', HERDR_PANE_ID='coordinator')
-    enabled = json.dumps([{'id': 'tc.herdr-fleet', 'enabled': True}])
-    disabled = json.dumps([{'id': 'tc.herdr-fleet', 'enabled': False}])
+    enabled = json.dumps([{'plugin_id': 'tc.herdr-fleet', 'enabled': True}])
+    disabled = json.dumps([{'plugin_id': 'tc.herdr-fleet', 'enabled': False}])
     for updates, text in [({}, '未安装'), ({'PLUGINS': disabled}, '未启用'),
                           ({'PLUGINS': enabled, 'COORD_MISSING': '1'}, 'coordinator'),
                           ({'PLUGINS': enabled, 'HERDR_VERSION': 'herdr 0.8.0'}, '版本')]:

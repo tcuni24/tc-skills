@@ -327,7 +327,7 @@ def doctor():
         print(f'herdr 版本检查失败: {e}'); ok = False
     try:
         plugins = herdr('plugin', 'list', '--json')['plugins']
-        plugin = next((item for item in plugins if item.get('id') == 'tc.herdr-fleet'), None)
+        plugin = next((item for item in plugins if item.get('plugin_id') == 'tc.herdr-fleet'), None)
         if not plugin:
             print('插件 tc.herdr-fleet 未安装'); ok = False
         elif not plugin.get('enabled'):
