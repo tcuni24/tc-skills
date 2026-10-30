@@ -40,6 +40,8 @@ if os.environ.get('BARRIER') and args[:2] == os.environ.get('BARRIER_CALL', '').
         time.sleep(0.01)
 if args == ['--version']: print(os.environ.get('HERDR_VERSION', 'herdr 0.9.1')); sys.exit(0)
 if os.environ.get('FAIL') and args[:2] == os.environ['FAIL'].split(): sys.exit(1)
+if args == ['integration', 'status']:
+    print(os.environ.get('INTEGRATIONS', 'pi: current (v9) (/path)')); sys.exit(0)
 if args[:2] == ['plugin', 'list']: result = {'plugins': json.loads(os.environ.get('PLUGINS', '[]'))}
 elif args[:2] == ['pane', 'get']:
     if os.environ.get('COORD_MISSING'): sys.exit(1)
@@ -251,6 +253,34 @@ def test_doctor_checks_readiness(setup):
     (log.parent / 'state/herdr-fleet/inbox.json').write_text(json.dumps([{'root': str(root), 'delivery': 'pending'}]))
     result = fleet('doctor', PLUGINS=enabled, check=False)
     assert result.returncode != 0 and '待投递' in result.stdout
+
+
+def test_doctor_integration_default_and_missing(setup):
+    root, fleet, log = setup
+    enabled = json.dumps([{'plugin_id': 'tc.herdr-fleet', 'enabled': True}])
+    assert fleet('doctor', PLUGINS=enabled).returncode == 0
+    for status in ('pi: not installed (/path)', 'claude: current (v1) (/path)'):
+        result = fleet('doctor', PLUGINS=enabled, INTEGRATIONS=status, check=False)
+        assert result.returncode != 0
+        assert 'herdr integration install pi' in result.stdout and '新启动' in result.stdout
+    result = fleet('doctor', PLUGINS=enabled, FAIL='integration status', check=False)
+    assert result.returncode != 0 and 'integration' in result.stdout
+    config = root / '.herdr-fleet.toml'
+    config.write_text(config.read_text().replace('agent = "pi"', 'agent = "none"'))
+    log.write_text('')
+    assert fleet('doctor', PLUGINS=enabled).returncode == 0
+    assert not any(json.loads(line)[:2] == ['integration', 'status'] for line in log.read_text().splitlines())
+
+
+def test_doctor_integrations_for_active_task_kinds(setup):
+    root, fleet, log = setup
+    enabled = json.dumps([{'plugin_id': 'tc.herdr-fleet', 'enabled': True}])
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', HERDR_PANE_ID='coordinator')
+    fleet('new', 'other', '-r', 'web', '--no-fetch', '--agent', 'letta', HERDR_PANE_ID='coordinator')
+    both = 'pi: current (v9) (/path)\nletta (experimental): current (v1) (/path)'
+    assert fleet('doctor', PLUGINS=enabled, INTEGRATIONS=both).returncode == 0
+    result = fleet('doctor', PLUGINS=enabled, INTEGRATIONS='pi: current (v9) (/path)\nletta (experimental): not installed (/path)', check=False)
+    assert result.returncode != 0 and 'herdr integration install letta' in result.stdout
 
 
 def test_registration_open_and_dry_run(setup):

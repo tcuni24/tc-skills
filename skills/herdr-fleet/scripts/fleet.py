@@ -336,7 +336,28 @@ def doctor():
             print('插件 tc.herdr-fleet 已启用')
     except (RuntimeError, OSError, ValueError, KeyError, TypeError) as e:
         print(f'插件检查失败: {e}'); ok = False
-    for data in tasks():
+    active_tasks = list(tasks())
+    kinds = {(data.get('agent') or {}).get('kind') or SETTINGS['agent'] for data in active_tasks} if active_tasks else {SETTINGS['agent']}
+    kinds.discard('none')
+    if kinds:
+        try:
+            output = run(HERDR, 'integration', 'status')
+            statuses = {}
+            for line in output.splitlines():
+                match = re.match(r'^([^\s:]+)(?: \(experimental\))?:\s*(.+)$', line)
+                if match:
+                    statuses[match.group(1)] = match.group(2)
+            for kind in sorted(kinds):
+                status = statuses.get(kind)
+                if not status or status.startswith('not installed'):
+                    reason = '未安装' if status else '无内置集成或状态缺失'
+                    print(f'{kind} 集成{reason}：运行 herdr integration install {kind}；仅对之后新启动的 agent 生效')
+                    ok = False
+                else:
+                    print(f'{kind} 集成: {status}')
+        except (RuntimeError, OSError) as e:
+            print(f'integration status 检查失败: {e}'); ok = False
+    for data in active_tasks:
         pane = data.get('coordinator_pane')
         if not pane:
             print(f"{data['slug']}: coordinator_pane 不存在，请运行 fleet bind"); ok = False
