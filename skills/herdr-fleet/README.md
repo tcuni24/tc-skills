@@ -26,6 +26,6 @@ herdr plugin unlink tc.herdr-fleet
 - 通过：主 agent 结束本轮后，任务完成时被自动通知唤醒，先用 `fleet status` 核查再汇报。
 - 通过：主 agent 忙于 sleep 150 时两个任务先后完成，空闲后合并为一条通知，包含 `live-b done review -` 和 `live-c done review -`。
 - 通过：herdr 接受清单及相对路径钩子，`herdr plugin log list` 显示 `pane.agent_status_changed` 钩子 succeeded、退出码 0。
-- 已知限制：关闭任务 tab 不触发 `pane.exited`，插件日志没有该事件，不能依靠关 tab 获得退出通知。pane 内进程退出（如 shell exit）时探测到 `pane.exited`；杀掉任务 agent 进程时通知状态为 done。
-- 未验证：blocked 通知。pi 提问时 herdr 状态为 done，未触发 blocked。
+- 退出入口已修正，待真机重测：插件订阅 `pane.exited`、`pane.closed` 和 `tab.closed`。探测确认关 tab 触发 `tab.closed`，关 pane 触发 `pane.closed`，pane 内进程退出触发 `pane.exited`；杀掉任务 agent 进程时通知状态为 done。旧索引没有 tab_id，需运行 `fleet bind` 或重新打开任务以登记 tab。
+- blocked 是否出现取决于 agent 集成是否上报：pi 的 herdr 集成只在收到 pi 事件 `herdr:blocked` 时上报 blocked，纯文字提问显示 done。blocked 通知路径目前仅 fake herdr 验证，真机未验证。
 - 已知限制：任务回报块常不在最近 12 行中，`fleet status` 可能显示未找到回报块；可增大 `--lines`（属 #24 范围）。

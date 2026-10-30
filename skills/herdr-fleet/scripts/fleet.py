@@ -245,7 +245,11 @@ def prune_coordinators(panes, inbox):
             del panes[pane]
 
 
-def register_task(data, pane):
+def task_index_matches(entry, slug):
+    return entry.get('root') == str(ROOT) and entry.get('slug') == slug and entry.get('role') == 'task'
+
+
+def register_task(data, pane, tab_id):
     coordinator = os.environ.get('HERDR_PANE_ID')
     if not coordinator:
         return
@@ -254,9 +258,9 @@ def register_task(data, pane):
         data['coordinator_pane'] = coordinator
         save(data)
         for old, entry in list(panes.items()):
-            if entry == {'root': str(ROOT), 'slug': data['slug'], 'role': 'task'}:
+            if task_index_matches(entry, data['slug']):
                 del panes[old]
-        panes[pane] = {'root': str(ROOT), 'slug': data['slug'], 'role': 'task'}
+        panes[pane] = {'root': str(ROOT), 'slug': data['slug'], 'role': 'task', 'tab_id': tab_id}
         if panes.get(coordinator, {}).get('root') != str(ROOT) or panes[coordinator].get('role') != 'coordinator':
             panes[coordinator] = {'root': str(ROOT), 'role': 'coordinator'}
         prune_coordinators(panes, inbox)
@@ -296,9 +300,9 @@ def bind_locked(coordinator, tabs, agents, panes, inbox):
         agent = next((item for item in agents if tab and item.get('tab_id') == tab['tab_id']), None)
         if agent:
             for pane, entry in list(panes.items()):
-                if entry == {'root': str(ROOT), 'slug': data['slug'], 'role': 'task'}:
+                if task_index_matches(entry, data['slug']):
                     del panes[pane]
-            panes[agent['pane_id']] = {'root': str(ROOT), 'slug': data['slug'], 'role': 'task'}
+            panes[agent['pane_id']] = {'root': str(ROOT), 'slug': data['slug'], 'role': 'task', 'tab_id': tab['tab_id']}
     slugs = {data['slug'] for data in current}
     for event in inbox:
         if event.get('root') == str(ROOT) and event.get('slug') in slugs and event.get('delivery') == 'pending':
@@ -668,7 +672,7 @@ def create_tab(data, agent, focus=False, explicit=None, prompt=None):
     except Exception:
         herdr('tab', 'close', tid)
         raise
-    register_task(data, pane)
+    register_task(data, pane, tid)
     if prompt and agent['kind'] != 'none':
             context = [f'任务目录：{dest}']
             for key, details in data['repos'].items():
@@ -1031,7 +1035,7 @@ def done(a):
     dest.rmdir()
     with fleet_state(write=True) as (panes, inbox):
         for pane, entry in list(panes.items()):
-            if entry == {'root': str(ROOT), 'slug': a.slug, 'role': 'task'}:
+            if task_index_matches(entry, a.slug):
                 del panes[pane]
         inbox[:] = [event for event in inbox if not (event.get('root') == str(ROOT) and event.get('slug') == a.slug)]
         prune_coordinators(panes, inbox)
@@ -1135,7 +1139,7 @@ def main():
             if tab:
                 herdr('tab', 'focus', tab['tab_id'])
                 live = next((agent for agent in agents if agent.get('tab_id') == tab['tab_id']), None)
-                if live: register_task(data, live['pane_id'])
+                if live: register_task(data, live['pane_id'], tab['tab_id'])
             else:
                 agent = agent_options(a, data)
                 if create_tab(data, agent, focus=True):

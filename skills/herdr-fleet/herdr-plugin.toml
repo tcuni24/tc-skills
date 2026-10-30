@@ -11,3 +11,11 @@ command = ["python3", "hooks/event.py"]
 [[events]]
 on = "pane.exited"
 command = ["python3", "hooks/event.py"]
+
+[[events]]
+on = "pane.closed"
+command = ["python3", "hooks/event.py"]
+
+[[events]]
+on = "tab.closed"
+command = ["python3", "hooks/event.py"]

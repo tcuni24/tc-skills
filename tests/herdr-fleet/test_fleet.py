@@ -203,7 +203,7 @@ def test_plugin_manifest():
     manifest = tomllib.loads((SKILL / 'herdr-plugin.toml').read_text())
     assert manifest['id'] == 'tc.herdr-fleet'
     assert manifest['min_herdr_version'] == '0.9.1'
-    assert {event['on'] for event in manifest['events']} == {'pane.agent_status_changed', 'pane.exited'}
+    assert {event['on'] for event in manifest['events']} == {'pane.agent_status_changed', 'pane.exited', 'pane.closed', 'tab.closed'}
     assert all(event['command'] == ['python3', 'hooks/event.py'] for event in manifest['events'])
 
 
@@ -211,6 +211,7 @@ def test_plugin_manifest():
     ('pane.agent_status_changed', {'event': 'pane.agent_status_changed', 'data': {'pane_id': 'p', 'agent_status': 'working'}}, 'working'),
     ('pane.agent_status_changed', {'pane_id': 'p', 'agent_status': 'idle'}, 'idle'),
     ('pane.exited', {'pane_id': 'p'}, 'exited'),
+    ('pane.closed', {'event': 'pane_closed', 'data': {'pane_id': 'p'}}, 'exited'),
 ])
 def test_plugin_hook_event(tmp_path, event, payload, status):
     skill = tmp_path / 'skill'
@@ -236,6 +237,41 @@ def test_plugin_hook_event(tmp_path, event, payload, status):
     (state / 'panes.json').write_text(json.dumps({'p': {'root': str(tmp_path)}}))
     result = cmd('python3', hook, env={**env, 'FLEET_FAIL': '1'}, check=False)
     assert result.returncode != 0
+    assert [json.loads(line)[:2] for line in (tmp_path / 'log').read_text().splitlines()] == [['notification', 'show']]
+
+
+@pytest.mark.parametrize('wrapped', [True, False])
+def test_plugin_hook_tab_closed_routes_tasks(tmp_path, wrapped):
+    skill = tmp_path / 'skill'
+    (skill / 'hooks').mkdir(parents=True)
+    (skill / 'scripts').mkdir()
+    (skill / 'hooks/event.py').write_text((SKILL / 'hooks/event.py').read_text())
+    (skill / 'scripts/fleet.py').write_text("import json, os, sys\nwith open(os.environ['CALLS'], 'a') as f: f.write(json.dumps([sys.argv[1:], os.environ['FLEET_ROOT']]) + '\\n')\nsys.exit(int(os.environ.get('FLEET_FAIL', '0')))\n")
+    state = tmp_path / 'state/herdr-fleet'; state.mkdir(parents=True)
+    index = {'p': {'root': '/project/a', 'role': 'task', 'tab_id': 't'},
+             'q': {'root': '/project/b', 'role': 'task', 'tab_id': 't'},
+             'old': {'root': '/project/a', 'role': 'task'},
+             'coordinator': {'root': '/project/a', 'role': 'coordinator', 'tab_id': 't'}}
+    (state / 'panes.json').write_text(json.dumps(index))
+    fake = tmp_path / 'herdr'; fake.write_text(FAKE_HERDR); fake.chmod(0o755)
+    payload = {'tab_id': 't'}
+    if wrapped: payload = {'event': 'tab_closed', 'data': payload}
+    env = {**os.environ, 'XDG_STATE_HOME': str(tmp_path / 'state'), 'HERDR_PLUGIN_EVENT': 'tab.closed',
+           'HERDR_PLUGIN_EVENT_JSON': json.dumps(payload), 'CALLS': str(tmp_path / 'calls'),
+           'LOG': str(tmp_path / 'log'), 'FLEET_HERDR': str(fake)}
+    hook = skill / 'hooks/event.py'
+    cmd('python3', hook, env=env)
+    calls = [json.loads(line) for line in (tmp_path / 'calls').read_text().splitlines()]
+    assert calls == [[['event', '--pane', 'p', '--status', 'exited'], '/project/a'],
+                     [['event', '--pane', 'q', '--status', 'exited'], '/project/b']]
+    (tmp_path / 'calls').unlink()
+    (state / 'panes.json').write_text(json.dumps({'old': index['old']}))
+    cmd('python3', hook, env=env)
+    assert not (tmp_path / 'calls').exists()
+    (state / 'panes.json').write_text(json.dumps(index))
+    result = cmd('python3', hook, env={**env, 'FLEET_FAIL': '1'}, check=False)
+    assert result.returncode != 0
+    assert len((tmp_path / 'calls').read_text().splitlines()) == 2
     assert [json.loads(line)[:2] for line in (tmp_path / 'log').read_text().splitlines()] == [['notification', 'show']]
 
 
@@ -288,7 +324,7 @@ def test_registration_open_and_dry_run(setup):
     fleet('new', 'hello', '-r', 'web', '--no-fetch', HERDR_PANE_ID='coordinator')
     assert task_data(root, 'hello')['coordinator_pane'] == 'coordinator'
     index = json.loads((log.parent / 'state/herdr-fleet/panes.json').read_text())
-    assert index['p'] == {'root': str(root), 'slug': 'hello', 'role': 'task'}
+    assert index['p'] == {'root': str(root), 'slug': 'hello', 'role': 'task', 'tab_id': 't'}
     assert index['coordinator'] == {'root': str(root), 'role': 'coordinator'}
     assert {p.name for p in (root / 'worktrees/hello').iterdir()} == {'TASK.md', 'web'}
     fleet('done', 'hello', '--dry-run', '--no-fetch')
@@ -296,13 +332,17 @@ def test_registration_open_and_dry_run(setup):
     assert task_data(root, 'hello')['coordinator_pane'] == 'new-coordinator'
     index = json.loads((log.parent / 'state/herdr-fleet/panes.json').read_text())
     assert 'p' not in index and 'coordinator' not in index
-    assert index['new-task']['slug'] == 'hello' and 'new-coordinator' in index
+    assert index['new-task']['slug'] == 'hello' and index['new-task']['tab_id'] == 't' and 'new-coordinator' in index
 
 
 def test_inbox_bind_and_cleanup(setup):
     root, fleet, log = setup
     fleet('new', 'hello', '-r', 'web', '--no-fetch', HERDR_PANE_ID='old')
     path = log.parent / 'state/herdr-fleet/inbox.json'
+    index_path = path.parent / 'panes.json'
+    index = json.loads(index_path.read_text())
+    del index['p']['tab_id']
+    index_path.write_text(json.dumps(index))
     events = [dict(root=str(root), slug='hello', coordinator_pane='old', status=s, delivery=d,
                    created='2026-01-01', dedup_key=str(i), attempts=0, last_error=None)
               for i, (s, d) in enumerate([('idle', 'pending'), ('blocked', 'delivered')])]
@@ -313,6 +353,7 @@ def test_inbox_bind_and_cleanup(setup):
     assert 'hello' in fleet('inbox').stdout and path.read_bytes() == before
     fleet('bind', HERDR_PANE_ID='new')
     assert task_data(root, 'hello')['coordinator_pane'] == 'new'
+    assert json.loads(index_path.read_text())['p']['tab_id'] == 't'
     assert [event['coordinator_pane'] for event in json.loads(path.read_text())] == ['new', 'old']
     fleet('done', 'hello', '--no-fetch')
     assert json.loads(path.read_text()) == []
