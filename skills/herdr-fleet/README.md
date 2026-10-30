@@ -18,6 +18,36 @@ herdr plugin unlink tc.herdr-fleet
 
 通知未到时，用 `herdr plugin log list` 检查钩子记录，并用 `fleet status <slug>` 核查任务。插件卸载后其他 fleet 命令仍可使用。
 
+## ask_user 扩展（pi）
+
+`extensions/ask-user.ts` 是一个 pi 扩展，注册 `ask_user` 工具和 `/ask-user` 命令。工具在等待用户输入期间经 pi 事件总线发出 `herdr:blocked { active: true, label: <问题> }`，等待结束（回答、取消、中止或出错）后发出一次 `{ active: false }`。herdr 的 pi 集成（`herdr-agent-state.ts`）按 active 计数上报 pane 状态：等待期间显示 blocked（label 作为阻塞原因），恢复后回到 working/idle。扩展与集成的契约是配平计数——只在确实等待过的调用上发 `{ active: false }`，不会提前释放其他 blocked 所有者。未安装集成时事件无人消费，工具退化为普通提问。
+
+参数：
+
+- `question`（必填）：问题文本。
+- `options`（可选，非空数组）：给出时弹出选择列表；省略则为自由文本输入。
+- `placeholder`（可选）：自由文本输入的占位提示，有 options 时忽略。
+- `timeout`（可选，毫秒）：对话框超时自动取消，结果记为 cancelled。
+
+结果：`structuredContent`/`details.status` 为 `answered`（附 `answer`）、`cancelled`（Esc、空白输入、超时或中止）、`unavailable`（print/json 等无 UI 模式，isError）、`invalid`/`error`（isError）。select 和 input 对话框在 TUI 与 RPC 模式都可用（RPC 经 extension UI 协议转发）。
+
+`/ask-user <问题> [| 选项1 | 选项2...]` 走同一条等待路径，供人工或验收脚本触发；无参数时报用法。
+
+安装（任选其一）：
+
+```sh
+pi -e <skill 目录>/extensions/ask-user.ts            # 本次会话生效
+cp <skill 目录>/extensions/ask-user.ts ~/.pi/agent/extensions/   # 用户级常驻
+```
+
+任务 agent 由 fleet 启动 pi 时逐任务加载（参数经 `herdr agent start` 传给 pi）：
+
+```sh
+fleet new <slug> --agent pi --agent-arg=-e --agent-arg=<skill 目录绝对路径>/extensions/ask-user.ts --prompt '...'
+```
+
+验收：`python3 tests/herdr-fleet/ask_user_live_check.py` 在 pty 中启动真实 pi（关闭扩展发现，`-e` 显式加载本扩展与已安装的 herdr 集成），HERDR_* 指向脚本自建 unix socket，键入 `/ask-user` 后断言 `pane.report_agent` 依次出现 idle → blocked（message 为问题文本）→ idle。该检查验证真实 pi 进程、真实扩展与真实集成文件之间的完整链路；socket 对端（真实 herdr daemon → 插件 `pane.agent_status_changed` → fleet 收件箱 → 主 agent 通知）不在覆盖范围。要在真实 fleet 中验收：按上例开任务（或给既有 pi pane 加 `-e`），让任务 agent 调用 ask_user 或输入 `/ask-user`，观察 pane 显示 blocked、主 agent 收到 `<slug> blocked blocked -`，回答后恢复。
+
 ## 真机验证清单
 
 在 herdr 0.9.1 上使用 pi 完成以下验证；0.9.5 未验证。验收后插件已 unlink，pi 集成保留安装。自动化测试使用 fake herdr，不修改真实插件注册表。
