@@ -48,7 +48,7 @@ dir = "backend"
 fleet new my-task --agent devin --agent-arg=--model --agent-arg example --prompt '需求描述' # --agent none 不启动 agent；--agent-arg 可重复
 fleet ls                                 # 任务、tab、agent 状态、dirty、ahead/behind、合并状态；--json；--fetch 先 fetch
 fleet status my-task [--lines N] [--json] # 提交、diff 统计、未提交文件、PR、agent 最近输出；默认 12 行，0 不显示，负数报错
-fleet wait my-task [--timeout SEC]       # 等待 idle/done/blocked
+fleet wait my-task [other-task ...] [--any|--all] [--timeout SEC] # 等待本轮终态
 fleet peek my-task [--lines N]           # 任务 agent 的最近输出
 fleet send my-task '补充要求'
 fleet open my-task [--agent devin] [--agent-arg=--flag] # tab 丢失后重建；已有 tab 时只切过去
@@ -94,7 +94,7 @@ phase 按以下顺序判断（仓库异常时为 `error`）：
 | review | 任一仓库有领先提交且 unmerged |
 | idle-empty | 所有仓库 no-commits |
 
-`wait` 返回码：idle/done 为 0，blocked 为 3，超时为 4，无 agent 或其他错误为 1。观察到终态后，仓库信息读取失败仅报告错误，不改变终态返回码。已经 idle 时立即返回；`new` 后先用 `status` 确认已 working 再等待。`done --dry-run` 预检通过返回 0，拒绝返回 1，且不删除或关闭 tab。
+`wait` 默认等待全部任务，`--any` 等首个终态；只认最近一次提交之后的终态。返回码：idle/done 为 0，blocked 为 3，超时为 4，无 agent 或其他错误为 1。观察到终态后，仓库信息读取失败仅报告错误，不改变终态返回码。当前没有自动通知，主 agent 结束本轮前必须 `fleet wait` 到任务结束或阻塞，不得声称完成后会自动通知。`done --dry-run` 预检通过返回 0，拒绝返回 1，且不删除或关闭 tab。
 
 ## 安全规则
 

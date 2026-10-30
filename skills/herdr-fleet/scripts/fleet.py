@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 
 CONFIG = '.herdr-fleet.toml'
@@ -24,6 +25,10 @@ NAME = re.compile(r'^[A-Za-z0-9._-]+$')
 ROOT = None
 REPOS = {}
 SETTINGS = {}
+
+
+class SubmissionError(RuntimeError):
+    pass
 
 
 def run(*args, cwd=None, check=True, input=None):
@@ -179,6 +184,37 @@ def load(slug):
     return data
 
 
+def save(data):
+    path = task_dir(data['slug']) / 'TASK.md'
+    before, rest = path.read_text().split('```json\n', 1)
+    _, after = rest.split('\n```', 1)
+    path.write_text(before + '```json\n' + json.dumps(data, ensure_ascii=False, indent=2) + '\n```' + after)
+
+
+def submit(data, pane, text):
+    agent = herdr('agent', 'get', pane)['agent']
+    if agent['agent_status'] == 'blocked':
+        raise RuntimeError(f"agent 已 blocked，请先 fleet peek {data['slug']}")
+    seq = agent['state_change_seq']
+    if not isinstance(seq, int):
+        raise RuntimeError('agent 未提供有效的 state_change_seq')
+    data['submit_seq'] = seq
+    save(data)
+    p = subprocess.run([HERDR, 'agent', 'prompt', pane, text, '--wait', '--until', 'working', '--until', 'blocked', '--timeout', '5000'], capture_output=True, text=True)
+    if p.returncode:
+        try:
+            error = json.loads(p.stdout or p.stderr).get('error', {}).get('code')
+        except ValueError:
+            error = None
+        if error in ('timeout', 'agent_prompt_stalled'):
+            current = herdr('agent', 'get', pane)['agent']
+            if current['state_change_seq'] > seq and current['agent_status'] in ('idle', 'done', 'blocked'):
+                return
+        if error == 'agent_blocked':
+            raise RuntimeError(f"agent 已 blocked，请先 fleet peek {data['slug']}")
+        raise RuntimeError(f'开始确认失败：{p.stderr or p.stdout}')
+
+
 def tasks():
     root = ROOT / 'worktrees'
     if not root.exists():
@@ -254,7 +290,10 @@ def create_tab(data, agent, focus=False, explicit=None, prompt=None):
             herdr('agent', 'start', data['slug'], '--kind', agent['kind'], '--pane', pane, '--timeout', '60000',
                   *(['--', *agent['args']] if agent['args'] else []))
         herdr('pane', 'split', pane, '--direction', 'right', '--cwd', dest, '--no-focus')
-        if prompt and agent['kind'] != 'none':
+    except Exception:
+        herdr('tab', 'close', tid)
+        raise
+    if prompt and agent['kind'] != 'none':
             context = [f'任务目录：{dest}']
             for key, details in data['repos'].items():
                 cfg = REPOS[key]
@@ -264,10 +303,10 @@ def create_tab(data, agent, focus=False, explicit=None, prompt=None):
                 context.append(f"{REPOS[key]['dir']} 未链接 {', '.join(REPOS[key]['shared'])}（{info['reason']}）：需要时在 {dest / REPOS[key]['dir']} {how}。")
             context.append(f'只在上述 worktree 中修改和提交，不要改主 checkout（{ROOT}/<仓库>）。开始前先读各 worktree 里的 AGENTS.md。')
             context.append('最终回复必须包含以下回报块：\nFLEET-REPORT\n结果：完成 / 部分完成 / 阻塞\nPR：链接或无\n测试：每条命令及退出码\n证据边界：哪些已真实验证，哪些只是合成数据、mock、空页面或未覆盖\n需要决策：需要用户决定的事项或无\nEND FLEET-REPORT')
-            herdr('agent', 'prompt', data['slug'], '\n'.join(context) + '\n\n' + prompt)
-    except Exception:
-        herdr('tab', 'close', tid)
-        raise
+            try:
+                submit(data, pane, '\n'.join(context) + '\n\n' + prompt)
+            except (RuntimeError, OSError, ValueError, KeyError) as e:
+                raise SubmissionError(str(e)) from e
     return True
 
 
@@ -322,12 +361,21 @@ def new(a):
         if a.prompt:
             text += '\n## 需求\n\n' + a.prompt + '\n'
         (dest / 'TASK.md').write_text(text)
-        create_tab(data, agent, a.focus, a.workspace, a.prompt)
     except Exception:
         for repo, path, branch, created in reversed(made):
             git(repo, 'worktree', 'remove', '--force', path, check=False)
             if created:
                 git(repo, 'branch', '-D', branch, check=False)
+        shutil.rmtree(dest, ignore_errors=True)
+        raise
+    try:
+        create_tab(data, agent, a.focus, a.workspace, a.prompt)
+    except SubmissionError:
+        raise
+    except Exception:
+        for repo, path, branch, created in reversed(made):
+            git(repo, 'worktree', 'remove', '--force', path, check=False)
+            if created: git(repo, 'branch', '-D', branch, check=False)
         shutil.rmtree(dest, ignore_errors=True)
         raise
     print(f'已创建任务 {slug}')
@@ -479,7 +527,7 @@ def status(a):
     if row['agent_output']: print('\nagent 最近输出：\n' + row['agent_output'])
 
 
-def wait(a):
+def legacy_wait(a):
     if a.timeout is not None and a.timeout < 0: raise RuntimeError('--timeout 不能为负数')
     pane = task_agent(a.slug)
     args = [HERDR, 'agent', 'wait', pane] + (['--timeout', str(int(a.timeout * 1000))] if a.timeout is not None else [])
@@ -515,6 +563,37 @@ def wait(a):
         print(f'仓库错误：{e}', file=sys.stderr)
     print(f'{a.slug} {phase} {state}')
     return 3 if state == 'blocked' else 0
+
+
+def wait(a):
+    if a.timeout is not None and a.timeout < 0: raise RuntimeError('--timeout 不能为负数')
+    if len(a.slugs) == 1 and 'submit_seq' not in load(a.slugs[0]):
+        a.slug = a.slugs[0]
+        return legacy_wait(a)
+    pending = {slug: (load(slug), task_agent(slug)) for slug in a.slugs}
+    deadline = time.monotonic() + a.timeout if a.timeout is not None else None
+    completed = {}
+    while pending:
+        tabs, agents = herdr_state()
+        for slug, (data, pane) in list(pending.items()):
+            agent = herdr('agent', 'get', pane)['agent']
+            state = agent['agent_status']
+            if state in ('idle', 'done', 'blocked') and ('submit_seq' not in data or agent['state_change_seq'] > data['submit_seq']):
+                current_agents = [dict(item, agent_status=state) if item.get('pane_id') == pane else item for item in agents]
+                row = task_row(data, tabs, current_agents)
+                phase = row['phase']
+                if row.get('error'): print(f"仓库错误：{row['error']}", file=sys.stderr)
+                completed[slug] = (phase, state)
+                del pending[slug]
+        if completed and (a.any or not pending):
+            for slug in a.slugs:
+                if slug in completed:
+                    phase, state = completed[slug]
+                    print(f'{slug} {phase} {state}')
+            return 3 if any(state == 'blocked' for _, state in completed.values()) else 0
+        if deadline is not None and time.monotonic() >= deadline:
+            print('错误：等待超时', file=sys.stderr); return 4
+        time.sleep(min(0.2, max(0, deadline - time.monotonic())) if deadline is not None else 0.2)
 
 
 def done_checks(a, data, dest):
@@ -639,7 +718,8 @@ def main():
     n.add_argument('--prompt'); n.add_argument('--focus', action='store_true'); n.add_argument('--workspace')
     l = sub.add_parser('ls'); l.add_argument('--json', action='store_true'); l.add_argument('--fetch', action='store_true')
     st = sub.add_parser('status'); st.add_argument('slug'); st.add_argument('--lines', type=int, default=12); st.add_argument('--json', action='store_true')
-    w = sub.add_parser('wait'); w.add_argument('slug'); w.add_argument('--timeout', type=float, metavar='SEC')
+    w = sub.add_parser('wait'); w.add_argument('slugs', nargs='+'); w.add_argument('--timeout', type=float, metavar='SEC')
+    modes = w.add_mutually_exclusive_group(); modes.add_argument('--any', action='store_true'); modes.add_argument('--all', action='store_true')
     pk = sub.add_parser('peek'); pk.add_argument('slug'); pk.add_argument('--lines', type=int, default=60)
     s = sub.add_parser('send'); s.add_argument('slug'); s.add_argument('text')
     o = sub.add_parser('open'); o.add_argument('slug'); o.add_argument('--agent')
@@ -657,7 +737,7 @@ def main():
         elif a.command == 'done': return done(a)
         elif a.command == 'gc': gc(a)
         elif a.command == 'peek': print(herdr('agent', 'read', task_agent(a.slug), '--source', 'recent-unwrapped', '--lines', a.lines, json_output=False))
-        elif a.command == 'send': herdr('agent', 'prompt', task_agent(a.slug), a.text)
+        elif a.command == 'send': submit(load(a.slug), task_agent(a.slug), a.text)
         elif a.command == 'open':
             data = load(a.slug)
             tab = find_tab(a.slug, herdr_state()[0])
