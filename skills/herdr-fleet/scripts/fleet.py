@@ -335,17 +335,25 @@ def task_event(a):
             seq = agent['state_change_seq']
             if not isinstance(seq, int):
                 raise RuntimeError('agent 未提供有效的 state_change_seq')
-            if agent['agent_status'] != a.status:
-                return
+            status = agent['agent_status']
             if a.status == 'working':
-                if round_state is None:
-                    round_state = {'baseline': seq, 'notified': False, 'last_terminal_seq': -1}
-                elif round_state['notified'] and seq > round_state['last_terminal_seq']:
-                    round_state = {'baseline': seq, 'notified': False, 'last_terminal_seq': round_state['last_terminal_seq']}
-                else:
+                if status not in ('working', 'idle', 'done', 'blocked'):
                     return
-                data['event_round'] = round_state
-                save(data)
+                if round_state is None or (round_state['notified'] and seq > round_state['last_terminal_seq']):
+                    last = round_state['last_terminal_seq'] if round_state else -1
+                    # Hooks lack a sequence: a late old working edge followed by
+                    # done->idle is indistinguishable from a new fast round.
+                    # Prefer an extra notice over silently losing that round.
+                    round_state = {'baseline': seq if status == 'working' else seq - 1,
+                                   'notified': False, 'last_terminal_seq': last}
+                elif round_state['notified']:
+                    return
+                if status == 'working':
+                    data['event_round'] = round_state
+                    save(data)
+                    return
+                a.status = status
+            elif status != a.status:
                 return
             if not round_state or round_state['notified'] or seq <= round_state['baseline']:
                 return
@@ -470,24 +478,37 @@ def event(a):
         if a.status in ('idle', 'done'):
             deliver(a.pane)
         return
-    target = task_event(a)
+    if entry.get('role') != 'task' or entry.get('root') != str(ROOT):
+        return
+    with task_lock(entry['slug']):
+        target = task_event(a)
     if target:
         deliver(target)
 
 
+@contextmanager
+def task_lock(slug):
+    directory = Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local/state') / 'herdr-fleet'
+    directory.mkdir(parents=True, exist_ok=True)
+    name = hashlib.sha256(json.dumps([str(ROOT), slug]).encode()).hexdigest()
+    with (directory / ('task-' + name + '.lock')).open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
 def submit(data, pane, text):
-    # Serialize submission confirmation with event processing so fast completions
-    # cannot be mistaken for a failed or previous submission.
-    with fleet_state():
-        data = load(data['slug'])
+    # Only the same task's event handlers wait for submission confirmation.
+    with task_lock(data['slug']):
         agent = herdr('agent', 'get', pane)['agent']
         if agent['agent_status'] == 'blocked':
             raise RuntimeError(f"agent 已 blocked，请先 fleet peek {data['slug']}")
         seq = agent['state_change_seq']
         if not isinstance(seq, int):
             raise RuntimeError('agent 未提供有效的 state_change_seq')
-        data['submit_seq'] = seq
-        save(data)
+        with fleet_state():
+            data = load(data['slug'])
+            data['submit_seq'] = seq
+            save(data)
         p = subprocess.run([HERDR, 'agent', 'prompt', pane, text, '--wait', '--until', 'working', '--until', 'blocked', '--timeout', '5000'], capture_output=True, text=True)
         if p.returncode:
             try:
@@ -502,9 +523,11 @@ def submit(data, pane, text):
                 if error == 'agent_blocked':
                     raise RuntimeError(f"agent 已 blocked，请先 fleet peek {data['slug']}")
                 raise RuntimeError(f'开始确认失败：{p.stderr or p.stdout}')
-        previous = data.get('event_round', {})
-        data['event_round'] = {'baseline': seq, 'notified': False, 'last_terminal_seq': previous.get('last_terminal_seq', -1)}
-        save(data)
+        with fleet_state():
+            data = load(data['slug'])
+            previous = data.get('event_round', {})
+            data['event_round'] = {'baseline': seq, 'notified': False, 'last_terminal_seq': previous.get('last_terminal_seq', -1)}
+            save(data)
 
 
 def tasks():

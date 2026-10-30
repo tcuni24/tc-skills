@@ -312,11 +312,82 @@ def test_event_manual_working_and_stale_status(setup):
     _, fleet, _ = setup
     fleet('new', 'hello', '-r', 'web', '--no-fetch', HERDR_PANE_ID='coordinator')
     fleet('event', '--pane', 'p', '--status', 'idle', GET_SEQ='12')
-    fleet('event', '--pane', 'p', '--status', 'working', GET_STATUS='idle', GET_SEQ='12')
     assert json.loads(fleet('inbox', '--json').stdout) == []
     fleet('event', '--pane', 'p', '--status', 'working', GET_STATUS='working', GET_SEQ='13')
     fleet('event', '--pane', 'p', '--status', 'done', GET_STATUS='done', GET_SEQ='14')
+    fleet('event', '--pane', 'p', '--status', 'working', GET_STATUS='done', GET_SEQ='14')
     assert [r['status'] for r in json.loads(fleet('inbox', '--json').stdout)] == ['done']
+
+
+@pytest.mark.parametrize('terminal', ['done', 'idle', 'blocked'])
+def test_first_manual_round_working_processed_after_terminal(setup, terminal):
+    _, fleet, _ = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', HERDR_PANE_ID='coordinator')
+    fleet('event', '--pane', 'p', '--status', 'working', GET_STATUS=terminal, GET_SEQ='14')
+    fleet('event', '--pane', 'p', '--status', terminal, GET_STATUS=terminal, GET_SEQ='14')
+    rows = json.loads(fleet('inbox', '--json').stdout)
+    assert len(rows) == 1 and rows[0]['status'] == terminal
+
+
+def test_manual_round_delayed_working_and_done_to_idle(setup):
+    _, fleet, _ = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
+    fleet('event', '--pane', 'p', '--status', 'done', GET_STATUS='done', GET_SEQ='12')
+    fleet('event', '--pane', 'p', '--status', 'working', GET_STATUS='done', GET_SEQ='12')
+    fleet('event', '--pane', 'p', '--status', 'idle', GET_STATUS='idle', GET_SEQ='13')
+    assert len(json.loads(fleet('inbox', '--json').stdout)) == 1
+    fleet('event', '--pane', 'p', '--status', 'working', GET_STATUS='done', GET_SEQ='16')
+    fleet('event', '--pane', 'p', '--status', 'done', GET_STATUS='done', GET_SEQ='16')
+    fleet('event', '--pane', 'p', '--status', 'idle', GET_STATUS='idle', GET_SEQ='17')
+    assert [e['status'] for e in json.loads(fleet('inbox', '--json').stdout)] == ['done', 'done']
+
+
+def test_ambiguous_late_working_after_done_to_idle_prefers_notice(setup):
+    _, fleet, _ = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
+    fleet('event', '--pane', 'p', '--status', 'done', GET_STATUS='done', GET_SEQ='12')
+    fleet('event', '--pane', 'p', '--status', 'idle', GET_STATUS='idle', GET_SEQ='13')
+    fleet('event', '--pane', 'p', '--status', 'working', GET_STATUS='idle', GET_SEQ='13')
+    assert [e['status'] for e in json.loads(fleet('inbox', '--json').stdout)] == ['done', 'idle']
+
+
+def test_same_task_fast_event_waits_for_submission_confirmation(setup, tmp_path):
+    _, fleet, _ = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', HERDR_PANE_ID='coordinator')
+    barrier = tmp_path / 'submit-barrier'
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        submitting = pool.submit(fleet, 'send', 'hello', 'go', BARRIER=str(barrier), BARRIER_CALL='agent prompt')
+        try:
+            wait_barrier(barrier)
+            completion = pool.submit(fleet, 'event', '--pane', 'p', '--status', 'done', GET_STATUS='done', GET_SEQ='12')
+            time.sleep(0.2)
+            assert not completion.done()
+        finally:
+            barrier.with_suffix('.release').touch()
+        submitting.result(timeout=10)
+        completion.result(timeout=10)
+    rows = json.loads(fleet('inbox', '--json').stdout)
+    assert len(rows) == 1 and rows[0]['status'] == 'done'
+
+
+def test_manual_round_not_blocked_by_other_task_submit(setup, tmp_path):
+    _, fleet, _ = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
+    fleet('event', '--pane', 'p', '--status', 'done', GET_STATUS='done', GET_SEQ='12')
+    fleet('new', 'other', '-r', 'web', '--no-fetch', NEW_PANE='q', HERDR_PANE_ID='coordinator')
+    barrier = tmp_path / 'submit-barrier'
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        submit = pool.submit(fleet, 'send', 'other', 'go', MULTI='1', BARRIER=str(barrier), BARRIER_CALL='agent prompt')
+        working = None
+        try:
+            wait_barrier(barrier)
+            working = pool.submit(fleet, 'event', '--pane', 'p', '--status', 'working', GET_STATUS='done', GET_SEQ='14')
+            working.result(timeout=2)
+            fleet('event', '--pane', 'p', '--status', 'done', GET_STATUS='done', GET_SEQ='14')
+        finally:
+            barrier.with_suffix('.release').touch()
+        submit.result(timeout=10)
+    assert [e['status'] for e in json.loads(fleet('inbox', '--json').stdout)] == ['done', 'done']
 
 
 def test_event_failed_submission_does_not_start_round(setup):
