@@ -315,6 +315,43 @@ def inbox_list(a):
     display(events, a.json)
 
 
+def doctor():
+    ok = True
+    try:
+        version = run(HERDR, '--version')
+        match = re.fullmatch(r'herdr (\d+)\.(\d+)\.(\d+)', version)
+        valid = bool(match and tuple(map(int, match.groups())) >= (0, 9, 1))
+        print(f'herdr 版本: {version}' + ('' if valid else '（需要 >= 0.9.1）'))
+        ok &= valid
+    except (RuntimeError, OSError) as e:
+        print(f'herdr 版本检查失败: {e}'); ok = False
+    try:
+        plugins = herdr('plugin', 'list', '--json')['plugins']
+        plugin = next((item for item in plugins if item.get('id') == 'tc.herdr-fleet'), None)
+        if not plugin:
+            print('插件 tc.herdr-fleet 未安装'); ok = False
+        elif not plugin.get('enabled'):
+            print('插件 tc.herdr-fleet 未启用'); ok = False
+        else:
+            print('插件 tc.herdr-fleet 已启用')
+    except (RuntimeError, OSError, ValueError, KeyError, TypeError) as e:
+        print(f'插件检查失败: {e}'); ok = False
+    for data in tasks():
+        pane = data.get('coordinator_pane')
+        if not pane:
+            print(f"{data['slug']}: coordinator_pane 不存在，请运行 fleet bind"); ok = False
+            continue
+        try:
+            herdr('pane', 'get', pane)
+            print(f"{data['slug']}: coordinator_pane {pane} 存在")
+        except (RuntimeError, OSError, ValueError, KeyError):
+            print(f"{data['slug']}: coordinator_pane {pane} 不存在或无法检查"); ok = False
+    with fleet_state() as (_, inbox):
+        pending = sum(item.get('root') == str(ROOT) and item.get('delivery') == 'pending' for item in inbox)
+    print(f'待投递事件: {pending}')
+    return 0 if ok and not pending else 1
+
+
 def task_event(a):
     with fleet_state(write=True) as (panes, inbox):
         entry = panes.get(a.pane)
@@ -1052,6 +1089,7 @@ def main():
     g = sub.add_parser('gc'); g.add_argument('--apply', action='store_true'); g.add_argument('--json', action='store_true')
     i = sub.add_parser('inbox'); i.add_argument('--all', action='store_true'); i.add_argument('--json', action='store_true')
     sub.add_parser('bind')
+    sub.add_parser('doctor')
     e = sub.add_parser('event'); e.add_argument('--pane', required=True); e.add_argument('--status', required=True, choices=('working', 'idle', 'done', 'blocked', 'exited'))
     a = p.parse_args()
     try:
@@ -1065,6 +1103,7 @@ def main():
         elif a.command == 'gc': gc(a)
         elif a.command == 'inbox': inbox_list(a)
         elif a.command == 'bind': bind()
+        elif a.command == 'doctor': return doctor()
         elif a.command == 'event': event(a)
         elif a.command == 'peek': print(herdr('agent', 'read', task_agent(a.slug), '--source', 'recent-unwrapped', '--lines', a.lines, json_output=False))
         elif a.command == 'send': submit(load(a.slug), task_agent(a.slug), a.text)

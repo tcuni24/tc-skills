@@ -43,12 +43,15 @@ fleet new <slug> [-r <键>[,<键>]] [--fix] [--base <键>=<ref>] [--agent <种�
 
 `fleet` 会在 prompt 前自动加上 worktree 路径、分支、base 和"不要改主 checkout"，不必重复。开完后执行 `fleet ls`，确认 tab 和 agent 都在。
 
+随后执行 `fleet doctor`。通过时可以结束本轮，告诉用户任务完成或阻塞后会自动通知；不通过时不得声称会自动通知，必须在同一轮内执行 `fleet wait <slug>...` 直到任务结束或阻塞。
+
 ## 3. 看情况
 
 - `fleet ls`：查看各任务的 tab、agent 状态、phase 和仓库汇总。
 - `fleet status <slug>`：查看下一步建议、提交、diff 统计、未提交文件、PR 和 agent 最近输出。仓库异常时显示 `phase=error` 和原因，并尽力显示其他仓库；`--lines` 不接受负数。
 - `fleet wait <slug>... [--any|--all] [--timeout SEC]`：等待最近一次提交后的 idle/done/blocked；默认 `--all`，`--any` 等首个终态。返回码分别为 0/0/3；超时为 4，其他错误为 1。终态观察成功后仓库信息出错不改变返回码。
-- 当前没有自动通知：主 agent 结束本轮前必须 `fleet wait` 到任务结束或阻塞，不得声称完成后会自动通知。
+- 收到 herdr-fleet 自动通知后，先逐个执行 `fleet status <slug>` 核查，再向用户汇报；通知本身不是验收证据。
+- `fleet inbox`：查看待投递事件；通知不可用时用它辅助排查，不能代替同一轮内等待。
 - `fleet peek <slug> [--lines N]`：查看任务 agent 的最近输出。
 - agent 状态为 `blocked`（等待确认或提问）时，先 peek 弄清它在问什么。属于用户的决策就转给用户，主 agent 不代为做决定。
 - `fleet send <slug> '<补充说明>'`：转达用户的补充或修正。用户中途追加的、与现有任务无关的需求，应该另开一个任务，不要塞进正在进行的任务。
