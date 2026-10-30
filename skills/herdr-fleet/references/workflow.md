@@ -62,6 +62,20 @@ fleet gc [--apply]                       # 报告所有仓库的全部 worktree�
 
 `peek` 和 `send` 按 tab 找到任务 agent 所在的 pane，再对 pane 操作。`herdr agent list` 里的 `agent` 字段是种类（如 `pi`），多个任务同时用 pi 时不唯一。
 
+`new` 要求任务 agent 在最终回复中输出回报块：
+
+```text
+FLEET-REPORT
+结果：完成 / 部分完成 / 阻塞
+PR：链接或无
+测试：每条命令及退出码
+证据边界：哪些已真实验证，哪些只是合成数据、mock、空页面或未覆盖
+需要决策：需要用户决定的事项或无
+END FLEET-REPORT
+```
+
+`status` 从所读取的最近输出中摘取最后一个完整回报块，文本显示在「回报」一节，JSON 的 `report` 为原文或 `null`。只有开头没有结尾不算完整块；输出行数不足可能截断回报，可增大 `--lines`。`--lines 0` 不读取 agent 输出，也不摘取回报块。`send` 的补充说明不改变回报要求。
+
 herdr 可执行文件依次取 `FLEET_HERDR`、`HERDR_BIN_PATH`，都没有时用 `herdr`。
 PR 查询用 `FLEET_GH` 指定可执行文件，默认 `gh`；失败或超时显示未知，不阻塞收尾。`ls --json` 保留原有键，新增 `agent_kind` 和 `phase`，出错时新增 `error`。
 `ls` 表格包含 tab 列，tab 存在但没有 agent 时可与没有 tab 区分。`status` 的文本和 JSON 在仓库异常时显示 `phase=error` 和原因，尽力保留其他仓库的信息，返回码为 0（与 `ls` 一致）。

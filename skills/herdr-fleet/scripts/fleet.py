@@ -263,6 +263,7 @@ def create_tab(data, agent, focus=False, explicit=None, prompt=None):
                 how = f"执行 {info['command']}" if info.get('command') else '自行安装依赖'
                 context.append(f"{REPOS[key]['dir']} 未链接 {', '.join(REPOS[key]['shared'])}（{info['reason']}）：需要时在 {dest / REPOS[key]['dir']} {how}。")
             context.append(f'只在上述 worktree 中修改和提交，不要改主 checkout（{ROOT}/<仓库>）。开始前先读各 worktree 里的 AGENTS.md。')
+            context.append('最终回复必须包含以下回报块：\nFLEET-REPORT\n结果：完成 / 部分完成 / 阻塞\nPR：链接或无\n测试：每条命令及退出码\n证据边界：哪些已真实验证，哪些只是合成数据、mock、空页面或未覆盖\n需要决策：需要用户决定的事项或无\nEND FLEET-REPORT')
             herdr('agent', 'prompt', data['slug'], '\n'.join(context) + '\n\n' + prompt)
     except Exception:
         herdr('tab', 'close', tid)
@@ -422,6 +423,19 @@ def pr_info(repo, branch):
         return None
 
 
+def last_report(output):
+    lines = output.splitlines(keepends=True)
+    start = None
+    report = None
+    for i, line in enumerate(lines):
+        if line.rstrip('\r\n') == 'FLEET-REPORT':
+            start = i
+        elif line.rstrip('\r\n') == 'END FLEET-REPORT' and start is not None:
+            report = ''.join(lines[start:i + 1]).rstrip('\r\n')
+            start = None
+    return report
+
+
 def status(a):
     if a.lines < 0: raise RuntimeError('--lines 不能为负数')
     data = load(a.slug)
@@ -448,6 +462,7 @@ def status(a):
     tab = find_tab(a.slug, tabs)
     agent = next((x for x in agents if tab and x.get('tab_id') == tab['tab_id']), None)
     row['agent_output'] = herdr('agent', 'read', agent['pane_id'], '--source', 'recent-unwrapped', '--lines', a.lines, json_output=False) if agent and a.lines else ''
+    row['report'] = last_report(row['agent_output'])
     if a.json:
         print(json.dumps(row, ensure_ascii=False, indent=2)); return
     print(f"{row['slug']}  tab: {row['tab']}  agent: {row['agent_kind']} {row['agent']}  phase: {row['phase']}\n下一步：{row['next_step']}")
@@ -460,6 +475,7 @@ def status(a):
         print('diff stat：\n' + ('\n'.join(info['diff_stat']) or '无'))
         if info['diff_stat_omitted']: print(f"另有 {info['diff_stat_omitted']} 行")
         print('PR: ' + (f"#{info['pr']['number']} {info['pr']['state']} {info['pr']['url']}" if info['pr'] else '未知'))
+    print('\n回报：\n' + (row['report'] or '未找到回报块'))
     if row['agent_output']: print('\nagent 最近输出：\n' + row['agent_output'])
 
 

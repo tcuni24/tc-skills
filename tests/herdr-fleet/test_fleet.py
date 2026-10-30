@@ -38,7 +38,7 @@ elif args[:2] == ['agent', 'wait']:
         print(os.environ['WAIT_FAIL'], file=sys.stderr); sys.exit(1)
     result = {}  # The real wait response schema is not specified by --help.
 elif args[:2] == ['agent', 'read']:
-    print('agent output tail'); sys.exit(0)
+    print(os.environ.get('AGENT_OUTPUT', 'agent output tail')); sys.exit(0)
 elif args[:2] == ['tab', 'create']: result = {'tab': {'tab_id': 't'}, 'root_pane': {'pane_id': 'p'}}
 elif args[:2] == ['pane', 'split']: result = {'pane': {'pane_id': 'q'}}
 else: result = {}
@@ -101,6 +101,7 @@ def test_new_and_rollback(setup):
     assert calls[1] == ['agent', 'start', 'hello', '--kind', 'pi', '--pane', 'p', '--timeout', '60000']
     prompt = calls[-1][-1]
     assert str(dest / 'web') in prompt and 'app-web' in prompt and prompt.endswith('do work')
+    assert all(field in prompt for field in ('FLEET-REPORT', 'END FLEET-REPORT', '结果', 'PR', '测试', '证据边界', '需要决策', '退出码'))
     p = fleet('new', 'bad', '--no-fetch', check=False, FAIL='pane split')
     assert p.returncode and not (root / 'worktrees/bad').exists()
     assert not git(root / 'app-web', 'branch', '--list', 'feat/bad')
@@ -386,6 +387,36 @@ def test_status_and_pr(setup, tmp_path):
     assert row['repos']['web']['diff_stat'] and row['agent_output'] == 'agent output tail'
     assert 'https://example.test/pr/12' in fleet('status', 'hello', FLEET_GH=str(gh)).stdout
     assert not json.loads(fleet('status', 'hello', '--json', '--lines', '0', NOTAB='1').stdout)['agent_output']
+
+
+@pytest.mark.parametrize(('output', 'expected'), [
+    ('before\nFLEET-REPORT\n结果：完成\nEND FLEET-REPORT\nafter', 'FLEET-REPORT\n结果：完成\nEND FLEET-REPORT'),
+    ('FLEET-REPORT\nold\nEND FLEET-REPORT\nFLEET-REPORT\nnew\nEND FLEET-REPORT', 'FLEET-REPORT\nnew\nEND FLEET-REPORT'),
+    ('FLEET-REPORT\nincomplete', None),
+    ('FLEET-REPORT\nold\nEND FLEET-REPORT\nFLEET-REPORT\nincomplete', 'FLEET-REPORT\nold\nEND FLEET-REPORT'),
+    ('nothing', None),
+])
+def test_status_report_blocks(setup, output, expected):
+    _, fleet, _ = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch')
+    text = fleet('status', 'hello', AGENT_OUTPUT=output)
+    row = json.loads(fleet('status', 'hello', '--json', AGENT_OUTPUT=output).stdout)
+    assert text.returncode == 0 and row['report'] == expected
+    assert (expected or '未找到回报块') in text.stdout
+    assert {'slug', 'tab', 'agent', 'agent_kind', 'phase', 'repos', 'next_step', 'agent_output'} <= row.keys()
+    ls = json.loads(fleet('ls', '--json').stdout)[0]
+    assert {'slug', 'tab', 'agent', 'agent_kind', 'phase', 'repos'} <= ls.keys()
+    assert 'report' not in ls
+
+
+def test_status_zero_lines_skips_report_read(setup):
+    _, fleet, log = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch')
+    log.write_text('')
+    row = json.loads(fleet('status', 'hello', '--json', '--lines', '0', AGENT_OUTPUT='FLEET-REPORT\nx\nEND FLEET-REPORT').stdout)
+    assert row['agent_output'] == '' and row['report'] is None
+    assert not any(json.loads(line)[:2] == ['agent', 'read'] for line in log.read_text().splitlines())
+    assert '未找到回报块' in fleet('status', 'hello', '--lines', '0').stdout
 
 
 def test_status_limits(setup, tmp_path):

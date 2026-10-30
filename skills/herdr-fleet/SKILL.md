@@ -51,7 +51,7 @@ fleet new <slug> [-r <键>[,<键>]] [--fix] [--base <键>=<ref>] [--agent <种�
 - `fleet peek <slug> [--lines N]`：查看任务 agent 的最近输出。
 - agent 状态为 `blocked`（等待确认或提问）时，先 peek 弄清它在问什么。属于用户的决策就转给用户，主 agent 不代为做决定。
 - `fleet send <slug> '<补充说明>'`：转达用户的补充或修正。用户中途追加的、与现有任务无关的需求，应该另开一个任务，不要塞进正在进行的任务。
-- 汇报给用户时，每个任务一行：slug、状态、PR 或阻塞点、下一步。
+- 汇报给用户时，每个任务一行：slug、状态、PR 或阻塞点、证据边界、下一步。
 
 主 agent 不替任务 agent 跑测试，也不进入其 worktree 修改文件。核对时只读：例如 `git -C worktrees/<slug>/<dir> diff --stat`，或者看 PR。
 
