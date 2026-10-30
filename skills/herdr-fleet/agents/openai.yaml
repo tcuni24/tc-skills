@@ -1,0 +1,4 @@
+interface:
+  display_name: "Herdr Fleet"
+  short_description: "Coordinate many parallel tasks in Herdr: one tab, one agent, and one set of git worktrees per task"
+  default_prompt: "Use $herdr-fleet to split this work into independent tasks, open a worktree set and a Herdr tab with its own agent for each, then track and clean them up."
