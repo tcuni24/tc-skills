@@ -204,7 +204,17 @@ def save(data):
     path = task_dir(data['slug']) / 'TASK.md'
     before, rest = path.read_text().split('```json\n', 1)
     _, after = rest.split('\n```', 1)
-    path.write_text(before + '```json\n' + json.dumps(data, ensure_ascii=False, indent=2) + '\n```' + after)
+    text = before + '```json\n' + json.dumps(data, ensure_ascii=False, indent=2) + '\n```' + after
+    temp = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', dir=path.parent, prefix='.TASK.md.', delete=False) as out:
+            temp = Path(out.name)
+            os.fchmod(out.fileno(), path.stat().st_mode & 0o7777)
+            out.write(text)
+        os.replace(temp, path)
+    finally:
+        if temp is not None:
+            temp.unlink(missing_ok=True)
 
 
 @contextmanager
@@ -238,6 +248,7 @@ def register_task(data, pane):
     if not coordinator:
         return
     with fleet_state(write=True) as (panes, inbox):
+        data = load(data['slug'])
         data['coordinator_pane'] = coordinator
         save(data)
         for old, entry in list(panes.items()):
@@ -321,12 +332,15 @@ def task_event(a):
         round_state['notified'] = True
         round_state['last_terminal_seq'] = seq if seq is not None else round_state['baseline']
         key = json.dumps([str(ROOT), data['slug'], round_state['baseline']], ensure_ascii=False)
-        inbox.append({'root': str(ROOT), 'slug': data['slug'], 'coordinator_pane': coordinator,
-                      'status': a.status, 'created': datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                      'dedup_key': key, 'delivery': 'pending', 'attempts': 0, 'last_error': None})
+        exists = any(item.get('dedup_key') == key for item in inbox)
+        if not exists:
+            inbox.append({'root': str(ROOT), 'slug': data['slug'], 'coordinator_pane': coordinator,
+                          'status': a.status, 'created': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                          'dedup_key': key, 'delivery': 'pending', 'attempts': 0, 'last_error': None})
         data['event_round'] = round_state
         save(data)
-        return coordinator
+        if not exists:
+            return coordinator
 
 
 def herdr_result(*args):
@@ -1008,12 +1022,10 @@ def main():
             else:
                 agent = agent_options(a, data)
                 if create_tab(data, agent, focus=True):
-                    data['agent'] = agent
-                    path = task_dir(a.slug) / 'TASK.md'
-                    text = path.read_text()
-                    before, rest = text.split('```json\n', 1)
-                    _, after = rest.split('\n```', 1)
-                    path.write_text(before + '```json\n' + json.dumps(data, ensure_ascii=False, indent=2) + '\n```' + after)
+                    with fleet_state():
+                        data = load(a.slug)
+                        data['agent'] = agent
+                        save(data)
     except (RuntimeError, OSError, ValueError, KeyError) as e:
         print(f'错误：{e}', file=sys.stderr)
         return 1

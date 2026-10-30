@@ -27,8 +27,16 @@ dir = "backend"
 
 FAKE_HERDR = '''#!/usr/bin/env python3
 import json, os, sys, time
+from pathlib import Path
 args = sys.argv[1:]
 with open(os.environ['LOG'], 'a') as f: f.write(json.dumps(args) + '\\n')
+if os.environ.get('BARRIER') and args[:2] == os.environ.get('BARRIER_CALL', '').split():
+    barrier = Path(os.environ['BARRIER'])
+    barrier.touch()
+    deadline = time.monotonic() + 10
+    while not barrier.with_suffix('.release').exists():
+        if time.monotonic() >= deadline: sys.exit(2)
+        time.sleep(0.01)
 if os.environ.get('FAIL') and args[:2] == os.environ['FAIL'].split(): sys.exit(1)
 if args[:2] == ['workspace', 'list']: result = {'workspaces': [{'workspace_id': 'w', 'focused': True}]}
 elif args[:2] == ['tab', 'list']: result = {'tabs': [] if os.environ.get('NOTAB') else [{'tab_id': 't', 'label': 'hello', 'workspace_id': 'w'}] + ([{'tab_id': 'u', 'label': 'other', 'workspace_id': 'w'}] if os.environ.get('MULTI') else [])}
@@ -336,6 +344,64 @@ def test_event_exited_without_agent_get(setup):
     fleet('event', '--pane', 'p', '--status', 'exited', FAIL='agent get')
     assert not any(json.loads(line) == ['agent', 'get', 'p'] for line in log.read_text().splitlines())
     assert json.loads(fleet('inbox', '--json').stdout)[0]['status'] == 'exited'
+
+
+@pytest.mark.parametrize(('call', 'reopen'), [('tab focus', False), ('pane split', True)])
+def test_open_race_with_event_preserves_round_and_deduplicates(setup, tmp_path, call, reopen):
+    root, fleet, log = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
+    barrier = tmp_path / 'barrier'
+    log.write_text('')
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        opening = pool.submit(fleet, 'open', 'hello', HERDR_PANE_ID='coordinator', BARRIER=str(barrier),
+                              BARRIER_CALL=call, **({'NOTAB': '1'} if reopen else {}))
+        try:
+            deadline = time.monotonic() + 8
+            while not barrier.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert barrier.exists(), 'open did not reach the fake herdr barrier'
+            fleet('event', '--pane', 'p', '--status', 'idle', GET_SEQ='12', COORD_STATUS='idle')
+        finally:
+            barrier.with_suffix('.release').touch()
+        opening.result(timeout=10)
+    assert task_data(root, 'hello')['event_round']['notified'] is True
+    fleet('event', '--pane', 'p', '--status', 'idle', GET_SEQ='12', COORD_STATUS='idle')
+    assert len(json.loads(fleet('inbox', '--all', '--json').stdout)) == 1
+    prompts = [c for line in log.read_text().splitlines() if (c := json.loads(line))[:2] == ['agent', 'prompt']]
+    assert len(prompts) == 1
+    assert {p.name for p in (root / 'worktrees/hello').iterdir()} == {'TASK.md', 'web'}
+
+
+def test_event_dedup_key_survives_stale_round_state(setup):
+    root, fleet, _ = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
+    fleet('event', '--pane', 'p', '--status', 'idle', GET_SEQ='12', COORD_STATUS='idle')
+    path = root / 'worktrees/hello/TASK.md'
+    text = path.read_text().replace('"notified": true', '"notified": false')
+    path.write_text(text)
+    fleet('event', '--pane', 'p', '--status', 'idle', GET_SEQ='12', COORD_STATUS='idle')
+    assert len(json.loads(fleet('inbox', '--all', '--json').stdout)) == 1
+    assert task_data(root, 'hello')['event_round']['notified'] is True
+
+
+def test_atomic_task_save_with_concurrent_cli_readers(setup):
+    root, fleet, _ = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', HERDR_PANE_ID='coordinator')
+    path = root / 'worktrees/hello/TASK.md'
+    with path.open('a') as f:
+        f.write('\n' + 'x' * 3000000)
+    def writer():
+        for _ in range(30):
+            fleet('bind', HERDR_PANE_ID='coordinator')
+    def reader():
+        for _ in range(30):
+            rows = json.loads(fleet('ls', '--json').stdout)
+            assert [row['slug'] for row in rows] == ['hello']
+            assert json.loads(fleet('status', 'hello', '--json', '--lines', '0').stdout)['slug'] == 'hello'
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        jobs = [pool.submit(writer), pool.submit(reader)]
+        for job in jobs: job.result(timeout=60)
+    assert {p.name for p in path.parent.iterdir()} == {'TASK.md', 'web'}
 
 
 def test_delivery_idle_and_inbox_history(setup):
