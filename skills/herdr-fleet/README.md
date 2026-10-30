@@ -46,7 +46,9 @@ cp <skill 目录>/extensions/ask-user.ts ~/.pi/agent/extensions/   # 用户级�
 fleet new <slug> --agent pi --agent-arg=-e --agent-arg=<skill 目录绝对路径>/extensions/ask-user.ts --prompt '...'
 ```
 
-验收：`python3 tests/herdr-fleet/ask_user_live_check.py` 在 pty 中启动真实 pi（关闭扩展发现，`-e` 显式加载本扩展与已安装的 herdr 集成），HERDR_* 指向脚本自建 unix socket，键入 `/ask-user` 后断言 `pane.report_agent` 依次出现 idle → blocked（message 为问题文本）→ idle。该检查验证真实 pi 进程、真实扩展与真实集成文件之间的完整链路；socket 对端（真实 herdr daemon → 插件 `pane.agent_status_changed` → fleet 收件箱 → 主 agent 通知）不在覆盖范围。要在真实 fleet 中验收：按上例开任务（或给既有 pi pane 加 `-e`），让任务 agent 调用 ask_user 或输入 `/ask-user`，观察 pane 显示 blocked、主 agent 收到 `<slug> blocked blocked -`，回答后恢复。
+验收：`python3 tests/herdr-fleet/ask_user_live_check.py` 在 pty 中启动真实 pi（关闭扩展发现，`-e` 显式加载本扩展与已安装的 herdr 集成），HERDR_* 指向脚本自建 unix socket，键入 `/ask-user` 后断言 `pane.report_agent` 依次出现 idle → blocked（message 为问题文本）→ idle。`--plain` 则完全不加载集成、不开 socket，验证 `/ask-user` 在无事件消费者时仍是普通提问。
+
+真实 fleet 验收（已实测，pi 1.4.0 / herdr 0.9.1 / 插件 tc.herdr-fleet，probe `ask-user-live`）：按上例 `fleet new` 创建 pi 任务并登记 `coordinator_pane`。模型路径：任务 pi 的真实模型实际调用 `ask_user(验收选项, [alpha, beta])` → pane blocked → blocked 通知进入 coordinator 收件箱并 delivered → 真实按键选 alpha → 工具返回 `User selected: alpha` → 恢复。命令路径：向 pane 键入 `/ask-user … | a | b` 回车 → blocked → Enter 回答恢复；Escape 取消 → `User cancelled without answering` 恢复。原始证据（agent get/inbox/plugin log/终端文本记录/pi session 转录）为本机 gitignored 产物，留存于 `tests/herdr-fleet/tmp-live/fleet-acceptance/`。已知限制：blocked 的任务 pane 上 `fleet status --lines 70` 读取输出返回 `agent_not_idle`（#36）；改用 `herdr agent read <pane> --source visible` 查看（`--source visible` 不可省略）。
 
 ## 真机验证清单
 
@@ -58,4 +60,5 @@ fleet new <slug> --agent pi --agent-arg=-e --agent-arg=<skill 目录绝对路径
 - 通过：herdr 接受清单及相对路径钩子，`herdr plugin log list` 显示 `pane.agent_status_changed` 钩子 succeeded、退出码 0。
 - 通过：关闭任务 tab 触发 `tab.closed`，钩子按索引中的 tab_id 找到任务 pane，事件以 `exited` 状态投递给主 agent（`herdr plugin log list` 中 `tab.closed` 钩子 succeeded、退出码 0）。插件订阅 `pane.exited`、`pane.closed` 和 `tab.closed`；杀掉任务 agent 进程时通知状态为 done。旧索引没有 tab_id，需运行 `fleet bind` 或重新打开任务以登记 tab。
 - 通过：blocked 通知。用只含 `/probe-block`、`/probe-unblock` 两个命令的临时 pi 扩展（`pi -e`，经 pi 事件总线发出 `herdr:blocked`，由 herdr 自带的 pi 集成上报，未写 socket）：`fleet send <slug> '/probe-block'` 后 herdr 显示 blocked，主 agent 收到 `<slug> blocked blocked -`；`/probe-unblock` 后状态回到 idle。pi 纯文字提问不会发 `herdr:blocked`，仍显示 done。
-- 已知限制：任务回报块常不在最近 12 行中，`fleet status` 可能显示未找到回报块；可增大 `--lines`（属 #24 范围）。
+- 通过：ask-user-live probe（#34 交付验收）。真实模型调用 `ask_user` 与 `/ask-user` 命令路径均使 pane 上报 blocked 且通知进 coordinator 收件箱；按键回答返回所选值、Esc 取消返回 cancelled，状态恢复。无集成时工具降级为普通提问。
+- 已知限制：任务回报块常不在最近 12 行中，`fleet status` 可能显示未找到回报块；可增大 `--lines`（属 #24 范围）。blocked 的任务 pane 上 `fleet status --lines 70` 读输出返回 `agent_not_idle`（#36），用 `fleet status --lines 0` 加 `herdr agent read <pane> --source visible` 代替。

@@ -14,6 +14,11 @@ blocked while the dialog waits and returns to idle after the answer, and dumps
 the captured frames. Usage:
 
     python3 tests/herdr-fleet/ask_user_live_check.py [--integration PATH] [--out PATH]
+
+With --plain the herdr integration and fake socket are skipped entirely: the
+check asserts /ask-user still drives a real TUI dialog and returns the answer,
+proving the extension degrades to a plain question when no consumer listens on
+pi.events.
 """
 
 import argparse
@@ -38,6 +43,7 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument('--ext', default=str(SKILL / 'extensions' / 'ask-user.ts'))
     p.add_argument('--integration', default=str(Path.home() / '.pi/agent/extensions/herdr-agent-state.ts'))
+    p.add_argument('--plain', action='store_true', help='run without the herdr integration or socket')
     p.add_argument('--pi', default='pi')
     p.add_argument('--out', default='')
     p.add_argument('--timeout', type=float, default=30.0)
@@ -74,7 +80,10 @@ def sock_server(path, records, ready):
 
 def main():
     a = parse_args()
-    for name, path in (('extension', a.ext), ('integration', a.integration)):
+    checks = [('extension', a.ext)]
+    if not a.plain:
+        checks.append(('integration', a.integration))
+    for name, path in checks:
         if not Path(path).is_file():
             print(f'missing {name}: {path}', file=sys.stderr)
             return 2
@@ -85,22 +94,24 @@ def main():
         agent_dir = os.path.join(tmp, 'agent')
         os.makedirs(agent_dir)
         records, ready = [], threading.Event()
-        server = threading.Thread(target=sock_server, args=(sock_path, records, ready), daemon=True)
-        server.start()
-        ready.wait(5)
+        if not a.plain:
+            server = threading.Thread(target=sock_server, args=(sock_path, records, ready), daemon=True)
+            server.start()
+            ready.wait(5)
 
         master, slave = os.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 40, 120, 0, 0))
         env = {
             **os.environ,
             'PI_CODING_AGENT_DIR': agent_dir,
-            'HERDR_ENV': '1',
-            'HERDR_PANE_ID': 'live-check-pane',
-            'HERDR_SOCKET_PATH': sock_path,
             'TERM': 'xterm-256color',
         }
-        proc = subprocess.Popen(
-            [a.pi, '--no-extensions', '--no-session', '-e', a.integration, '-e', a.ext],
+        if not a.plain:
+            env.update({'HERDR_ENV': '1', 'HERDR_PANE_ID': 'live-check-pane', 'HERDR_SOCKET_PATH': sock_path})
+        argv = [a.pi, '--no-extensions', '--no-session']
+        if not a.plain:
+            argv += ['-e', a.integration]
+        proc = subprocess.Popen(argv + ['-e', a.ext],
             stdin=slave, stdout=slave, stderr=slave, cwd=tmp, env=env, close_fds=True)
         os.close(slave)
         os.set_blocking(master, False)
@@ -137,17 +148,38 @@ def main():
 
         steps = []
         ok = True
-        ok &= wait_for(lambda: agent_states() and agent_states()[-1] == 'idle', 'initial idle', deadline - time.monotonic())
-        steps.append(('startup->idle', ok))
-        if ok:
-            os.write(master, b'/ask-user Approve deploy? | yes | no\r')
-            ok = wait_for(lambda: 'blocked' in agent_states(), 'blocked report', 20)
-            steps.append(('ask-user->blocked', ok))
-        if ok:
-            time.sleep(0.5)
-            os.write(master, b'\r')
-            ok = wait_for(lambda: agent_states() and agent_states()[-1] != 'blocked', 'idle after answer', 20)
-            steps.append(('answer->recover', ok))
+        if a.plain:
+            ok &= wait_for(lambda: bytes(raw).count(b'\xe2\x94\x80') > 100, 'tui render', deadline - time.monotonic())
+            steps.append(('startup->render', ok))
+            if ok:
+                os.write(master, b'/ask-user Degrade check? | a1 | a2')
+                ok = wait_for(lambda: b'Degrade check' in raw, 'typed echo', 20)
+            dialog_up = False
+            for _ in range(5):
+                if not ok:
+                    break
+                os.write(master, b'\r')
+                if wait_for(lambda: b'a1' in raw and b'cancel' in raw, 'dialog shown', 8):
+                    dialog_up = True
+                    break
+            ok &= dialog_up
+            steps.append(('ask-user->dialog', ok))
+            if ok:
+                os.write(master, b'\r')
+                ok = wait_for(lambda: b'User selected: a1' in raw, 'answer returned', 20)
+                steps.append(('answer->result', ok))
+        else:
+            ok &= wait_for(lambda: agent_states() and agent_states()[-1] == 'idle', 'initial idle', deadline - time.monotonic())
+            steps.append(('startup->idle', ok))
+            if ok:
+                os.write(master, b'/ask-user Approve deploy? | yes | no\r')
+                ok = wait_for(lambda: 'blocked' in agent_states(), 'blocked report', 20)
+                steps.append(('ask-user->blocked', ok))
+            if ok:
+                time.sleep(0.5)
+                os.write(master, b'\r')
+                ok = wait_for(lambda: agent_states() and agent_states()[-1] != 'blocked', 'idle after answer', 20)
+                steps.append(('answer->recover', ok))
 
         proc.send_signal(signal.SIGTERM)
         pump(time.monotonic() + 2)
