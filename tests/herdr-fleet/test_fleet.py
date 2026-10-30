@@ -29,8 +29,16 @@ args = sys.argv[1:]
 with open(os.environ['LOG'], 'a') as f: f.write(json.dumps(args) + '\\n')
 if os.environ.get('FAIL') and args[:2] == os.environ['FAIL'].split(): sys.exit(1)
 if args[:2] == ['workspace', 'list']: result = {'workspaces': [{'workspace_id': 'w', 'focused': True}]}
-elif args[:2] == ['tab', 'list']: result = {'tabs': [] if os.environ.get('NOTAB') else [{'tab_id': 't', 'label': 'hello', 'workspace_id': 'w'}]}
-elif args[:2] == ['agent', 'list']: result = {'agents': [] if os.environ.get('NOAGENT') else [{'agent': 'pi', 'pane_id': 'p', 'tab_id': 't', 'agent_status': os.environ.get('AGENT_STATUS', 'idle')}]}
+elif args[:2] == ['tab', 'list']: result = {'tabs': [] if os.environ.get('NOTAB') else [{'tab_id': 't', 'label': 'hello', 'workspace_id': 'w'}] + ([{'tab_id': 'u', 'label': 'other', 'workspace_id': 'w'}] if os.environ.get('MULTI') else [])}
+elif args[:2] == ['agent', 'list']: result = {'agents': [] if os.environ.get('NOAGENT') else [{'agent': 'pi', 'pane_id': 'p', 'tab_id': 't', 'agent_status': os.environ.get('AGENT_STATUS', 'idle')}] + ([{'agent': 'pi', 'pane_id': 'q', 'tab_id': 'u', 'agent_status': os.environ.get('OTHER_STATUS', 'idle')}] if os.environ.get('MULTI') else [])}
+elif args[:2] == ['agent', 'get']:
+    gets = sum(json.loads(line)[:2] == ['agent', 'get'] for line in open(os.environ['LOG']))
+    seq = os.environ.get('GET_AFTER_SEQ', '10') if gets > int(os.environ.get('GET_AFTER_N', '999999')) else os.environ.get('GET_SEQ', '10')
+    result = {'agent': {'agent_status': os.environ.get('OTHER_STATUS', 'idle') if args[2] == 'q' else os.environ.get('GET_STATUS', 'idle'), 'state_change_seq': int(os.environ.get('OTHER_SEQ', seq) if args[2] == 'q' else seq)}}
+elif args[:2] == ['agent', 'prompt'] and '--wait' in args:
+    if os.environ.get('PROMPT_FAIL'):
+        print(json.dumps({'error': {'code': os.environ['PROMPT_FAIL']}})); sys.exit(1)
+    result = {'type': 'agent_prompted'}
 elif args[:2] == ['agent', 'wait']:
     if os.environ.get('WAIT_STDOUT'):
         print(os.environ['WAIT_STDOUT']); sys.exit(1)
@@ -97,15 +105,67 @@ def test_new_and_rollback(setup):
     assert node.is_symlink() and node.readlink().is_absolute() and node.resolve() == root / 'app-web/node_modules'
     assert 'origin/develop' in (dest / 'TASK.md').read_text()
     calls = [json.loads(x) for x in log.read_text().splitlines()]
-    assert [c[:2] for c in calls] == [['tab', 'create'], ['agent', 'start'], ['pane', 'split'], ['agent', 'prompt']]
+    assert [c[:2] for c in calls] == [['tab', 'create'], ['agent', 'start'], ['pane', 'split'], ['agent', 'get'], ['agent', 'prompt']]
     assert calls[1] == ['agent', 'start', 'hello', '--kind', 'pi', '--pane', 'p', '--timeout', '60000']
-    prompt = calls[-1][-1]
+    prompt = calls[-1][3]
     assert str(dest / 'web') in prompt and 'app-web' in prompt and prompt.endswith('do work')
     assert all(field in prompt for field in ('FLEET-REPORT', 'END FLEET-REPORT', '结果', 'PR', '测试', '证据边界', '需要决策', '退出码'))
     p = fleet('new', 'bad', '--no-fetch', check=False, FAIL='pane split')
     assert p.returncode and not (root / 'worktrees/bad').exists()
     assert not git(root / 'app-web', 'branch', '--list', 'feat/bad')
     assert fleet('new', 'Bad!', check=False).returncode
+
+
+def test_send_blocked_before_submission(setup):
+    root, fleet, log = setup
+    fleet('new', 'hello', '--no-fetch')
+    result = fleet('send', 'hello', 'text', GET_STATUS='blocked', check=False)
+    assert result.returncode == 1 and 'peek' in result.stderr
+    assert not any(json.loads(line)[:2] == ['agent', 'prompt'] for line in log.read_text().splitlines())
+
+
+def test_round_wait_rejects_old_idle_and_accepts_new_idle(setup):
+    root, fleet, _ = setup
+    fleet('new', 'hello', '--no-fetch', '--prompt', 'work')
+    assert task_data(root, 'hello')['submit_seq'] == 10
+    assert fleet('wait', 'hello', '--timeout', '0', check=False).returncode == 4
+    result = fleet('wait', 'hello', '--timeout', '0', GET_SEQ='12')
+    assert result.stdout.strip() == 'hello idle-empty idle'
+
+
+def test_confirmation_failure_preserves_task(setup):
+    root, fleet, log = setup
+    result = fleet('new', 'hello', '--no-fetch', '--prompt', 'work', PROMPT_FAIL='timeout', check=False)
+    assert result.returncode == 1 and (root / 'worktrees/hello/web').exists()
+    assert not any(json.loads(line)[:2] == ['tab', 'close'] for line in log.read_text().splitlines())
+
+
+@pytest.mark.parametrize('command', ['new', 'send'])
+def test_fast_completion_after_confirmation_timeout(setup, command):
+    root, fleet, log = setup
+    if command == 'send': fleet('new', 'hello', '--no-fetch')
+    log.write_text('')
+    args = ('new', 'hello', '--no-fetch', '--prompt', 'work') if command == 'new' else ('send', 'hello', 'work')
+    fleet(*args, PROMPT_FAIL='timeout', GET_AFTER_N='1', GET_AFTER_SEQ='12')
+    assert task_data(root, 'hello')['submit_seq'] == 10
+    assert fleet('wait', 'hello', '--timeout', '0', GET_SEQ='12').returncode == 0
+
+
+def test_round_wait_multiple_and_blocked(setup):
+    root, fleet, _ = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'work')
+    fleet('new', 'other', '-r', 'web', '--no-fetch', '--agent', 'none')
+    path = root / 'worktrees/other/TASK.md'
+    text = path.read_text().replace('"slug": "other"', '"slug": "other", "submit_seq": 9')
+    path.write_text(text)
+    result = fleet('wait', 'hello', 'other', '--timeout', '0', check=False)
+    assert result.returncode == 1  # missing tab is an error
+    assert fleet('wait', 'hello', 'other', '--timeout', '0', MULTI='1', GET_SEQ='11', OTHER_SEQ='9', check=False).returncode == 4
+    any_result = fleet('wait', 'hello', 'other', '--any', '--timeout', '0', MULTI='1', GET_SEQ='11', OTHER_SEQ='9')
+    assert any_result.stdout.strip() == 'hello idle-empty idle'
+    all_result = fleet('wait', 'hello', 'other', '--all', '--timeout', '0', MULTI='1', GET_SEQ='11', OTHER_SEQ='10', OTHER_STATUS='blocked', check=False)
+    assert all_result.returncode == 3 and len(all_result.stdout.splitlines()) == 2
+    assert fleet('wait', 'hello', '--timeout', '0', GET_STATUS='blocked', GET_SEQ='11', check=False).returncode == 3
 
 
 def task_data(root, slug):
@@ -268,7 +328,7 @@ def test_lockfile_mismatch_skips_link_and_tells_the_agent(setup):
     p = fleet('new', 'locky', '-r', 'web', '--no-fetch', '--prompt', 'go')
     node = root / 'worktrees/locky/web/node_modules'
     assert not node.exists() and 'pnpm i' in p.stderr
-    prompt = json.loads(log.read_text().splitlines()[-1])[-1]
+    prompt = json.loads(log.read_text().splitlines()[-1])[3]
     assert 'pnpm-lock.yaml' in prompt and f"{root / 'worktrees/locky/web'} 执行 pnpm i" in prompt
     # An independent install (ignored by git) must not block cleanup.
     (node / 'pkg').mkdir(parents=True); (node / 'pkg/index.js').write_text('x')
@@ -283,7 +343,7 @@ def test_send_and_peek_target_pane(setup):
     fleet('send', 'hello', '继续')
     fleet('peek', 'hello', '--lines', '5')
     calls = [json.loads(line) for line in log.read_text().splitlines()]
-    assert ['agent', 'prompt', 'p', '继续'] in calls
+    assert any(call[:4] == ['agent', 'prompt', 'p', '继续'] and '--wait' in call for call in calls)
     assert ['agent', 'read', 'p', '--source', 'recent-unwrapped', '--lines', '5'] in calls
 
 
