@@ -26,6 +26,6 @@ herdr plugin unlink tc.herdr-fleet
 - 通过：主 agent 结束本轮后，任务完成时被自动通知唤醒，先用 `fleet status` 核查再汇报。
 - 通过：主 agent 忙于 sleep 150 时两个任务先后完成，空闲后合并为一条通知，包含 `live-b done review -` 和 `live-c done review -`。
 - 通过：herdr 接受清单及相对路径钩子，`herdr plugin log list` 显示 `pane.agent_status_changed` 钩子 succeeded、退出码 0。
-- 退出入口已修正，待真机重测：插件订阅 `pane.exited`、`pane.closed` 和 `tab.closed`。探测确认关 tab 触发 `tab.closed`，关 pane 触发 `pane.closed`，pane 内进程退出触发 `pane.exited`；杀掉任务 agent 进程时通知状态为 done。旧索引没有 tab_id，需运行 `fleet bind` 或重新打开任务以登记 tab。
-- blocked 是否出现取决于 agent 集成是否上报：pi 的 herdr 集成只在收到 pi 事件 `herdr:blocked` 时上报 blocked，纯文字提问显示 done。blocked 通知路径目前仅 fake herdr 验证，真机未验证。
+- 通过：关闭任务 tab 触发 `tab.closed`，钩子按索引中的 tab_id 找到任务 pane，事件以 `exited` 状态投递给主 agent（`herdr plugin log list` 中 `tab.closed` 钩子 succeeded、退出码 0）。插件订阅 `pane.exited`、`pane.closed` 和 `tab.closed`；杀掉任务 agent 进程时通知状态为 done。旧索引没有 tab_id，需运行 `fleet bind` 或重新打开任务以登记 tab。
+- 通过：blocked 通知。用只含 `/probe-block`、`/probe-unblock` 两个命令的临时 pi 扩展（`pi -e`，经 pi 事件总线发出 `herdr:blocked`，由 herdr 自带的 pi 集成上报，未写 socket）：`fleet send <slug> '/probe-block'` 后 herdr 显示 blocked，主 agent 收到 `<slug> blocked blocked -`；`/probe-unblock` 后状态回到 idle。pi 纯文字提问不会发 `herdr:blocked`，仍显示 done。
 - 已知限制：任务回报块常不在最近 12 行中，`fleet status` 可能显示未找到回报块；可增大 `--lines`（属 #24 范围）。
