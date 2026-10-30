@@ -23,10 +23,10 @@
 | D2 | 逻辑归属 | 插件钩子是薄壳，只解析事件并调用 `fleet event`；判定、去重、延后、投递全部在 fleet 命令里，状态以 fleet 的记录为准 |
 | D3 | 投递时机 | 主 agent 空闲时立即 `herdr agent prompt`；主 agent working 或 blocked 时进收件箱，等主 agent 自己的空闲边沿到来时合并为一条投递。不往正在运行的主 agent 里插话 |
 | D4 | 通知内容 | 只当触发器：首行固定标明"herdr-fleet 自动通知，非用户消息"，列出 slug、agent 状态、phase、PR（如已知），并要求用 `fleet status` 核查。通知本身不是证据 |
-| D5 | 去重 | 一个任务在一次"working → 终态（idle/done/blocked/exited）"转换上最多通知一次；之前没有观察到 working 的终态边沿不通知 |
+| D5 | 去重 | 一个任务每一轮最多通知一次。轮次由 `new`/`send` 提交成功时开始（基线为提交前读取的状态序号），也可由序号晚于上次已通知终态的 working 边沿开始（用户直接在任务 pane 里输入的情况）；只有序号晚于本轮基线的终态（idle/done/blocked/exited）才通知，不要求事先观察到 working 边沿。提交前的旧终态、迟到或重复的事件不通知 |
 | D6 | 状态存放 | `TASK.md` 记录 `coordinator_pane`；pane 索引与收件箱放在 `$XDG_STATE_HOME/herdr-fleet/`（默认 `~/.local/state/herdr-fleet/`），不放进任务目录（`done` 预检会拒绝任务目录里多出的文件） |
-| D7 | 无插件时的规则 | `fleet doctor` 未通过时，主 agent 在同一轮内 `fleet wait` 直到任务结束或阻塞；不得声称会自动通知。`fleet inbox` 作为兜底查看 |
-| D8 | wait 语义 | 只接受本次提交 prompt 之后发生的终态；`new`/`send` 在命令内部确认 agent 已开始工作；`wait` 支持多个 slug 与 `--any`/`--all` |
+| D7 | 无插件时的规则 | `fleet doctor` 未通过时，主 agent 必须在同一轮内 `fleet wait` 直到任务结束或阻塞，不能以"告诉用户不会自动通知"代替等待；不得声称会自动通知。`fleet inbox` 只作兜底查看，不替代等待 |
+| D8 | wait 语义 | 只接受本次提交 prompt 之后发生的终态（序号晚于提交前读取的基线）；`new`/`send` 在命令内部确认 agent 已开始工作，确认期间已出现晚于基线的终态（快速完成）同样视为确认成功；`wait` 支持多个 slug 与 `--any`/`--all` |
 | D9 | 回报块 | 任务 agent 结束时输出固定的 `FLEET-REPORT` 块；`fleet status` 摘取最近一块；SKILL 汇报模板加"证据边界"一列 |
 | D10 | 实施基线 | 实施分支基于已合并 PR #22（ls 表格）之后的 `main`；工单 1、2 可并行，3 → 4 → 5 串行 |
 
@@ -46,7 +46,7 @@
 
 ### B. 按轮次等待（D8）
 
-- `new` 与 `send` 提交 prompt 后，在命令内部等待 agent 进入 working 或 blocked（短超时），并记录本次提交时的状态序号。确认失败时报错并保留任务，不回滚已建的 worktree（`new` 的回滚只针对 worktree、tab、agent 创建失败）。
+- `new` 与 `send` 在提交 prompt 前读取并记录状态序号作为本轮基线，提交后在命令内部等待 agent 进入 working 或 blocked（短超时）。任务可能在确认返回前就完成 working → idle，且确认可能看不到短暂的 working：确认超时后先查 `agent get`，若已出现序号晚于基线的 idle/done/blocked，视为已开始并已结束，确认成功。仍无变化时才报错并保留任务，不回滚已建的 worktree（`new` 的回滚只针对 worktree、tab、agent 创建失败）。
 - `wait <slug>...`：对每个任务，只接受序号晚于最近一次提交的 idle/done/blocked；已经满足的立即计入。`--all`（默认）等全部任务，`--any` 等第一个。返回码沿用现有约定：全部 idle/done 为 0，任一 blocked 为 3，超时为 4，其他错误为 1；多任务时逐行输出 `slug phase state`。
 - SKILL 删去"先用 `fleet status` 确认 working 再 wait"的手工步骤。
 
@@ -54,8 +54,8 @@
 
 - `new`/`open` 把当前 `HERDR_PANE_ID` 记为 `coordinator_pane`（写入 `TASK.md`），并在 pane 索引中登记：任务 pane → (项目根, slug, role=task)，主 agent pane → (项目根, role=coordinator)。`done` 清理对应索引；`fleet bind` 把当前项目全部活跃任务的 `coordinator_pane` 改为当前 pane（主 agent 换了 tab 或重启后使用）。
 - `fleet event --pane <id> --status <状态>`：
-  - 任务 pane 的 working 边沿：记录"本轮已开始"。
-  - 任务 pane 的终态边沿（idle/done/blocked/exited）：本轮已开始且未通知时，生成一条事件进收件箱，并尝试投递。
+  - 本轮开始：`new`/`send` 提交成功时已记录本轮基线（B 节），不依赖插件观察到 working 边沿。任务 pane 的 working 边沿只在其序号晚于上次已通知终态时开始新一轮（用户直接在任务 pane 输入的情况），迟到的旧 working 不开新轮。
+  - 任务 pane 的终态边沿（idle/done/blocked/exited）：以 `agent get` 核对当前状态与序号，序号晚于本轮基线且本轮未通知时，生成一条事件进收件箱，并尝试投递。working 事件缺失、idle 先于 working 到达时同样通知一次；提交前的旧终态与重复事件不通知。
   - 主 agent pane 的 idle/done 边沿：把收件箱里属于该 pane 的待投递事件合并成一条投递。
   - 不认识的 pane：静默退出 0。
 - 投递：主 agent 当前为 idle/done 时 `herdr agent prompt`，以 `agent_prompted` 为成功；主 agent working/blocked、pane 不存在或投递未确认时保留为待投递。pane 不存在时用 `herdr notification show` 提醒一次。
@@ -68,7 +68,7 @@
 - 钩子读取 `HERDR_PLUGIN_EVENT` 与 `HERDR_PLUGIN_EVENT_JSON`，兼容 `{event, data}` 外层包装与扁平载荷，取 `pane_id`、`agent_status`，查 pane 索引得到项目根后调用同目录的 fleet `event`。不认识的 pane 不调用 fleet。钩子失败时显示一次 `notification show`。
 - `fleet doctor`：检查 herdr 版本、插件已安装且启用、活跃任务的 `coordinator_pane` 仍存在、待投递事件数量；全部满足返回 0，否则返回非零并逐项说明。
 - README 写安装：`herdr plugin link <skill 目录> --enabled`，以及卸载与 `herdr plugin log list` 排障。
-- SKILL「开任务」一节：开完后运行 `fleet doctor`；通过则可以结束本轮，并告诉用户完成后会被自动通知；不通过则在同一轮内 `fleet wait`，或明确告诉用户不会自动通知。收到自动通知后先 `fleet status` 核查，再向用户汇报。
+- SKILL「开任务」一节：开完后运行 `fleet doctor`；通过则可以结束本轮，并告诉用户完成后会被自动通知；不通过则必须在同一轮内 `fleet wait` 到任务结束或阻塞，不得只告诉用户不会自动通知就结束本轮。收到自动通知后先 `fleet status` 核查，再向用户汇报。
 
 ## User Stories
 
@@ -108,6 +108,7 @@
 34. 作为维护者，我希望 `fleet done` 清理该任务的索引和收件箱记录，以便状态目录不累积垃圾。
 35. 作为维护者，我希望不认识的 pane 事件静默忽略，以便插件不干扰 herdr-pair 或其他 tab。
 36. 作为维护者，我希望旧任务（`TASK.md` 没有 `coordinator_pane`）继续可用，只是不产生通知，以便升级不破坏已有任务。
+37. 作为主 agent，我希望任务在开始确认返回前就完成（working → idle）时，`new`/`send` 不误报超时、`wait` 立即返回、通知照常且只发一次，以便很快完成的小任务不被当成失败或被漏掉。
 
 ## Implementation Decisions
 
@@ -116,8 +117,8 @@
   - 修改：`new`、`open`（记录 `coordinator_pane`、登记 pane 索引、确认 agent 开始工作并记录提交序号）、`send`（确认开始工作并记录提交序号）、`wait`（多 slug、`--any`/`--all`、按提交序号判定）、`status`（摘取回报块，JSON 增加 `report`）、`done`（清理索引与收件箱记录）。
   - 现有命令的返回码与 `ls --json` 已有键保持不变。
 - **状态序号来源**：优先使用 herdr `agent get` 返回的 `state_change_seq`；实施时须核实它在提交 prompt、状态变化时的实际行为，若不可用则由 fleet 自记提交时间与边沿顺序，结论写进 PR。
-- **任务 agent 的确认开始**：使用 `herdr agent prompt --wait --until working --until blocked` 加短超时；`agent_blocked`（提交前已 blocked）报错并提示先 peek。
-- **事件模型**：每条事件包含 项目根、slug、终态、产生时间、去重键、投递状态（pending / delivered）、投递尝试次数与最近错误。去重键由 slug 与该轮终态边沿唯一确定（D5）。
+- **任务 agent 的确认开始**：提交前读取基线序号；使用 `herdr agent prompt --wait --until working --until blocked` 加短超时；`agent_blocked`（提交前已 blocked）报错并提示先 peek。确认超时后以 `agent get` 复核，序号晚于基线的终态视为快速完成、确认成功。实施时核实 `--until working` 能否错过短暂的 working，结论写进 PR。
+- **事件模型**：每条事件包含 项目根、slug、终态、产生时间、去重键、投递状态（pending / delivered）、投递尝试次数与最近错误。去重键由 slug 与本轮基线唯一确定（D5），不依赖是否观察到 working 边沿。
 - **合并投递格式**：首行 `herdr-fleet 自动通知（非用户消息）：N 个任务状态变化`，随后每个任务一行 `slug agent状态 phase PR`，末行要求逐个 `fleet status <slug>` 核查。单条 prompt 不超过 herdr 的 prompt 长度限制，超出时截断任务行并注明剩余数量。
 - **插件**：与 herdr-pair 插件互相独立，可同时启用；钩子不导入 fleet、不直接写状态，只调用 fleet 命令。
 - **SKILL.md / workflow.md**：更新「开任务」「看情况」「收尾」三节与命令全集；新增"收到自动通知后的处理"；汇报模板加证据边界。CONTEXT.md 的 fleet task 条目补充 coordinator pane、收件箱、回报块三个术语。
@@ -131,7 +132,7 @@
   - `agent prompt` 返回可配置的 prompted / blocked / 失败，并记录目标 pane 与文本；
   - `agent read` 可返回含回报块的输出；
   - `plugin list` 返回可配置的已安装/启用状态。
-  覆盖：回报块摘取与缺失；new/send 的开始确认与失败；wait 的提交序号判定、多任务、`--any`、各返回码；event 的 working→终态通知、无 working 不通知、重复事件只投一次、主 agent 忙时延后与空闲时合并投递、pane 不存在时通知并保留、并发两次 event 不丢不重；inbox 与 `--all`/`--json`；bind；done 清理；旧任务无 `coordinator_pane` 不通知；doctor 各项。
+  覆盖：回报块摘取与缺失；new/send 的开始确认与失败；快速完成（确认期间已 working → idle 且看不到 working）不误报超时、wait 立即返回；wait 的提交序号判定、多任务、`--any`、各返回码；event 的提交后终态通知、提交前旧终态不通知、working 事件缺失或乱序时仍只通知一次、重复事件只投一次、主 agent 忙时延后与空闲时合并投递、pane 不存在时通知并保留、并发两次 event 不丢不重；inbox 与 `--all`/`--json`；bind；done 清理；旧任务无 `coordinator_pane` 不通知；doctor 各项。
 - **接缝 B：插件钩子子进程。** 以 `HERDR_PLUGIN_EVENT`/`HERDR_PLUGIN_EVENT_JSON` 环境变量运行钩子，断言包装载荷与扁平载荷都转成正确的 fleet `event` 调用，不认识的 pane 不调用 fleet，fleet 失败时显示一次通知。另加清单结构断言（事件订阅、id）。先例：herdr-pair 插件钩子与清单的测试。
 - **接缝 C：真机验收（一次性，人工）。** 在用户的 herdr 上 link 并启用插件，主 agent 用 pi 开一个只做小事的任务后结束本轮，确认被自动通知唤醒；再验证主 agent 忙时延后、任务 blocked、两个任务接连完成合并为一条。结论写入 skill 的 README 验证清单。先例：herdr-pair 插件⑧（#15）。
 - 不在测试中 link 本机真实的插件注册表。
