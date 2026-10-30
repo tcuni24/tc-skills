@@ -74,7 +74,17 @@ def load_config(root):
     dirs = [r['dir'] for r in repos.values()]
     if not repos or len(set(dirs)) != len(dirs):
         raise RuntimeError(f'{CONFIG} 须至少配置一个 [repos.<key>]，且各 dir 不重复')
-    return repos, {'agent': raw.get('agent', 'pi'), 'root_base': raw.get('root_base')}
+    agents = raw.get('agents', {})
+    if not isinstance(agents, dict):
+        raise RuntimeError(f'{CONFIG} 中 agents 须为表')
+    for kind, item in agents.items():
+        try:
+            valid_agent(kind)
+        except RuntimeError as e:
+            raise RuntimeError(f'{CONFIG} 中 agents.{kind} 的 agent 种类无效') from e
+        if not isinstance(item, dict) or not isinstance(item.get('args', []), list) or not all(isinstance(arg, str) for arg in item.get('args', [])):
+            raise RuntimeError(f'{CONFIG} 中 agents.{kind}.args 须为字符串列表')
+    return repos, {'agent': raw.get('agent', 'pi'), 'agents': agents, 'root_base': raw.get('root_base')}
 
 
 def valid_slug(slug):
@@ -222,6 +232,14 @@ def link_shared(key, path):
     return None
 
 
+def agent_options(a, data=None):
+    saved = (data or {}).get('agent', {})
+    kind = valid_agent(a.agent or saved.get('kind') or SETTINGS['agent'])
+    args = a.agent_arg if a.agent_arg is not None else (
+        saved.get('args', []) if saved and kind == saved.get('kind') else SETTINGS['agents'].get(kind, {}).get('args', []))
+    return {'kind': kind, 'args': [] if kind == 'none' else args}
+
+
 def create_tab(data, agent, focus=False, explicit=None, prompt=None):
     if not explicit and not os.environ.get('HERDR_ENV'):
         print('未在 herdr 中且未指定 workspace，跳过 tab', file=sys.stderr)
@@ -232,10 +250,11 @@ def create_tab(data, agent, focus=False, explicit=None, prompt=None):
     tid = tab['tab']['tab_id']
     try:
         pane = tab['root_pane']['pane_id']
-        if agent != 'none':
-            herdr('agent', 'start', data['slug'], '--kind', agent, '--pane', pane, '--timeout', '60000')
+        if agent['kind'] != 'none':
+            herdr('agent', 'start', data['slug'], '--kind', agent['kind'], '--pane', pane, '--timeout', '60000',
+                  *(['--', *agent['args']] if agent['args'] else []))
         herdr('pane', 'split', pane, '--direction', 'right', '--cwd', dest, '--no-focus')
-        if prompt and agent != 'none':
+        if prompt and agent['kind'] != 'none':
             context = [f'任务目录：{dest}']
             for key, details in data['repos'].items():
                 cfg = REPOS[key]
@@ -248,6 +267,7 @@ def create_tab(data, agent, focus=False, explicit=None, prompt=None):
     except Exception:
         herdr('tab', 'close', tid)
         raise
+    return True
 
 
 def parse_bases(items):
@@ -262,7 +282,7 @@ def parse_bases(items):
 
 def new(a):
     slug = valid_slug(a.slug)
-    agent = valid_agent(a.agent or SETTINGS['agent'])
+    agent = agent_options(a)
     if not re.fullmatch(r'[a-z][a-z0-9-]*', a.type):
         raise RuntimeError('分支类型无效')
     keys = a.repos.split(',') if a.repos else list(REPOS)
@@ -272,7 +292,7 @@ def new(a):
     dest = task_dir(slug)
     if dest.exists():
         raise RuntimeError('任务目录已存在，请使用 fleet open')
-    data = {'slug': slug, 'created': datetime.datetime.now(datetime.timezone.utc).isoformat(), 'repos': {}}
+    data = {'slug': slug, 'created': datetime.datetime.now(datetime.timezone.utc).isoformat(), 'repos': {}, 'agent': agent}
     made = []
     dest.mkdir(parents=True)
     if (ROOT / '.git').exists() and subprocess.run(['git', '-C', str(ROOT), 'check-ignore', '-q', str(dest)]).returncode:
@@ -318,6 +338,40 @@ def repo_info(repo, path, branch, base, original_base=None):
     return {'branch': branch, 'dirty': dirty, 'ahead': int(counts[0]), 'behind': int(counts[1]), 'merge': merge_status(repo, branch, base, original_base)}
 
 
+def task_phase(agent_status, repos):
+    if agent_status == '-': return 'no-tab'
+    if agent_status in ('working', 'blocked', 'unknown'): return agent_status
+    if agent_status not in ('idle', 'done') or not repos: return 'unknown'
+    values = list(repos.values())
+    if all(r['merge'] in ('merged', 'squash-merged') for r in values): return 'merged'
+    if any(r['dirty'] > 0 for r in values): return 'uncommitted'
+    if any(r['ahead'] > 0 and r['merge'] == 'unmerged' for r in values): return 'review'
+    if all(r['merge'] == 'no-commits' for r in values): return 'idle-empty'
+    return 'unknown'
+
+
+def agent_kind(data, agent):
+    # The live pane's kind is the truth; TASK.md's record (absent on tasks that predate it) is the fallback.
+    return (agent or {}).get('agent') or data.get('agent', {}).get('kind') or '?'
+
+
+def task_row(data, tabs, agents, do_fetch=False):
+    tab = find_tab(data['slug'], tabs)
+    agent = next((x for x in agents if tab and x.get('tab_id') == tab['tab_id']), None)
+    repos, errors = {}, []
+    for key, info in data['repos'].items():
+        try:
+            if do_fetch: fetch(REPOS[key]['path'], info['base'])
+            repos[key] = repo_info(REPOS[key]['path'], task_dir(data['slug']) / REPOS[key]['dir'], info['branch'], info['base'], info['base_commit'])
+        except (RuntimeError, OSError, ValueError, KeyError) as e:
+            errors.append(f'{key}: {e}')
+    state = agent.get('agent_status', '-') if agent else '-'
+    row = {'slug': data['slug'], 'tab': tab['tab_id'] if tab else '-', 'agent': state, 'repos': repos,
+           'agent_kind': agent_kind(data, agent), 'phase': 'error' if errors else task_phase(state, repos)}
+    if errors: row['error'] = '; '.join(errors)
+    return row
+
+
 def display(rows, as_json):
     if as_json:
         print(json.dumps(rows, ensure_ascii=False, indent=2))
@@ -334,15 +388,18 @@ def ls(a):
     tabs, agents = herdr_state()
     rows = []
     for data in tasks():
-        tab = find_tab(data['slug'], tabs)
-        agent = next((x for x in agents if tab and x.get('tab_id') == tab['tab_id']), None)
-        repos = {}
-        for key, info in data['repos'].items():
-            if a.fetch:
-                fetch(REPOS[key]['path'], info['base'])
-            repos[key] = repo_info(REPOS[key]['path'], task_dir(data['slug']) / REPOS[key]['dir'], info['branch'], info['base'], info['base_commit'])
-        rows.append({'slug': data['slug'], 'tab': tab['tab_id'] if tab else '-', 'agent': agent.get('agent_status', '-') if agent else '-', 'repos': repos})
-    display(rows, a.json)
+        try:
+            rows.append(task_row(data, tabs, agents, a.fetch))
+        except (RuntimeError, OSError, ValueError, KeyError) as e:
+            tab = find_tab(data['slug'], tabs)
+            agent = next((x for x in agents if tab and x.get('tab_id') == tab['tab_id']), None)
+            rows.append({'slug': data['slug'], 'tab': tab['tab_id'] if tab else '-', 'agent': agent.get('agent_status', '-') if agent else '-',
+                         'repos': {}, 'agent_kind': agent_kind(data, agent), 'phase': 'error', 'error': str(e)})
+    if a.json:
+        display(rows, True)
+    else:
+        display([{'slug': r['slug'], 'tab': r['tab'], 'agent': f"{r['agent_kind']} {r['agent']}", 'phase': r['phase'],
+                  'repos': r.get('error') or '; '.join(f"{k} +{v['ahead']}/-{v['behind']} dirty{v['dirty']} {v['merge']}" for k, v in r['repos'].items())} for r in rows], False)
 
 
 def task_agent(slug):
@@ -356,45 +413,156 @@ def task_agent(slug):
     return agent['pane_id']
 
 
+def pr_info(repo, branch):
+    try:
+        p = subprocess.run([os.environ.get('FLEET_GH', 'gh'), 'pr', 'list', '--head', branch, '--state', 'all', '--json', 'number,url,state', '--limit', '1'], cwd=repo, capture_output=True, text=True, timeout=10)
+        result = json.loads(p.stdout) if p.returncode == 0 else []
+        return result[0] if isinstance(result, list) and result else None
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+
+def status(a):
+    if a.lines < 0: raise RuntimeError('--lines 不能为负数')
+    data = load(a.slug)
+    tabs, agents = herdr_state()
+    row = task_row(data, tabs, agents)
+    suggestions = {'working': '等待或使用 fleet wait', 'blocked': '使用 fleet peek 查看问题并交用户决策',
+                   'uncommitted': '用 fleet send 让 agent 提交', 'review': '核查 diff，让 agent 推送并提 PR',
+                   'idle-empty': '使用 fleet peek 确认是否卡住', 'merged': f'先执行 fleet done {a.slug} --dry-run，再执行 fleet done {a.slug}',
+                   'no-tab': f'使用 fleet open {a.slug}', 'unknown': '使用 fleet peek 检查状态', 'error': '检查仓库错误'}
+    row['next_step'] = suggestions[row['phase']]
+    for key, info in data['repos'].items():
+        if key not in row['repos']: continue
+        repo, path = REPOS[key]['path'], task_dir(a.slug) / REPOS[key]['dir']
+        try:
+            changes = git(path, 'status', '--porcelain').splitlines()
+            commits = git(repo, 'log', '--oneline', f"{info['base']}..{info['branch']}", '-10').splitlines()
+            stat = git(repo, 'diff', '--stat', f"{info['base']}...{info['branch']}").splitlines()
+            row['repos'][key].update(base=info['base'], files=changes[:20], files_omitted=max(0, len(changes)-20),
+                                     commits=commits, diff_stat=stat[:20], diff_stat_omitted=max(0, len(stat)-20), pr=pr_info(repo, info['branch']))
+        except (RuntimeError, OSError, ValueError, KeyError) as e:
+            row['phase'], row['next_step'] = 'error', suggestions['error']
+            row['error'] = '; '.join(filter(None, (row.get('error'), f'{key}: {e}')))
+            del row['repos'][key]
+    tab = find_tab(a.slug, tabs)
+    agent = next((x for x in agents if tab and x.get('tab_id') == tab['tab_id']), None)
+    row['agent_output'] = herdr('agent', 'read', agent['pane_id'], '--source', 'recent-unwrapped', '--lines', a.lines, json_output=False) if agent and a.lines else ''
+    if a.json:
+        print(json.dumps(row, ensure_ascii=False, indent=2)); return
+    print(f"{row['slug']}  tab: {row['tab']}  agent: {row['agent_kind']} {row['agent']}  phase: {row['phase']}\n下一步：{row['next_step']}")
+    if row.get('error'): print(f"仓库错误：{row['error']}")
+    for key, info in row['repos'].items():
+        print(f"\n{key}: branch {info['branch']}  base {info['base']}  +{info['ahead']}/-{info['behind']}  {info['merge']}")
+        print('未提交文件：\n' + ('\n'.join(info['files']) or '无'))
+        if info['files_omitted']: print(f"另有 {info['files_omitted']} 行")
+        print('提交：\n' + ('\n'.join(info['commits']) or '无'))
+        print('diff stat：\n' + ('\n'.join(info['diff_stat']) or '无'))
+        if info['diff_stat_omitted']: print(f"另有 {info['diff_stat_omitted']} 行")
+        print('PR: ' + (f"#{info['pr']['number']} {info['pr']['state']} {info['pr']['url']}" if info['pr'] else '未知'))
+    if row['agent_output']: print('\nagent 最近输出：\n' + row['agent_output'])
+
+
+def wait(a):
+    if a.timeout is not None and a.timeout < 0: raise RuntimeError('--timeout 不能为负数')
+    pane = task_agent(a.slug)
+    args = [HERDR, 'agent', 'wait', pane] + (['--timeout', str(int(a.timeout * 1000))] if a.timeout is not None else [])
+    try:
+        p = subprocess.run(args, capture_output=True, text=True, timeout=a.timeout + 2 if a.timeout is not None else None)
+    except subprocess.TimeoutExpired:
+        print('错误：等待超时', file=sys.stderr); return 4
+    if p.returncode:
+        error = (p.stderr + ' ' + p.stdout).strip()
+        codes = []
+        for output in (p.stdout, p.stderr):
+            try:
+                parsed = json.loads(output)
+                if isinstance(parsed, dict) and isinstance(parsed.get('error'), dict):
+                    codes.append(parsed['error'].get('code'))
+            except ValueError:
+                pass
+        timed_out = 'timeout' in codes if codes else bool(re.search(r'\btimed\s+out\b|超时', error, re.I))
+        if timed_out:
+            print(f'错误：等待超时：{error}', file=sys.stderr); return 4
+        raise RuntimeError(f'agent wait 失败：{error}')
+    data = load(a.slug)
+    tabs, agents = herdr_state()
+    agent = next((x for x in agents if x.get('pane_id') == pane), None)
+    state = agent.get('agent_status', '-') if agent else '-'
+    if state not in ('idle', 'done', 'blocked'): raise RuntimeError(f'等待后 agent 状态无效：{state}')
+    try:
+        row = task_row(data, tabs, agents)
+        phase = row['phase']
+        if row.get('error'): print(f"仓库错误：{row['error']}", file=sys.stderr)
+    except (RuntimeError, OSError, ValueError, KeyError) as e:
+        phase = 'error'
+        print(f'仓库错误：{e}', file=sys.stderr)
+    print(f'{a.slug} {phase} {state}')
+    return 3 if state == 'blocked' else 0
+
+
+def done_checks(a, data, dest):
+    checks = []
+    expected = {'TASK.md', *(REPOS[key]['dir'] for key in data['repos'])}
+    actual = {item.name for item in dest.iterdir()}
+    if actual != expected:
+        extra = sorted(actual - expected)
+        raise RuntimeError('任务目录含有额外文件或缺少仓库，拒绝清理' + (f'：{", ".join(extra[:10])}' + (f' 等 {len(extra)} 个' if len(extra) > 10 else '') if extra else ''))
+    for key, info in data['repos'].items():
+        repo = REPOS[key]['path']
+        path = dest / REPOS[key]['dir']
+        try:
+            entry = next((w for w in worktrees(repo) if Path(w['worktree']) == path), None)
+            if entry and 'locked' in entry:
+                raise RuntimeError(f"{key} worktree 已锁定，拒绝清理" + (f"：{entry['locked']}" if entry['locked'] else ''))
+            if not a.no_fetch: fetch(repo, info['base'])
+            if git(path, 'branch', '--show-current') != info['branch']:
+                raise RuntimeError(f'{key} 当前分支与任务记录不符，拒绝清理')
+            status = repo_info(repo, path, info['branch'], info['base'], info['base_commit'])
+            reasons = []
+            if status['dirty'] and not a.discard: reasons.append(f'{key} 有未提交文件，需要 --discard')
+            if status['merge'] == 'unmerged' and not a.force:
+                unpushed = git(repo, 'rev-list', '--count', info['branch'], '--not', '--remotes=origin')
+                reasons.append(f'{key} 未合并（未推送提交 {unpushed} 个），需要 --force；分支会保留')
+            checks.append((key, repo, path, info['branch'], status['merge'], '; '.join(reasons)))
+        except (RuntimeError, OSError, ValueError) as e:
+            checks.append((key, repo, path, info['branch'], None, str(e)))
+    return checks
+
+
 def done(a):
     data = load(a.slug)
     dest = task_dir(a.slug)
-    checks = []
-    expected = {'TASK.md', *(REPOS[key]['dir'] for key in data['repos'])}
-    if {item.name for item in dest.iterdir()} != expected:
-        raise RuntimeError('任务目录含有额外文件或缺少仓库，拒绝清理')
-    for key, info in data['repos'].items():
-        repo = REPOS[key]['path']
-        if not a.no_fetch:
-            fetch(repo, info['base'])
-        path = dest / REPOS[key]['dir']
-        if git(path, 'branch', '--show-current') != info['branch']:
-            raise RuntimeError(f'{key} 当前分支与任务记录不符，拒绝清理')
-        status = repo_info(repo, path, info['branch'], info['base'], info['base_commit'])
-        if status['dirty'] and not a.discard:
-            raise RuntimeError(f'{key} 有未提交文件，需要 --discard')
-        # Once merged (squash included, even with the remote source branch deleted) the content is in base.
-        if status['merge'] == 'unmerged' and not a.force:
-            unpushed = git(repo, 'rev-list', '--count', info['branch'], '--not', '--remotes=origin')
-            raise RuntimeError(f'{key} 未合并（未推送提交 {unpushed} 个），需要 --force；分支会保留')
-        checks.append((key, repo, path, info['branch'], status['merge']))
+    checks = done_checks(a, data, dest)
+    if a.dry_run:
+        for key, repo, path, branch, state, reason in checks:
+            print(f"{key}: " + (f'被拒绝：{reason}' if reason else f'将删除 worktree {path}；' + (f'将保留分支 {branch}' if state == 'unmerged' else f'将删除分支 {branch}')))
+        if any(c[-1] for c in checks): return 1
+        print('将删除 TASK.md 和任务目录，并关闭存在的 tab')
+        return 0
+    errors = [c[-1] for c in checks if c[-1]]
+    if errors: raise RuntimeError('; '.join(errors))
     tabs, _ = herdr_state()
     tab = find_tab(a.slug, tabs)
-    for key, repo, path, branch, status in checks:
+    for key, repo, path, branch, status, _ in checks:
         for name in REPOS[key]['shared']:
             if (path / name).is_symlink():
                 (path / name).unlink()
         git(repo, 'worktree', 'remove', *(['--force'] if a.discard else []), path)
+        print(f'已删除 worktree {path}')
         if status == 'unmerged':
             print(f'保留未合并分支 {branch}')
         else:
             git(repo, 'branch', '-D', branch)
+            print(f'已删除分支 {branch}')
         git(repo, 'worktree', 'prune')
     (dest / 'TASK.md').unlink()
     dest.rmdir()
     print('完成', flush=True)
     if tab:
         herdr('tab', 'close', tab['tab_id'])
+        print(f"已关闭 tab {tab['tab_id']}")
+    return 0
 
 
 def gc(a):
@@ -451,12 +619,16 @@ def main():
     n.add_argument('--base', action='append', metavar='KEY=REF', help='覆盖某个仓库的 base，可重复')
     n.add_argument('--no-fetch', action='store_true')
     n.add_argument('--agent', help='herdr agent 种类，none 表示不启动；默认取配置的 agent')
+    n.add_argument('--agent-arg', action='append', metavar='ARG', help='agent 启动参数，可重复；以 - 开头的值须写成 --agent-arg=--flag')
     n.add_argument('--prompt'); n.add_argument('--focus', action='store_true'); n.add_argument('--workspace')
     l = sub.add_parser('ls'); l.add_argument('--json', action='store_true'); l.add_argument('--fetch', action='store_true')
+    st = sub.add_parser('status'); st.add_argument('slug'); st.add_argument('--lines', type=int, default=12); st.add_argument('--json', action='store_true')
+    w = sub.add_parser('wait'); w.add_argument('slug'); w.add_argument('--timeout', type=float, metavar='SEC')
     pk = sub.add_parser('peek'); pk.add_argument('slug'); pk.add_argument('--lines', type=int, default=60)
     s = sub.add_parser('send'); s.add_argument('slug'); s.add_argument('text')
     o = sub.add_parser('open'); o.add_argument('slug'); o.add_argument('--agent')
-    d = sub.add_parser('done'); d.add_argument('slug'); d.add_argument('--force', action='store_true'); d.add_argument('--discard', action='store_true'); d.add_argument('--no-fetch', action='store_true')
+    o.add_argument('--agent-arg', action='append', metavar='ARG', help='agent 启动参数，可重复；以 - 开头的值须写成 --agent-arg=--flag')
+    d = sub.add_parser('done'); d.add_argument('slug'); d.add_argument('--force', action='store_true'); d.add_argument('--discard', action='store_true'); d.add_argument('--no-fetch', action='store_true'); d.add_argument('--dry-run', action='store_true')
     g = sub.add_parser('gc'); g.add_argument('--apply', action='store_true'); g.add_argument('--json', action='store_true')
     a = p.parse_args()
     try:
@@ -464,7 +636,9 @@ def main():
         REPOS, SETTINGS = load_config(ROOT)
         if a.command == 'new': new(a)
         elif a.command == 'ls': ls(a)
-        elif a.command == 'done': done(a)
+        elif a.command == 'status': status(a)
+        elif a.command == 'wait': return wait(a)
+        elif a.command == 'done': return done(a)
         elif a.command == 'gc': gc(a)
         elif a.command == 'peek': print(herdr('agent', 'read', task_agent(a.slug), '--source', 'recent-unwrapped', '--lines', a.lines, json_output=False))
         elif a.command == 'send': herdr('agent', 'prompt', task_agent(a.slug), a.text)
@@ -472,7 +646,15 @@ def main():
             data = load(a.slug)
             tab = find_tab(a.slug, herdr_state()[0])
             if tab: herdr('tab', 'focus', tab['tab_id'])
-            else: create_tab(data, valid_agent(a.agent or SETTINGS['agent']), focus=True)
+            else:
+                agent = agent_options(a, data)
+                if create_tab(data, agent, focus=True):
+                    data['agent'] = agent
+                    path = task_dir(a.slug) / 'TASK.md'
+                    text = path.read_text()
+                    before, rest = text.split('```json\n', 1)
+                    _, after = rest.split('\n```', 1)
+                    path.write_text(before + '```json\n' + json.dumps(data, ensure_ascii=False, indent=2) + '\n```' + after)
     except (RuntimeError, OSError, ValueError, KeyError) as e:
         print(f'错误：{e}', file=sys.stderr)
         return 1
