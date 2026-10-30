@@ -71,6 +71,12 @@ fleet gc [--apply]                       # 报告所有仓库的全部 worktree�
 
 开始确认只阻塞同一任务的事件处理，不持有跨任务的状态锁。herdr 状态钩子不带序号：处理 `working` 时若实时状态已是终态，则以实时序号推断快速结束的手动轮次；已有通知时实时序号必须晚于上次终态。单独的 `done` → `idle` 后续边沿不会再次通知。但若上一轮迟到的 `working` 恰好在同轮 `done` → `idle` 后才处理，它与快速完成的新轮次无法区分，可能额外通知一次；此取舍避免静默漏掉新轮次。
 
+手动新轮次的 `working` 钩子尚未处理时，若 agent 已退出且 `exited` 先到，而上一轮已通知或没有轮次记录，则该轮不会通知。钩子载荷没有序号，无法把它与同一轮 `done` 后退出区分，不能简单地对每次退出都发通知。
+
+投递先构造消息，再查询主 agent 状态并发送，但查询和 `agent prompt` 之间仍有窗口；herdr 没有「仅空闲时接受」的原子条件。herdr 在提交时 agent 已为 `blocked` 会以 `agent_blocked` 拒绝，处于 `working` 时 prompt 是排队还是打断尚未真机验证。
+
+仅在真机 herdr 0.9.1 上实测，`state_change_seq` 跨 pane 全局递增（多个 pane 间从 9185 到 9238），新 pane 不复用旧序号；因此该版本中 `open` 重建后保留旧 `submit_seq`/`event_round` 不会因序号复用而误去重。
+
 `new` 要求任务 agent 在最终回复中输出回报块：
 
 ```text

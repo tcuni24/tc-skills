@@ -236,8 +236,10 @@ def fleet_state(write=False):
                 os.replace(temp, directory / name)
 
 
-def prune_coordinators(panes):
-    active = {d.get('coordinator_pane') for d in tasks()}
+def prune_coordinators(panes, inbox):
+    active = ({d.get('coordinator_pane') for d in tasks()}
+              | {event.get('coordinator_pane') for event in inbox
+                 if event.get('root') == str(ROOT) and event.get('delivery') == 'pending'})
     for pane, entry in list(panes.items()):
         if entry.get('root') == str(ROOT) and entry.get('role') == 'coordinator' and pane not in active:
             del panes[pane]
@@ -257,7 +259,7 @@ def register_task(data, pane):
         panes[pane] = {'root': str(ROOT), 'slug': data['slug'], 'role': 'task'}
         if panes.get(coordinator, {}).get('root') != str(ROOT) or panes[coordinator].get('role') != 'coordinator':
             panes[coordinator] = {'root': str(ROOT), 'role': 'coordinator'}
-        prune_coordinators(panes)
+        prune_coordinators(panes, inbox)
 
 
 def bind():
@@ -304,7 +306,7 @@ def bind_locked(coordinator, tabs, agents, panes, inbox):
     if current:
         if panes.get(coordinator, {}).get('root') != str(ROOT) or panes[coordinator].get('role') != 'coordinator':
             panes[coordinator] = {'root': str(ROOT), 'role': 'coordinator'}
-    prune_coordinators(panes)
+    prune_coordinators(panes, inbox)
 
 
 def inbox_list(a):
@@ -974,7 +976,7 @@ def done(a):
             if entry == {'root': str(ROOT), 'slug': a.slug, 'role': 'task'}:
                 del panes[pane]
         inbox[:] = [event for event in inbox if not (event.get('root') == str(ROOT) and event.get('slug') == a.slug)]
-        prune_coordinators(panes)
+        prune_coordinators(panes, inbox)
     print('完成', flush=True)
     if tab:
         herdr('tab', 'close', tab['tab_id'])

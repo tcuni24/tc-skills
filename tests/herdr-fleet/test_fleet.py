@@ -227,6 +227,25 @@ def test_inbox_bind_and_cleanup(setup):
     assert not json.loads((path.parent / 'panes.json').read_text())
 
 
+def test_open_retains_old_coordinator_for_pending_delivery(setup):
+    root, fleet, log = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='old')
+    fleet('event', '--pane', 'p', '--status', 'idle', GET_SEQ='12')
+    assert len(json.loads(fleet('inbox', '--json').stdout)) == 1
+    fleet('open', 'hello', HERDR_PANE_ID='new')
+    assert task_data(root, 'hello')['coordinator_pane'] == 'new'
+    index_path = log.parent / 'state/herdr-fleet/panes.json'
+    assert json.loads(index_path.read_text())['old']['role'] == 'coordinator'
+    log.write_text('')
+    fleet('event', '--pane', 'old', '--status', 'idle', COORD_STATUS='idle')
+    fleet('event', '--pane', 'old', '--status', 'idle', COORD_STATUS='idle')
+    prompts = [c for line in log.read_text().splitlines() if (c := json.loads(line))[:2] == ['agent', 'prompt']]
+    assert len(prompts) == 1 and prompts[0][2] == 'old'
+    assert json.loads(fleet('inbox', '--json').stdout) == []
+    fleet('open', 'hello', HERDR_PANE_ID='new')
+    assert 'old' not in json.loads(index_path.read_text())
+
+
 def test_concurrent_done_preserves_unrelated_inbox_records(setup):
     root, fleet, log = setup
     for slug in ('hello', 'other'):
