@@ -27,8 +27,10 @@ description: 在 Herdr 里担任并行开发的主 agent（coordinator）：把�
 ## 2. 开任务
 
 ```sh
-fleet new <slug> [-r <键>[,<键>]] [--fix] [--base <键>=<ref>] --prompt '<自包含的任务说明>'
+fleet new <slug> [-r <键>[,<键>]] [--fix] [--base <键>=<ref>] [--agent <种类>] [--agent-arg=<参数>] --prompt '<自包含的任务说明>'
 ```
+
+`--agent` 选择 agent 种类（`none` 不启动），`--agent-arg` 可重复并按顺序传给 agent；以 `-` 开头的值须写成 `--agent-arg=--flag`。参数会明文写入 `TASK.md`，不要放密钥。
 
 `--prompt` 必须写成自包含的任务说明，任务 agent 看不到主 agent 的上下文：
 
@@ -43,7 +45,9 @@ fleet new <slug> [-r <键>[,<键>]] [--fix] [--base <键>=<ref>] --prompt '<自�
 
 ## 3. 看情况
 
-- `fleet ls`：查看各任务的 agent 状态（idle/working/blocked/done）、未提交文件数、ahead/behind、合并状态。
+- `fleet ls`：查看各任务的 tab、agent 状态、phase 和仓库汇总。
+- `fleet status <slug>`：查看下一步建议、提交、diff 统计、未提交文件、PR 和 agent 最近输出。仓库异常时显示 `phase=error` 和原因，并尽力显示其他仓库；`--lines` 不接受负数。
+- `fleet wait <slug> [--timeout SEC]`：等待 agent idle/done/blocked，返回码分别为 0/0/3；超时为 4，其他错误为 1。终态观察成功后仓库信息出错不改变返回码。若已经 idle 会立即返回；`fleet new` 后先用 `fleet status` 确认进入 working 再 wait。
 - `fleet peek <slug> [--lines N]`：查看任务 agent 的最近输出。
 - agent 状态为 `blocked`（等待确认或提问）时，先 peek 弄清它在问什么。属于用户的决策就转给用户，主 agent 不代为做决定。
 - `fleet send <slug> '<补充说明>'`：转达用户的补充或修正。用户中途追加的、与现有任务无关的需求，应该另开一个任务，不要塞进正在进行的任务。
@@ -53,9 +57,12 @@ fleet new <slug> [-r <键>[,<键>]] [--fix] [--base <键>=<ref>] --prompt '<自�
 
 ## 4. 收尾
 
-- 用户确认 PR 已合并或任务已放弃之后，执行 `fleet done <slug>`。它会删除 worktree、删除已合并的分支、关闭 tab。
+- agent 完成后（wait 返回，或 ls 显示 review/uncommitted），用 `fleet status <slug>` 只读核查提交与 diff；必要时用 `fleet send` 让任务 agent 提交、推送并提 PR。主 agent 不替任务 agent 改代码。
+- 用户确认合并，`fleet ls` 显示 merged 后，先执行 `fleet done <slug> --dry-run` 查看计划，再执行 `fleet done <slug>` 删除 worktree、已合并分支并关闭 tab。
+- 用户确认放弃任务时，同样先预览；`--force` 和 `--discard` 仍遵循以下规则。
 - `done` 拒绝时，不要随手加参数：
   - 报 dirty：先 peek 或询问任务 agent 这些改动是什么，确认可以丢弃后才加 `--discard`。
   - 报 unmerged：确认是放弃这个任务后才加 `--force`，分支会保留。
+  - 报 locked：不会自动解锁，先确认锁定原因，再由用户决定是否解锁。
 - 定期执行 `fleet gc` 查看遗留的 worktree，只出报告。`fleet gc --apply` 要在用户确认报告之后才能执行。
 - tab 被误关或 herdr 重启后，用 `fleet open <slug>` 重建 tab 和 agent，worktree 不受影响。

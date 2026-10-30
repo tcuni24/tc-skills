@@ -29,8 +29,16 @@ args = sys.argv[1:]
 with open(os.environ['LOG'], 'a') as f: f.write(json.dumps(args) + '\\n')
 if os.environ.get('FAIL') and args[:2] == os.environ['FAIL'].split(): sys.exit(1)
 if args[:2] == ['workspace', 'list']: result = {'workspaces': [{'workspace_id': 'w', 'focused': True}]}
-elif args[:2] == ['tab', 'list']: result = {'tabs': [{'tab_id': 't', 'label': 'hello', 'workspace_id': 'w'}]}
-elif args[:2] == ['agent', 'list']: result = {'agents': [{'agent': 'pi', 'pane_id': 'p', 'tab_id': 't', 'agent_status': 'idle'}]}
+elif args[:2] == ['tab', 'list']: result = {'tabs': [] if os.environ.get('NOTAB') else [{'tab_id': 't', 'label': 'hello', 'workspace_id': 'w'}]}
+elif args[:2] == ['agent', 'list']: result = {'agents': [] if os.environ.get('NOAGENT') else [{'agent': 'pi', 'pane_id': 'p', 'tab_id': 't', 'agent_status': os.environ.get('AGENT_STATUS', 'idle')}]}
+elif args[:2] == ['agent', 'wait']:
+    if os.environ.get('WAIT_STDOUT'):
+        print(os.environ['WAIT_STDOUT']); sys.exit(1)
+    if os.environ.get('WAIT_FAIL'):
+        print(os.environ['WAIT_FAIL'], file=sys.stderr); sys.exit(1)
+    result = {}  # The real wait response schema is not specified by --help.
+elif args[:2] == ['agent', 'read']:
+    print('agent output tail'); sys.exit(0)
 elif args[:2] == ['tab', 'create']: result = {'tab': {'tab_id': 't'}, 'root_pane': {'pane_id': 'p'}}
 elif args[:2] == ['pane', 'split']: result = {'pane': {'pane_id': 'q'}}
 else: result = {}
@@ -90,12 +98,114 @@ def test_new_and_rollback(setup):
     assert 'origin/develop' in (dest / 'TASK.md').read_text()
     calls = [json.loads(x) for x in log.read_text().splitlines()]
     assert [c[:2] for c in calls] == [['tab', 'create'], ['agent', 'start'], ['pane', 'split'], ['agent', 'prompt']]
+    assert calls[1] == ['agent', 'start', 'hello', '--kind', 'pi', '--pane', 'p', '--timeout', '60000']
     prompt = calls[-1][-1]
     assert str(dest / 'web') in prompt and 'app-web' in prompt and prompt.endswith('do work')
     p = fleet('new', 'bad', '--no-fetch', check=False, FAIL='pane split')
     assert p.returncode and not (root / 'worktrees/bad').exists()
     assert not git(root / 'app-web', 'branch', '--list', 'feat/bad')
     assert fleet('new', 'Bad!', check=False).returncode
+
+
+def task_data(root, slug):
+    text = (root / 'worktrees' / slug / 'TASK.md').read_text()
+    return json.loads(text.split('```json\n', 1)[1].split('\n```', 1)[0])
+
+
+def starts(log):
+    return [call for line in log.read_text().splitlines() if (call := json.loads(line))[:2] == ['agent', 'start']]
+
+
+def test_agent_args_config_and_reopen(setup):
+    root, fleet, log = setup
+    (root / '.herdr-fleet.toml').write_text(CONFIG + '\n[agents.devin]\nargs = ["--model", "configured"]\n')
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--agent', 'devin')
+    prefix = ['agent', 'start', 'hello', '--kind', 'devin', '--pane', 'p', '--timeout', '60000']
+    assert starts(log)[-1] == prefix + ['--', '--model', 'configured']
+    assert task_data(root, 'hello')['agent'] == {'kind': 'devin', 'args': ['--model', 'configured']}
+    fleet('open', 'hello', NOTAB='1')
+    assert starts(log)[-1] == prefix + ['--', '--model', 'configured']
+    fleet('open', 'hello', '--agent-arg=--foo', '--agent-arg=bar', NOTAB='1')
+    assert starts(log)[-1] == prefix + ['--', '--foo', 'bar']
+    assert task_data(root, 'hello')['agent'] == {'kind': 'devin', 'args': ['--foo', 'bar']}
+    fleet('open', 'hello', NOTAB='1')
+    assert starts(log)[-1] == prefix + ['--', '--foo', 'bar']
+    fleet('open', 'hello', '--agent', 'pi', NOTAB='1')
+    assert starts(log)[-1] == ['agent', 'start', 'hello', '--kind', 'pi', '--pane', 'p', '--timeout', '60000']
+    fleet('new', 'other', '-r', 'web', '--no-fetch', '--agent', 'devin', '--agent-arg=--foo', '--agent-arg=bar')
+    assert starts(log)[-1] == ['agent', 'start', 'other', '--kind', 'devin', '--pane', 'p', '--timeout', '60000', '--', '--foo', 'bar']
+    assert task_data(root, 'other')['agent'] == {'kind': 'devin', 'args': ['--foo', 'bar']}
+
+
+def test_old_task_and_agent_none(setup):
+    root, fleet, log = setup
+    (root / '.herdr-fleet.toml').write_text(CONFIG + '\n[agents.pi]\nargs = ["legacy default"]\n')
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--agent', 'none', '--agent-arg=--ignored')
+    assert not starts(log)
+    assert task_data(root, 'hello')['agent'] == {'kind': 'none', 'args': []}
+    path = root / 'worktrees/hello/TASK.md'
+    text = path.read_text()
+    data = task_data(root, 'hello')
+    del data['agent']
+    before, rest = text.split('```json\n', 1)
+    _, after = rest.split('\n```', 1)
+    path.write_text(before + '```json\n' + json.dumps(data) + '\n```' + after)
+    assert json.loads(fleet('status', 'hello', '--json').stdout)['agent_kind'] == 'pi'
+    fleet('open', 'hello', NOTAB='1')
+    assert starts(log)[-1] == ['agent', 'start', 'hello', '--kind', 'pi', '--pane', 'p', '--timeout', '60000', '--', 'legacy default']
+    count = len(starts(log))
+    fleet('open', 'hello', '--agent', 'none', NOTAB='1')
+    assert len(starts(log)) == count
+
+
+def test_ls_agent_kind_falls_back_to_herdr_for_old_tasks(setup):
+    root, fleet, log = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--agent', 'none')
+    assert json.loads(fleet('ls', '--json').stdout)[0]['agent_kind'] == 'pi'  # fake herdr's live agent; TASK.md says none
+    path = root / 'worktrees/hello/TASK.md'
+    text = path.read_text()
+    data = task_data(root, 'hello')
+    del data['agent']
+    before, rest = text.split('```json\n', 1)
+    _, after = rest.split('\n```', 1)
+    path.write_text(before + '```json\n' + json.dumps(data) + '\n```' + after)
+    assert json.loads(fleet('ls', '--json').stdout)[0]['agent_kind'] == 'pi'
+    assert fleet('ls', NOTAB='1').stdout.split('\n')[1].split()[2] == '?'  # no record and no live agent
+
+
+def test_open_preserves_task_on_failure_and_requirement_on_success(setup):
+    root, fleet, _ = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', '中文需求', '--agent-arg=原参数')
+    path = root / 'worktrees/hello/TASK.md'
+    before = path.read_text()
+    assert fleet('open', 'hello', '--agent-arg=新参数', NOTAB='1', FAIL='pane split', check=False).returncode == 1
+    assert path.read_text() == before
+    fleet('open', 'hello', '--agent-arg=新参数', NOTAB='1')
+    assert '中文需求' in path.read_text()
+    assert task_data(root, 'hello')['agent'] == {'kind': 'pi', 'args': ['新参数']}
+
+
+@pytest.mark.parametrize('config, error', [
+    ('[agents.devin]\nargs = "bad"\n', 'agents.devin.args'),
+    ('[agents.devin]\nargs = ["ok", 1]\n', 'agents.devin.args'),
+    ('[agents.Bad]\nargs = []\n', 'agents.Bad'),
+    ('agents = []\n', 'agents'),
+])
+def test_invalid_agent_config(setup, config, error):
+    root, fleet, _ = setup
+    (root / '.herdr-fleet.toml').write_text(config + '\n' + CONFIG)
+    result = fleet('ls', check=False)
+    assert result.returncode != 0 and error in result.stderr and '错误' in result.stderr
+
+
+def test_agent_start_failure_rolls_back(setup):
+    root, fleet, log = setup
+    result = fleet('new', 'bad', '--no-fetch', '--agent-arg=--foo', check=False, FAIL='agent start')
+    assert result.returncode != 0 and not (root / 'worktrees/bad').exists()
+    for repo in ('app-web', 'app-api'):
+        assert not git(root / repo, 'branch', '--list', 'feat/bad')
+        assert 'worktrees/bad' not in git(root / repo, 'worktree', 'list', '--porcelain')
+    assert json.loads(log.read_text().splitlines()[-1]) == ['tab', 'close', 't']
 
 
 def test_done_preflight_and_force(setup):
@@ -226,3 +336,167 @@ def test_skill_layout():
         assert f'fleet {command}' in text
     meta = (SKILL / 'agents/openai.yaml').read_text(encoding='utf-8')
     assert '$herdr-fleet' in meta
+
+
+def test_phases_and_ls_errors(setup):
+    root, fleet, _ = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch')
+    path = root / 'worktrees/hello/web'
+    def phase(**env): return json.loads(fleet('ls', '--json', **env).stdout)[0]['phase']
+    assert phase(NOTAB='1') == 'no-tab'
+    for state in ('working', 'blocked', 'unknown'):
+        assert phase(AGENT_STATUS=state) == state
+    assert phase() == 'idle-empty'
+    (path / 'file').write_text('changed')
+    assert phase() == 'uncommitted'
+    git(path, 'add', 'file'); git(path, 'commit', '-m', 'work')
+    assert phase() == 'review'
+    text = fleet('ls').stdout
+    assert '{' not in text and 'web +1/-0 dirty0 unmerged' in text
+    row = json.loads(fleet('ls', '--json').stdout)[0]
+    assert {'slug', 'tab', 'agent', 'repos', 'agent_kind', 'phase'} <= row.keys()
+    assert {'branch', 'dirty', 'ahead', 'behind', 'merge'} <= row['repos']['web'].keys()
+    git(root / 'app-web', 'merge', '--no-ff', 'feat/hello', '-m', 'merge')
+    git(root / 'app-web', 'push', 'origin', 'develop')
+    assert phase(AGENT_STATUS='done') == 'merged'
+    (path / 'file').write_text('dirty after merge')
+    assert phase() == 'merged'
+    fleet('new', 'other', '-r', 'web', '--no-fetch')
+    git(path, 'branch', '-m', 'moved')
+    rows = json.loads(fleet('ls', '--json').stdout)
+    assert rows[0]['phase'] == 'error' and rows[0]['error'] and rows[1]['slug'] == 'other'
+
+
+def test_status_and_pr(setup, tmp_path):
+    root, fleet, _ = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch')
+    path = root / 'worktrees/hello/web'
+    (path / 'file').write_text('changed')
+    git(path, 'add', 'file'); git(path, 'commit', '-m', 'example commit')
+    (path / 'untracked').write_text('x')
+    p = fleet('status', 'hello', FLEET_GH=str(tmp_path / 'missing'))
+    assert all(s in p.stdout for s in ('uncommitted', 'example commit', 'file |', '?? untracked', 'agent output tail', 'PR: 未知'))
+    gh = tmp_path / 'gh'
+    gh.write_text('#!/bin/sh\nprintf \'[{"number":12,"url":"https://example.test/pr/12","state":"OPEN"}]\'\n')
+    gh.chmod(0o755)
+    row = json.loads(fleet('status', 'hello', '--json', FLEET_GH=str(gh)).stdout)
+    assert row['repos']['web']['pr']['url'] == 'https://example.test/pr/12'
+    assert row['repos']['web']['files'] == ['?? untracked']
+    assert 'example commit' in row['repos']['web']['commits'][0]
+    assert row['repos']['web']['diff_stat'] and row['agent_output'] == 'agent output tail'
+    assert 'https://example.test/pr/12' in fleet('status', 'hello', FLEET_GH=str(gh)).stdout
+    assert not json.loads(fleet('status', 'hello', '--json', '--lines', '0', NOTAB='1').stdout)['agent_output']
+
+
+def test_status_limits(setup, tmp_path):
+    root, fleet, _ = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch')
+    path = root / 'worktrees/hello/web'
+    for i in range(22):
+        (path / f'file-{i:02}').write_text('x')
+    row = json.loads(fleet('status', 'hello', '--json', '--lines', '0', FLEET_GH=str(tmp_path / 'missing')).stdout)
+    assert len(row['repos']['web']['files']) == 20 and row['repos']['web']['files_omitted'] == 2
+    assert '另有 2 行' in fleet('status', 'hello', '--lines', '0', FLEET_GH=str(tmp_path / 'missing')).stdout
+    p = fleet('status', 'hello', '--lines', '-1', check=False)
+    assert p.returncode == 1 and '--lines 不能为负数' in p.stderr
+
+
+@pytest.mark.parametrize('failure', ['missing-worktree', 'invalid-base'])
+def test_status_repository_error_preserves_other_repositories(setup, failure):
+    root, fleet, _ = setup
+    fleet('new', 'hello', '--no-fetch')
+    if failure == 'missing-worktree':
+        git(root / 'app-api', 'worktree', 'remove', root / 'worktrees/hello/backend')
+    else:
+        git(root / 'app-api', 'update-ref', '-d', 'refs/remotes/origin/master')
+    row = json.loads(fleet('status', 'hello', '--json', '--lines', '0').stdout)
+    assert row['phase'] == 'error' and 'be:' in row['error']
+    assert row['repos']['web']['base'] == 'origin/develop' and 'be' not in row['repos']
+    text = fleet('status', 'hello', '--lines', '0').stdout
+    assert 'phase: error' in text and 'be:' in text and 'web: branch' in text
+
+
+def test_ls_table_distinguishes_tab_without_agent(setup):
+    _, fleet, _ = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch')
+    header, row = fleet('ls', NOAGENT='1').stdout.splitlines()
+    assert header.split()[:3] == ['slug', 'tab', 'agent']
+    assert row.split()[:4] == ['hello', 't', 'pi', '-']
+    assert fleet('ls', NOTAB='1').stdout.splitlines()[1].split()[:2] == ['hello', '-']
+
+
+def test_wait(setup):
+    _, fleet, log = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch')
+    assert fleet('wait', 'hello', '--timeout', '1.5').stdout.strip() == 'hello idle-empty idle'
+    assert ['agent', 'wait', 'p', '--timeout', '1500'] in [json.loads(x) for x in log.read_text().splitlines()]
+    assert fleet('wait', 'hello', AGENT_STATUS='blocked', check=False).returncode == 3
+    assert fleet('wait', 'hello', WAIT_FAIL='timed out', check=False).returncode == 4
+    assert fleet('wait', 'hello', WAIT_STDOUT='{"error":{"code":"timeout","message":"timed out waiting for agent status"}}', check=False).returncode == 4
+    assert fleet('wait', 'hello', WAIT_FAIL='invalid timeout argument', check=False).returncode == 1
+    assert fleet('wait', 'hello', WAIT_STDOUT='{"error":{"code":"invalid_argument","message":"timed out parameter invalid"}}', check=False).returncode == 1
+    assert fleet('wait', 'hello', WAIT_FAIL='other failure', check=False).returncode == 1
+    assert fleet('wait', 'hello', NOTAB='1', check=False).returncode == 1
+
+
+@pytest.mark.parametrize('state, code', [('idle', 0), ('done', 0), ('blocked', 3)])
+def test_wait_terminal_state_survives_repository_error(setup, state, code):
+    root, fleet, _ = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch')
+    git(root / 'app-web', 'worktree', 'remove', root / 'worktrees/hello/web')
+    result = fleet('wait', 'hello', AGENT_STATUS=state, check=False)
+    assert result.returncode == code and result.stdout.strip() == f'hello error {state}'
+    assert '仓库错误' in result.stderr
+
+
+def test_done_rejects_locked_second_worktree_without_changes(setup):
+    root, fleet, log = setup
+    fleet('new', 'hello', '--no-fetch')
+    dest = root / 'worktrees/hello'
+    git(root / 'app-api', 'worktree', 'lock', '--reason', 'in use', dest / 'backend')
+    before = (dest / 'TASK.md').read_bytes()
+    for extra in (('--dry-run',), ()):
+        result = fleet('done', 'hello', '--no-fetch', '--force', '--discard', *extra, check=False)
+        assert result.returncode == 1 and '锁定' in (result.stdout + result.stderr)
+        assert (dest / 'TASK.md').read_bytes() == before
+        assert (dest / 'web/node_modules').is_symlink()
+        for repo, dirname in [('app-web', 'web'), ('app-api', 'backend')]:
+            assert (dest / dirname).is_dir()
+            assert git(root / repo, 'branch', '--list', 'feat/hello')
+        assert not any(json.loads(line)[:2] == ['tab', 'close'] for line in log.read_text().splitlines())
+
+
+def test_done_dry_run_and_extra_files(setup):
+    root, fleet, log = setup
+    fleet('new', 'hello', '--no-fetch')
+    dest = root / 'worktrees/hello'
+    (dest / 'unexpected').write_text('x')
+    for extra in (('--dry-run',), ()):
+        p = fleet('done', 'hello', '--no-fetch', *extra, check=False)
+        assert p.returncode == 1 and 'unexpected' in p.stderr
+    (dest / 'unexpected').unlink()
+    (dest / 'web/dirty').write_text('x')
+    dry = fleet('done', 'hello', '--no-fetch', '--dry-run', check=False)
+    assert dry.returncode == 1 and '--discard' in dry.stdout and 'backend' in dry.stdout
+    assert fleet('done', 'hello', '--no-fetch', check=False).returncode == 1
+    before = log.read_text()
+    dry = fleet('done', 'hello', '--no-fetch', '--dry-run', '--discard')
+    assert '将删除' in dry.stdout and dest.exists() and (dest / 'web/dirty').exists()
+    assert 'tab", "close' not in log.read_text()[len(before):]
+    result = fleet('done', 'hello', '--no-fetch', '--discard')
+    assert '已删除 worktree' in result.stdout and '已删除分支' in result.stdout and '已关闭 tab' in result.stdout
+
+
+def test_done_dry_run_unmerged(setup):
+    root, fleet, _ = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch')
+    path = root / 'worktrees/hello/web'
+    (path / 'file').write_text('change')
+    git(path, 'add', 'file'); git(path, 'commit', '-m', 'work')
+    dry = fleet('done', 'hello', '--no-fetch', '--dry-run', check=False)
+    assert dry.returncode == 1 and '--force' in dry.stdout
+    assert fleet('done', 'hello', '--no-fetch', check=False).returncode == 1
+    dry = fleet('done', 'hello', '--no-fetch', '--dry-run', '--force')
+    assert '将保留分支 feat/hello' in dry.stdout and path.exists()
+    fleet('done', 'hello', '--no-fetch', '--force')
+    assert git(root / 'app-web', 'branch', '--list', 'feat/hello')
