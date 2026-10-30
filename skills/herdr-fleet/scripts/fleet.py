@@ -245,7 +245,11 @@ def prune_coordinators(panes, inbox):
             del panes[pane]
 
 
-def register_task(data, pane):
+def task_index_matches(entry, slug):
+    return entry.get('root') == str(ROOT) and entry.get('slug') == slug and entry.get('role') == 'task'
+
+
+def register_task(data, pane, tab_id):
     coordinator = os.environ.get('HERDR_PANE_ID')
     if not coordinator:
         return
@@ -254,9 +258,9 @@ def register_task(data, pane):
         data['coordinator_pane'] = coordinator
         save(data)
         for old, entry in list(panes.items()):
-            if entry == {'root': str(ROOT), 'slug': data['slug'], 'role': 'task'}:
+            if task_index_matches(entry, data['slug']):
                 del panes[old]
-        panes[pane] = {'root': str(ROOT), 'slug': data['slug'], 'role': 'task'}
+        panes[pane] = {'root': str(ROOT), 'slug': data['slug'], 'role': 'task', 'tab_id': tab_id}
         if panes.get(coordinator, {}).get('root') != str(ROOT) or panes[coordinator].get('role') != 'coordinator':
             panes[coordinator] = {'root': str(ROOT), 'role': 'coordinator'}
         prune_coordinators(panes, inbox)
@@ -296,9 +300,9 @@ def bind_locked(coordinator, tabs, agents, panes, inbox):
         agent = next((item for item in agents if tab and item.get('tab_id') == tab['tab_id']), None)
         if agent:
             for pane, entry in list(panes.items()):
-                if entry == {'root': str(ROOT), 'slug': data['slug'], 'role': 'task'}:
+                if task_index_matches(entry, data['slug']):
                     del panes[pane]
-            panes[agent['pane_id']] = {'root': str(ROOT), 'slug': data['slug'], 'role': 'task'}
+            panes[agent['pane_id']] = {'root': str(ROOT), 'slug': data['slug'], 'role': 'task', 'tab_id': tab['tab_id']}
     slugs = {data['slug'] for data in current}
     for event in inbox:
         if event.get('root') == str(ROOT) and event.get('slug') in slugs and event.get('delivery') == 'pending':
@@ -313,6 +317,64 @@ def inbox_list(a):
     with fleet_state() as (_, inbox):
         events = [event for event in inbox if event.get('root') == str(ROOT) and (a.all or event.get('delivery') == 'pending')]
     display(events, a.json)
+
+
+def doctor():
+    ok = True
+    try:
+        version = run(HERDR, '--version')
+        match = re.fullmatch(r'herdr (\d+)\.(\d+)\.(\d+)', version)
+        valid = bool(match and tuple(map(int, match.groups())) >= (0, 9, 1))
+        print(f'herdr 版本: {version}' + ('' if valid else '（需要 >= 0.9.1）'))
+        ok &= valid
+    except (RuntimeError, OSError) as e:
+        print(f'herdr 版本检查失败: {e}'); ok = False
+    try:
+        plugins = herdr('plugin', 'list', '--json')['plugins']
+        plugin = next((item for item in plugins if item.get('plugin_id') == 'tc.herdr-fleet'), None)
+        if not plugin:
+            print('插件 tc.herdr-fleet 未安装'); ok = False
+        elif not plugin.get('enabled'):
+            print('插件 tc.herdr-fleet 未启用'); ok = False
+        else:
+            print('插件 tc.herdr-fleet 已启用')
+    except (RuntimeError, OSError, ValueError, KeyError, TypeError) as e:
+        print(f'插件检查失败: {e}'); ok = False
+    active_tasks = list(tasks())
+    kinds = {(data.get('agent') or {}).get('kind') or SETTINGS['agent'] for data in active_tasks} if active_tasks else {SETTINGS['agent']}
+    kinds.discard('none')
+    if kinds:
+        try:
+            output = run(HERDR, 'integration', 'status')
+            statuses = {}
+            for line in output.splitlines():
+                match = re.match(r'^([^\s:]+)(?: \(experimental\))?:\s*(.+)$', line)
+                if match:
+                    statuses[match.group(1)] = match.group(2)
+            for kind in sorted(kinds):
+                status = statuses.get(kind)
+                if not status or status.startswith('not installed'):
+                    reason = '未安装' if status else '无内置集成或状态缺失'
+                    print(f'{kind} 集成{reason}：运行 herdr integration install {kind}；仅对之后新启动的 agent 生效')
+                    ok = False
+                else:
+                    print(f'{kind} 集成: {status}')
+        except (RuntimeError, OSError) as e:
+            print(f'integration status 检查失败: {e}'); ok = False
+    for data in active_tasks:
+        pane = data.get('coordinator_pane')
+        if not pane:
+            print(f"{data['slug']}: coordinator_pane 不存在，请运行 fleet bind"); ok = False
+            continue
+        try:
+            herdr('pane', 'get', pane)
+            print(f"{data['slug']}: coordinator_pane {pane} 存在")
+        except (RuntimeError, OSError, ValueError, KeyError):
+            print(f"{data['slug']}: coordinator_pane {pane} 不存在或无法检查"); ok = False
+    with fleet_state() as (_, inbox):
+        pending = sum(item.get('root') == str(ROOT) and item.get('delivery') == 'pending' for item in inbox)
+    print(f'待投递事件: {pending}')
+    return 0 if ok and not pending else 1
 
 
 def task_event(a):
@@ -610,7 +672,7 @@ def create_tab(data, agent, focus=False, explicit=None, prompt=None):
     except Exception:
         herdr('tab', 'close', tid)
         raise
-    register_task(data, pane)
+    register_task(data, pane, tid)
     if prompt and agent['kind'] != 'none':
             context = [f'任务目录：{dest}']
             for key, details in data['repos'].items():
@@ -973,7 +1035,7 @@ def done(a):
     dest.rmdir()
     with fleet_state(write=True) as (panes, inbox):
         for pane, entry in list(panes.items()):
-            if entry == {'root': str(ROOT), 'slug': a.slug, 'role': 'task'}:
+            if task_index_matches(entry, a.slug):
                 del panes[pane]
         inbox[:] = [event for event in inbox if not (event.get('root') == str(ROOT) and event.get('slug') == a.slug)]
         prune_coordinators(panes, inbox)
@@ -1052,6 +1114,7 @@ def main():
     g = sub.add_parser('gc'); g.add_argument('--apply', action='store_true'); g.add_argument('--json', action='store_true')
     i = sub.add_parser('inbox'); i.add_argument('--all', action='store_true'); i.add_argument('--json', action='store_true')
     sub.add_parser('bind')
+    sub.add_parser('doctor')
     e = sub.add_parser('event'); e.add_argument('--pane', required=True); e.add_argument('--status', required=True, choices=('working', 'idle', 'done', 'blocked', 'exited'))
     a = p.parse_args()
     try:
@@ -1065,6 +1128,7 @@ def main():
         elif a.command == 'gc': gc(a)
         elif a.command == 'inbox': inbox_list(a)
         elif a.command == 'bind': bind()
+        elif a.command == 'doctor': return doctor()
         elif a.command == 'event': event(a)
         elif a.command == 'peek': print(herdr('agent', 'read', task_agent(a.slug), '--source', 'recent-unwrapped', '--lines', a.lines, json_output=False))
         elif a.command == 'send': submit(load(a.slug), task_agent(a.slug), a.text)
@@ -1075,7 +1139,7 @@ def main():
             if tab:
                 herdr('tab', 'focus', tab['tab_id'])
                 live = next((agent for agent in agents if agent.get('tab_id') == tab['tab_id']), None)
-                if live: register_task(data, live['pane_id'])
+                if live: register_task(data, live['pane_id'], tab['tab_id'])
             else:
                 agent = agent_options(a, data)
                 if create_tab(data, agent, focus=True):

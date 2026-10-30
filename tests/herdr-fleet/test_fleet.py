@@ -4,6 +4,7 @@ from pathlib import Path
 import re
 import subprocess
 import time
+import tomllib
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -37,8 +38,15 @@ if os.environ.get('BARRIER') and args[:2] == os.environ.get('BARRIER_CALL', '').
     while not barrier.with_suffix('.release').exists():
         if time.monotonic() >= deadline: sys.exit(2)
         time.sleep(0.01)
+if args == ['--version']: print(os.environ.get('HERDR_VERSION', 'herdr 0.9.1')); sys.exit(0)
 if os.environ.get('FAIL') and args[:2] == os.environ['FAIL'].split(): sys.exit(1)
-if args[:2] == ['workspace', 'list']: result = {'workspaces': [{'workspace_id': 'w', 'focused': True}]}
+if args == ['integration', 'status']:
+    print(os.environ.get('INTEGRATIONS', 'pi: current (v9) (/path)')); sys.exit(0)
+if args[:2] == ['plugin', 'list']: result = {'plugins': json.loads(os.environ.get('PLUGINS', '[]'))}
+elif args[:2] == ['pane', 'get']:
+    if os.environ.get('COORD_MISSING'): sys.exit(1)
+    result = {'pane': {'pane_id': args[2]}}
+elif args[:2] == ['workspace', 'list']: result = {'workspaces': [{'workspace_id': 'w', 'focused': True}]}
 elif args[:2] == ['tab', 'list']: result = {'tabs': [] if os.environ.get('NOTAB') else [{'tab_id': 't', 'label': 'hello', 'workspace_id': 'w'}] + ([{'tab_id': 'u', 'label': 'other', 'workspace_id': 'w'}] if os.environ.get('MULTI') else [])}
 elif args[:2] == ['agent', 'list']: result = {'agents': [] if os.environ.get('NOAGENT') else [{'agent': 'pi', 'pane_id': 'p', 'tab_id': 't', 'agent_status': os.environ.get('AGENT_STATUS', 'idle')}] + ([{'agent': 'pi', 'pane_id': 'q', 'tab_id': 'u', 'agent_status': os.environ.get('OTHER_STATUS', 'idle')}] if os.environ.get('MULTI') else [])}
 elif args[:2] == ['agent', 'get']:
@@ -47,12 +55,18 @@ elif args[:2] == ['agent', 'get']:
             print(json.dumps({'error': {'code': 'pane_not_found'}})); sys.exit(1)
         status = Path(os.environ['COORD_STATUS_FILE']).read_text().strip() if os.environ.get('COORD_STATUS_FILE') else os.environ.get('COORD_STATUS', 'working')
         print(json.dumps({'result': {'agent': {'agent_status': status, 'state_change_seq': 1}}})); sys.exit(0)
+    if os.environ.get('FAKE_STATE_FILE') and Path(os.environ['FAKE_STATE_FILE']).exists():
+        print(json.dumps({'result': {'agent': json.loads(Path(os.environ['FAKE_STATE_FILE']).read_text())}})); sys.exit(0)
     gets = sum(json.loads(line)[:2] == ['agent', 'get'] for line in open(os.environ['LOG']))
     seq = os.environ.get('GET_AFTER_SEQ', '10') if gets > int(os.environ.get('GET_AFTER_N', '999999')) else os.environ.get('GET_SEQ', '10')
     result = {'agent': {'agent_status': os.environ.get('OTHER_STATUS', 'idle') if args[2] == 'q' else os.environ.get('GET_STATUS', 'idle'), 'state_change_seq': int(os.environ.get('OTHER_SEQ', seq) if args[2] == 'q' else seq)}}
 elif args[:2] == ['agent', 'prompt'] and '--wait' in args:
+    if args[4:] != ['--wait', '--until', 'working', '--until', 'blocked', '--timeout', '5000']:
+        print('invalid confirmation arguments', file=sys.stderr); sys.exit(1)
     if os.environ.get('PROMPT_FAIL'):
         print(json.dumps({'error': {'code': os.environ['PROMPT_FAIL']}})); sys.exit(1)
+    if os.environ.get('FAKE_STATE_FILE'):
+        Path(os.environ['FAKE_STATE_FILE']).write_text(json.dumps({'agent_status': 'working', 'state_change_seq': 11}))
     result = {'type': 'agent_prompted'}
 elif args[:2] == ['agent', 'prompt']:
     time.sleep(float(os.environ.get('DELIVERY_DELAY', '0')))
@@ -126,6 +140,7 @@ def test_new_and_rollback(setup):
     assert [c[:2] for c in calls] == [['tab', 'create'], ['agent', 'start'], ['pane', 'split'], ['agent', 'get'], ['agent', 'prompt']]
     assert calls[1] == ['agent', 'start', 'hello', '--kind', 'pi', '--pane', 'p', '--timeout', '60000']
     prompt = calls[-1][3]
+    assert calls[-1][4:] == ['--wait', '--until', 'working', '--until', 'blocked', '--timeout', '5000']
     assert str(dest / 'web') in prompt and 'app-web' in prompt and prompt.endswith('do work')
     assert all(field in prompt for field in ('FLEET-REPORT', 'END FLEET-REPORT', '结果', 'PR', '测试', '证据边界', '需要决策', '退出码'))
     p = fleet('new', 'bad', '--no-fetch', check=False, FAIL='pane split')
@@ -191,12 +206,132 @@ def task_data(root, slug):
     return json.loads(text.split('```json\n', 1)[1].split('\n```', 1)[0])
 
 
+def test_plugin_manifest():
+    manifest = tomllib.loads((SKILL / 'herdr-plugin.toml').read_text())
+    assert manifest['id'] == 'tc.herdr-fleet'
+    assert manifest['min_herdr_version'] == '0.9.1'
+    assert {event['on'] for event in manifest['events']} == {'pane.agent_status_changed', 'pane.exited', 'pane.closed', 'tab.closed'}
+    assert all(event['command'] == ['python3', 'hooks/event.py'] for event in manifest['events'])
+
+
+@pytest.mark.parametrize('event,payload,status', [
+    ('pane.agent_status_changed', {'event': 'pane.agent_status_changed', 'data': {'pane_id': 'p', 'agent_status': 'working'}}, 'working'),
+    ('pane.agent_status_changed', {'pane_id': 'p', 'agent_status': 'idle'}, 'idle'),
+    ('pane.exited', {'pane_id': 'p'}, 'exited'),
+    ('pane.closed', {'event': 'pane_closed', 'data': {'pane_id': 'p'}}, 'exited'),
+])
+def test_plugin_hook_event(tmp_path, event, payload, status):
+    skill = tmp_path / 'skill'
+    (skill / 'hooks').mkdir(parents=True)
+    (skill / 'scripts').mkdir()
+    (skill / 'hooks/event.py').write_text((SKILL / 'hooks/event.py').read_text())
+    (skill / 'scripts/fleet.py').write_text("import json, os, sys\nopen(os.environ['CALLS'], 'w').write(json.dumps([sys.argv[1:], os.environ['FLEET_ROOT']]))\nsys.exit(int(os.environ.get('FLEET_FAIL', '0')))\n")
+    state = tmp_path / 'state/herdr-fleet'
+    state.mkdir(parents=True)
+    (state / 'panes.json').write_text(json.dumps({'p': {'root': str(tmp_path)}}))
+    fake = tmp_path / 'herdr'
+    fake.write_text(FAKE_HERDR); fake.chmod(0o755)
+    env = {**os.environ, 'XDG_STATE_HOME': str(tmp_path / 'state'), 'HERDR_PLUGIN_EVENT': event,
+           'HERDR_PLUGIN_EVENT_JSON': json.dumps(payload), 'CALLS': str(tmp_path / 'calls'),
+           'LOG': str(tmp_path / 'log'), 'FLEET_HERDR': str(fake)}
+    hook = skill / 'hooks/event.py'
+    cmd('python3', hook, env=env)
+    assert json.loads((tmp_path / 'calls').read_text()) == [['event', '--pane', 'p', '--status', status], str(tmp_path)]
+    (tmp_path / 'calls').unlink()
+    (state / 'panes.json').write_text('{}')
+    cmd('python3', hook, env=env)
+    assert not (tmp_path / 'calls').exists()
+    (state / 'panes.json').write_text(json.dumps({'p': {'root': str(tmp_path)}}))
+    result = cmd('python3', hook, env={**env, 'FLEET_FAIL': '1'}, check=False)
+    assert result.returncode != 0
+    assert [json.loads(line)[:2] for line in (tmp_path / 'log').read_text().splitlines()] == [['notification', 'show']]
+
+
+@pytest.mark.parametrize('wrapped', [True, False])
+def test_plugin_hook_tab_closed_routes_tasks(tmp_path, wrapped):
+    skill = tmp_path / 'skill'
+    (skill / 'hooks').mkdir(parents=True)
+    (skill / 'scripts').mkdir()
+    (skill / 'hooks/event.py').write_text((SKILL / 'hooks/event.py').read_text())
+    (skill / 'scripts/fleet.py').write_text("import json, os, sys\nwith open(os.environ['CALLS'], 'a') as f: f.write(json.dumps([sys.argv[1:], os.environ['FLEET_ROOT']]) + '\\n')\nsys.exit(int(os.environ.get('FLEET_FAIL', '0')))\n")
+    state = tmp_path / 'state/herdr-fleet'; state.mkdir(parents=True)
+    index = {'p': {'root': '/project/a', 'role': 'task', 'tab_id': 't'},
+             'q': {'root': '/project/b', 'role': 'task', 'tab_id': 't'},
+             'old': {'root': '/project/a', 'role': 'task'},
+             'coordinator': {'root': '/project/a', 'role': 'coordinator', 'tab_id': 't'}}
+    (state / 'panes.json').write_text(json.dumps(index))
+    fake = tmp_path / 'herdr'; fake.write_text(FAKE_HERDR); fake.chmod(0o755)
+    payload = {'tab_id': 't'}
+    if wrapped: payload = {'event': 'tab_closed', 'data': payload}
+    env = {**os.environ, 'XDG_STATE_HOME': str(tmp_path / 'state'), 'HERDR_PLUGIN_EVENT': 'tab.closed',
+           'HERDR_PLUGIN_EVENT_JSON': json.dumps(payload), 'CALLS': str(tmp_path / 'calls'),
+           'LOG': str(tmp_path / 'log'), 'FLEET_HERDR': str(fake)}
+    hook = skill / 'hooks/event.py'
+    cmd('python3', hook, env=env)
+    calls = [json.loads(line) for line in (tmp_path / 'calls').read_text().splitlines()]
+    assert calls == [[['event', '--pane', 'p', '--status', 'exited'], '/project/a'],
+                     [['event', '--pane', 'q', '--status', 'exited'], '/project/b']]
+    (tmp_path / 'calls').unlink()
+    (state / 'panes.json').write_text(json.dumps({'old': index['old']}))
+    cmd('python3', hook, env=env)
+    assert not (tmp_path / 'calls').exists()
+    (state / 'panes.json').write_text(json.dumps(index))
+    result = cmd('python3', hook, env={**env, 'FLEET_FAIL': '1'}, check=False)
+    assert result.returncode != 0
+    assert len((tmp_path / 'calls').read_text().splitlines()) == 2
+    assert [json.loads(line)[:2] for line in (tmp_path / 'log').read_text().splitlines()] == [['notification', 'show']]
+
+
+def test_doctor_checks_readiness(setup):
+    root, fleet, log = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', HERDR_PANE_ID='coordinator')
+    enabled = json.dumps([{'plugin_id': 'tc.herdr-fleet', 'enabled': True}])
+    disabled = json.dumps([{'plugin_id': 'tc.herdr-fleet', 'enabled': False}])
+    for updates, text in [({}, '未安装'), ({'PLUGINS': disabled}, '未启用'),
+                          ({'PLUGINS': enabled, 'COORD_MISSING': '1'}, 'coordinator'),
+                          ({'PLUGINS': enabled, 'HERDR_VERSION': 'herdr 0.8.0'}, '版本')]:
+        result = fleet('doctor', check=False, **updates)
+        assert result.returncode != 0 and text in result.stdout
+    assert fleet('doctor', PLUGINS=enabled).returncode == 0
+    (log.parent / 'state/herdr-fleet/inbox.json').write_text(json.dumps([{'root': str(root), 'delivery': 'pending'}]))
+    result = fleet('doctor', PLUGINS=enabled, check=False)
+    assert result.returncode != 0 and '待投递' in result.stdout
+
+
+def test_doctor_integration_default_and_missing(setup):
+    root, fleet, log = setup
+    enabled = json.dumps([{'plugin_id': 'tc.herdr-fleet', 'enabled': True}])
+    assert fleet('doctor', PLUGINS=enabled).returncode == 0
+    for status in ('pi: not installed (/path)', 'claude: current (v1) (/path)'):
+        result = fleet('doctor', PLUGINS=enabled, INTEGRATIONS=status, check=False)
+        assert result.returncode != 0
+        assert 'herdr integration install pi' in result.stdout and '新启动' in result.stdout
+    result = fleet('doctor', PLUGINS=enabled, FAIL='integration status', check=False)
+    assert result.returncode != 0 and 'integration' in result.stdout
+    config = root / '.herdr-fleet.toml'
+    config.write_text(config.read_text().replace('agent = "pi"', 'agent = "none"'))
+    log.write_text('')
+    assert fleet('doctor', PLUGINS=enabled).returncode == 0
+    assert not any(json.loads(line)[:2] == ['integration', 'status'] for line in log.read_text().splitlines())
+
+
+def test_doctor_integrations_for_active_task_kinds(setup):
+    root, fleet, log = setup
+    enabled = json.dumps([{'plugin_id': 'tc.herdr-fleet', 'enabled': True}])
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', HERDR_PANE_ID='coordinator')
+    fleet('new', 'other', '-r', 'web', '--no-fetch', '--agent', 'letta', HERDR_PANE_ID='coordinator')
+    both = 'pi: current (v9) (/path)\nletta (experimental): current (v1) (/path)'
+    assert fleet('doctor', PLUGINS=enabled, INTEGRATIONS=both).returncode == 0
+    result = fleet('doctor', PLUGINS=enabled, INTEGRATIONS='pi: current (v9) (/path)\nletta (experimental): not installed (/path)', check=False)
+    assert result.returncode != 0 and 'herdr integration install letta' in result.stdout
+
+
 def test_registration_open_and_dry_run(setup):
     root, fleet, log = setup
     fleet('new', 'hello', '-r', 'web', '--no-fetch', HERDR_PANE_ID='coordinator')
     assert task_data(root, 'hello')['coordinator_pane'] == 'coordinator'
     index = json.loads((log.parent / 'state/herdr-fleet/panes.json').read_text())
-    assert index['p'] == {'root': str(root), 'slug': 'hello', 'role': 'task'}
+    assert index['p'] == {'root': str(root), 'slug': 'hello', 'role': 'task', 'tab_id': 't'}
     assert index['coordinator'] == {'root': str(root), 'role': 'coordinator'}
     assert {p.name for p in (root / 'worktrees/hello').iterdir()} == {'TASK.md', 'web'}
     fleet('done', 'hello', '--dry-run', '--no-fetch')
@@ -204,13 +339,17 @@ def test_registration_open_and_dry_run(setup):
     assert task_data(root, 'hello')['coordinator_pane'] == 'new-coordinator'
     index = json.loads((log.parent / 'state/herdr-fleet/panes.json').read_text())
     assert 'p' not in index and 'coordinator' not in index
-    assert index['new-task']['slug'] == 'hello' and 'new-coordinator' in index
+    assert index['new-task']['slug'] == 'hello' and index['new-task']['tab_id'] == 't' and 'new-coordinator' in index
 
 
 def test_inbox_bind_and_cleanup(setup):
     root, fleet, log = setup
     fleet('new', 'hello', '-r', 'web', '--no-fetch', HERDR_PANE_ID='old')
     path = log.parent / 'state/herdr-fleet/inbox.json'
+    index_path = path.parent / 'panes.json'
+    index = json.loads(index_path.read_text())
+    del index['p']['tab_id']
+    index_path.write_text(json.dumps(index))
     events = [dict(root=str(root), slug='hello', coordinator_pane='old', status=s, delivery=d,
                    created='2026-01-01', dedup_key=str(i), attempts=0, last_error=None)
               for i, (s, d) in enumerate([('idle', 'pending'), ('blocked', 'delivered')])]
@@ -221,6 +360,7 @@ def test_inbox_bind_and_cleanup(setup):
     assert 'hello' in fleet('inbox').stdout and path.read_bytes() == before
     fleet('bind', HERDR_PANE_ID='new')
     assert task_data(root, 'hello')['coordinator_pane'] == 'new'
+    assert json.loads(index_path.read_text())['p']['tab_id'] == 't'
     assert [event['coordinator_pane'] for event in json.loads(path.read_text())] == ['new', 'old']
     fleet('done', 'hello', '--no-fetch')
     assert json.loads(path.read_text()) == []
@@ -844,8 +984,29 @@ def test_send_and_peek_target_pane(setup):
     fleet('send', 'hello', '继续')
     fleet('peek', 'hello', '--lines', '5')
     calls = [json.loads(line) for line in log.read_text().splitlines()]
-    assert any(call[:4] == ['agent', 'prompt', 'p', '继续'] and '--wait' in call for call in calls)
+    assert ['agent', 'prompt', 'p', '继续', '--wait', '--until', 'working', '--until', 'blocked', '--timeout', '5000'] in calls
     assert ['agent', 'read', 'p', '--source', 'recent-unwrapped', '--lines', '5'] in calls
+
+
+@pytest.mark.parametrize('command', ['new', 'send'])
+def test_confirmation_changes_fake_agent_state(setup, command):
+    root, fleet, log = setup
+    if command == 'send': fleet('new', 'hello', '--no-fetch')
+    state = log.parent / 'agent-state.json'
+    args = ('new', 'hello', '--no-fetch', '--prompt', 'work') if command == 'new' else ('send', 'hello', 'work')
+    fleet(*args, FAKE_STATE_FILE=str(state))
+    assert json.loads(state.read_text()) == {'agent_status': 'working', 'state_change_seq': 11}
+    assert task_data(root, 'hello')['submit_seq'] == 10
+
+
+def test_skill_doctor_and_notification_rules():
+    text = (SKILL / 'SKILL.md').read_text(encoding='utf-8')
+    opening = text.split('## 2. 开任务', 1)[1].split('## 3. 看情况', 1)[0]
+    assert '通过时可以结束本轮' in opening and '会自动通知' in opening
+    assert '不通过时不得声称会自动通知' in opening
+    assert '必须在同一轮内执行 `fleet wait <slug>...` 直到任务结束或阻塞' in opening
+    assert '或明确' not in opening and '只说明不会自动通知' not in opening
+    assert re.search(r'收到.*自动通知后，先.*`fleet status <slug>` 核查，再向用户汇报', text)
 
 
 def test_gc_legacy_dependents(setup):

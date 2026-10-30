@@ -1,0 +1,21 @@
+id = "tc.herdr-fleet"
+name = "herdr-fleet completion notifications"
+version = "0.1.0"
+min_herdr_version = "0.9.1"
+platforms = ["linux", "macos"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["python3", "hooks/event.py"]
+
+[[events]]
+on = "pane.exited"
+command = ["python3", "hooks/event.py"]
+
+[[events]]
+on = "pane.closed"
+command = ["python3", "hooks/event.py"]
+
+[[events]]
+on = "tab.closed"
+command = ["python3", "hooks/event.py"]

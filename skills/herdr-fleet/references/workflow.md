@@ -67,7 +67,7 @@ fleet gc [--apply]                       # 报告所有仓库的全部 worktree�
 
 `new` 和 `open` 在设置了 `HERDR_PANE_ID` 时将该主 agent pane 记为 `coordinator_pane`。`bind` 将当前项目所有任务改绑到当前 pane，待投递事件也改绑；已投递历史保留原目标。旧任务没有此字段时仍可使用。pane 索引和收件箱位于 `$XDG_STATE_HOME/herdr-fleet/`（默认 `~/.local/state/herdr-fleet/`），不占用任务目录；读写通过文件锁协调，`done` 清除对应记录，`--dry-run` 不清除。收件箱记录项目根、任务、目标 pane、终态、时间、去重键、投递状态、尝试次数和最近错误。`inbox` 不改变状态。
 
-`event` 接受 `working`、`idle`、`done`、`blocked`、`exited`。任务每次成功提交以 `submit_seq` 为轮次基线；working 边沿也可开始手动输入的下一轮。只记录晚于基线且尚未通知的终态，重复和过期边沿不重复入箱。主 agent 为 idle/done 时尝试投递，否则保留待投递；主 agent 的 idle/done 边沿会合并投递待投递事件。投递须得到 `agent_prompted` 确认，失败时保留记录和错误；pane 不存在时显示一次 herdr 通知。通知只是触发器，须用 `fleet status` 核查。`event` 由后续插件调用；仅安装本命令不会自动订阅事件。
+`event` 接受 `working`、`idle`、`done`、`blocked`、`exited`。任务每次成功提交以 `submit_seq` 为轮次基线；working 边沿也可开始手动输入的下一轮。只记录晚于基线且尚未通知的终态，重复和过期边沿不重复入箱。主 agent 为 idle/done 时尝试投递，否则保留待投递；主 agent 的 idle/done 边沿会合并投递待投递事件。投递须得到 `agent_prompted` 确认，失败时保留记录和错误；pane 不存在时显示一次 herdr 通知。通知只是触发器，须用 `fleet status` 核查。插件将 `pane.exited`、`pane.closed` 与 `tab.closed` 映射为任务 `exited` 事件；关 tab 时通过索引的 tab_id 查找任务 pane。旧索引可通过 `fleet bind` 或重新打开任务补登记。仅安装本命令不会自动订阅事件。
 
 开始确认只阻塞同一任务的事件处理，不持有跨任务的状态锁。herdr 状态钩子不带序号：处理 `working` 时若实时状态已是终态，则以实时序号推断快速结束的手动轮次；已有通知时实时序号必须晚于上次终态。单独的 `done` → `idle` 后续边沿不会再次通知。但若上一轮迟到的 `working` 恰好在同轮 `done` → `idle` 后才处理，它与快速完成的新轮次无法区分，可能额外通知一次；此取舍避免静默漏掉新轮次。
 
@@ -109,11 +109,11 @@ phase 按以下顺序判断（仓库异常时为 `error`）：
 | review | 任一仓库有领先提交且 unmerged |
 | idle-empty | 所有仓库 no-commits |
 
-`wait` 默认等待全部任务，`--any` 等首个终态；只认最近一次提交之后的终态。返回码：idle/done 为 0，blocked 为 3，超时为 4，无 agent 或其他错误为 1。观察到终态后，仓库信息读取失败仅报告错误，不改变终态返回码。当前没有自动通知，主 agent 结束本轮前必须 `fleet wait` 到任务结束或阻塞，不得声称完成后会自动通知。`done --dry-run` 预检通过返回 0，拒绝返回 1，且不删除或关闭 tab。
+`wait` 默认等待全部任务，`--any` 等首个终态；只认最近一次提交之后的终态。返回码：idle/done 为 0，blocked 为 3，超时为 4，无 agent 或其他错误为 1。观察到终态后，仓库信息读取失败仅报告错误，不改变终态返回码。开任务后运行 `fleet doctor`：通过时可以结束本轮并告知用户会自动通知；不通过时不得声称会自动通知，必须在同一轮内 `fleet wait` 到任务结束或阻塞，不能只说明不会自动通知就结束本轮。`done --dry-run` 预检通过返回 0，拒绝返回 1，且不删除或关闭 tab。
 
 ## 安全规则
 
-- `new` 中途任何一步失败（worktree、tab、agent、pane），都会回滚已建的 worktree、新建的分支和 tab。
+- `new` 创建 worktree、tab、agent 或 pane 失败时，回滚已建的 worktree、新建的分支和 tab；提交 prompt 后开始确认失败则保留 worktree 和 tab，供检查和恢复。
 - `done` 先对所有仓库预检，任何一项不过就什么都不删：
   - 任务目录里有 `TASK.md` 和各仓库子目录以外的东西：拒绝。
   - worktree 当前分支和 `TASK.md` 记录不符：拒绝。
