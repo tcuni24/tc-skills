@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -25,7 +26,7 @@ dir = "backend"
 '''
 
 FAKE_HERDR = '''#!/usr/bin/env python3
-import json, os, sys
+import json, os, sys, time
 args = sys.argv[1:]
 with open(os.environ['LOG'], 'a') as f: f.write(json.dumps(args) + '\\n')
 if os.environ.get('FAIL') and args[:2] == os.environ['FAIL'].split(): sys.exit(1)
@@ -33,6 +34,10 @@ if args[:2] == ['workspace', 'list']: result = {'workspaces': [{'workspace_id': 
 elif args[:2] == ['tab', 'list']: result = {'tabs': [] if os.environ.get('NOTAB') else [{'tab_id': 't', 'label': 'hello', 'workspace_id': 'w'}] + ([{'tab_id': 'u', 'label': 'other', 'workspace_id': 'w'}] if os.environ.get('MULTI') else [])}
 elif args[:2] == ['agent', 'list']: result = {'agents': [] if os.environ.get('NOAGENT') else [{'agent': 'pi', 'pane_id': 'p', 'tab_id': 't', 'agent_status': os.environ.get('AGENT_STATUS', 'idle')}] + ([{'agent': 'pi', 'pane_id': 'q', 'tab_id': 'u', 'agent_status': os.environ.get('OTHER_STATUS', 'idle')}] if os.environ.get('MULTI') else [])}
 elif args[:2] == ['agent', 'get']:
+    if args[2] in ('coordinator', 'old', 'new'):
+        if os.environ.get('COORD_MISSING'):
+            print(json.dumps({'error': {'code': 'pane_not_found'}})); sys.exit(1)
+        print(json.dumps({'result': {'agent': {'agent_status': os.environ.get('COORD_STATUS', 'working'), 'state_change_seq': 1}}})); sys.exit(0)
     gets = sum(json.loads(line)[:2] == ['agent', 'get'] for line in open(os.environ['LOG']))
     seq = os.environ.get('GET_AFTER_SEQ', '10') if gets > int(os.environ.get('GET_AFTER_N', '999999')) else os.environ.get('GET_SEQ', '10')
     result = {'agent': {'agent_status': os.environ.get('OTHER_STATUS', 'idle') if args[2] == 'q' else os.environ.get('GET_STATUS', 'idle'), 'state_change_seq': int(os.environ.get('OTHER_SEQ', seq) if args[2] == 'q' else seq)}}
@@ -40,6 +45,9 @@ elif args[:2] == ['agent', 'prompt'] and '--wait' in args:
     if os.environ.get('PROMPT_FAIL'):
         print(json.dumps({'error': {'code': os.environ['PROMPT_FAIL']}})); sys.exit(1)
     result = {'type': 'agent_prompted'}
+elif args[:2] == ['agent', 'prompt']:
+    time.sleep(float(os.environ.get('DELIVERY_DELAY', '0')))
+    result = {'type': os.environ.get('DELIVERY_RESULT', 'agent_prompted')}
 elif args[:2] == ['agent', 'wait']:
     if os.environ.get('WAIT_STDOUT'):
         print(os.environ['WAIT_STDOUT']); sys.exit(1)
@@ -326,8 +334,94 @@ def test_event_exited_without_agent_get(setup):
     fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
     log.write_text('')
     fleet('event', '--pane', 'p', '--status', 'exited', FAIL='agent get')
-    assert log.read_text() == ''
+    assert not any(json.loads(line) == ['agent', 'get', 'p'] for line in log.read_text().splitlines())
     assert json.loads(fleet('inbox', '--json').stdout)[0]['status'] == 'exited'
+
+
+def test_delivery_idle_and_inbox_history(setup):
+    _, fleet, log = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
+    log.write_text('')
+    fleet('event', '--pane', 'p', '--status', 'idle', GET_SEQ='12', COORD_STATUS='idle')
+    calls = [json.loads(line) for line in log.read_text().splitlines()]
+    prompts = [c for c in calls if c[:2] == ['agent', 'prompt']]
+    assert len(prompts) == 1 and prompts[0][2] == 'coordinator'
+    assert prompts[0][3].splitlines()[0] == 'herdr-fleet 自动通知（非用户消息）'
+    assert 'hello idle' in prompts[0][3] and 'fleet status' in prompts[0][3]
+    assert json.loads(fleet('inbox', '--json').stdout) == []
+    assert json.loads(fleet('inbox', '--all', '--json').stdout)[0]['delivery'] == 'delivered'
+
+
+def test_delivery_busy_then_coordinator_idle_merges(setup):
+    _, fleet, log = setup
+    for slug, pane in [('hello', 'p'), ('other', 'q')]:
+        fleet('new', slug, '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator', NEW_PANE=pane)
+        fleet('event', '--pane', pane, '--status', 'idle', GET_SEQ='12', OTHER_SEQ='12')
+    assert len(json.loads(fleet('inbox', '--json').stdout)) == 2
+    log.write_text('')
+    fleet('event', '--pane', 'coordinator', '--status', 'idle', COORD_STATUS='idle')
+    prompts = [c for line in log.read_text().splitlines() if (c := json.loads(line))[:2] == ['agent', 'prompt']]
+    assert len(prompts) == 1 and all(slug in prompts[0][3] for slug in ('hello', 'other'))
+    assert json.loads(fleet('inbox', '--json').stdout) == []
+
+
+def test_delivery_missing_pane_warns_once(setup):
+    _, fleet, log = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
+    log.write_text('')
+    fleet('event', '--pane', 'p', '--status', 'idle', GET_SEQ='12', COORD_MISSING='1')
+    fleet('event', '--pane', 'coordinator', '--status', 'idle', COORD_MISSING='1')
+    calls = [json.loads(line) for line in log.read_text().splitlines()]
+    assert sum(c[:2] == ['notification', 'show'] for c in calls) == 1
+    assert len(json.loads(fleet('inbox', '--json').stdout)) == 1
+
+
+def test_delivery_unconfirmed_records_failure(setup):
+    _, fleet, _ = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
+    fleet('event', '--pane', 'p', '--status', 'idle', GET_SEQ='12', COORD_STATUS='idle', DELIVERY_RESULT='unknown')
+    event = json.loads(fleet('inbox', '--json').stdout)[0]
+    assert event['attempts'] == 1 and event['last_error']
+
+
+def test_delivery_concurrent_hooks_do_not_repeat_prompt(setup):
+    _, fleet, log = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
+    fleet('event', '--pane', 'p', '--status', 'idle', GET_SEQ='12')
+    log.write_text('')
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(lambda _: fleet('event', '--pane', 'coordinator', '--status', 'idle', COORD_STATUS='idle', DELIVERY_DELAY='0.3'), range(2)))
+    calls = [json.loads(line) for line in log.read_text().splitlines()]
+    assert sum(c[:2] == ['agent', 'prompt'] for c in calls) == 1
+
+
+def test_delivery_does_not_hold_global_lock_during_prompt(setup):
+    _, fleet, log = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
+    fleet('event', '--pane', 'p', '--status', 'idle', GET_SEQ='12')
+    log.write_text('')
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        delivery = pool.submit(fleet, 'event', '--pane', 'coordinator', '--status', 'idle', COORD_STATUS='idle', DELIVERY_DELAY='2')
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and 'agent", "prompt' not in log.read_text():
+            time.sleep(0.02)
+        assert 'agent", "prompt' in log.read_text()
+        assert len(json.loads(fleet('inbox', '--json').stdout)) == 1
+        assert not delivery.done()
+        delivery.result()
+
+
+def test_delivery_truncates_oversized_notice(setup, tmp_path):
+    _, fleet, log = setup
+    gh = tmp_path / 'fake-gh'
+    gh.write_text('#!/usr/bin/env python3\nimport json\nprint(json.dumps([{"url": "x" * 125000}]))\n')
+    gh.chmod(0o755)
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
+    log.write_text('')
+    fleet('event', '--pane', 'p', '--status', 'idle', GET_SEQ='12', COORD_STATUS='idle', FLEET_GH=str(gh))
+    prompts = [c for line in log.read_text().splitlines() if (c := json.loads(line))[:2] == ['agent', 'prompt']]
+    assert len(prompts[0][3].encode()) < 131071
+    assert '另有 1 个任务' in prompts[0][3] and 'fleet status' in prompts[0][3]
 
 
 def starts(log):

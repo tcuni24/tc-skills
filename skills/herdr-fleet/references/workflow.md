@@ -54,6 +54,7 @@ fleet send my-task '补充要求'
 fleet open my-task [--agent devin] [--agent-arg=--flag] # tab 丢失后重建；已有 tab 时只切过去
 fleet inbox [--all] [--json]             # 待投递事件；--all 包含已投递历史
 fleet bind                               # 将当前项目的任务改绑到当前 pane
+fleet event --pane PANE --status STATUS  # 处理状态边沿（供插件钩子调用）
 fleet done my-task [--dry-run]           # 预检并预览，或删除 worktree、已合并分支和 tab
 fleet gc [--apply]                       # 报告所有仓库的全部 worktree（包括不在 worktrees/<slug>/ 下的旧位置），默认只读
 ```
@@ -65,6 +66,8 @@ fleet gc [--apply]                       # 报告所有仓库的全部 worktree�
 `peek` 和 `send` 按 tab 找到任务 agent 所在的 pane，再对 pane 操作。`herdr agent list` 里的 `agent` 字段是种类（如 `pi`），多个任务同时用 pi 时不唯一。
 
 `new` 和 `open` 在设置了 `HERDR_PANE_ID` 时将该主 agent pane 记为 `coordinator_pane`。`bind` 将当前项目所有任务改绑到当前 pane，待投递事件也改绑；已投递历史保留原目标。旧任务没有此字段时仍可使用。pane 索引和收件箱位于 `$XDG_STATE_HOME/herdr-fleet/`（默认 `~/.local/state/herdr-fleet/`），不占用任务目录；读写通过文件锁协调，`done` 清除对应记录，`--dry-run` 不清除。收件箱记录项目根、任务、目标 pane、终态、时间、去重键、投递状态、尝试次数和最近错误。`inbox` 不改变状态。
+
+`event` 接受 `working`、`idle`、`done`、`blocked`、`exited`。任务每次成功提交以 `submit_seq` 为轮次基线；working 边沿也可开始手动输入的下一轮。只记录晚于基线且尚未通知的终态，重复和过期边沿不重复入箱。主 agent 为 idle/done 时尝试投递，否则保留待投递；主 agent 的 idle/done 边沿会合并投递待投递事件。投递须得到 `agent_prompted` 确认，失败时保留记录和错误；pane 不存在时显示一次 herdr 通知。通知只是触发器，须用 `fleet status` 核查。`event` 由后续插件调用；仅安装本命令不会自动订阅事件。
 
 `new` 要求任务 agent 在最终回复中输出回报块：
 
