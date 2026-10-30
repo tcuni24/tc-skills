@@ -46,7 +46,7 @@ dir = "backend"
 
 ```sh
 fleet new my-task --agent devin --agent-arg=--model --agent-arg example --prompt '需求描述' # --agent none 不启动 agent；--agent-arg 可重复
-fleet ls                                 # 任务、tab、agent 状态、dirty、ahead/behind、合并状态；--json；--fetch 先 fetch
+fleet ls                                 # 任务、tab、agent、状态、阶段、仓库；--json；--fetch 先 fetch
 fleet status my-task [--lines N] [--json] # 提交、diff 统计、未提交文件、PR、agent 最近输出；默认 12 行，0 不显示，负数报错
 fleet wait my-task [--timeout SEC]       # 等待 idle/done/blocked
 fleet peek my-task [--lines N]           # 任务 agent 的最近输出
@@ -64,7 +64,7 @@ fleet gc [--apply]                       # 报告所有仓库的全部 worktree�
 
 herdr 可执行文件依次取 `FLEET_HERDR`、`HERDR_BIN_PATH`，都没有时用 `herdr`。
 PR 查询用 `FLEET_GH` 指定可执行文件，默认 `gh`；失败或超时显示未知，不阻塞收尾。`ls --json` 保留原有键，新增 `agent_kind` 和 `phase`，出错时新增 `error`。
-`ls` 表格包含 tab 列，tab 存在但没有 agent 时可与没有 tab 区分。`status` 的文本和 JSON 在仓库异常时显示 `phase=error` 和原因，尽力保留其他仓库的信息，返回码为 0（与 `ls` 一致）。
+`ls` 文本表格列为任务、tab、agent（种类）、状态、阶段（phase 英文原值）、仓库；tab 存在但没有 agent 时可与没有 tab 区分。仓库按 `web 领先1 落后2 未提交3 未合并` 显示，仅在数量大于零时显示领先、落后和未提交；合并状态显示为未合并、已合并、已合并(squash)、无提交或未知。多个仓库以 `；` 分隔，仓库错误显示原错误文本；无任务时显示 `没有任务`，`--json` 仍输出 `[]`。`status` 的文本和 JSON 在仓库异常时显示 `phase=error` 和原因，尽力保留其他仓库的信息，返回码为 0（与 `ls` 一致）。
 
 phase 按以下顺序判断（仓库异常时为 `error`）：
 
