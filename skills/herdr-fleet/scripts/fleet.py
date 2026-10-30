@@ -7,6 +7,7 @@ holding .herdr-fleet.toml (or FLEET_ROOT); see references/workflow.md.
 """
 import argparse
 import datetime
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -17,6 +18,8 @@ import sys
 import tempfile
 import time
 import tomllib
+from contextlib import contextmanager
+from typing import Literal, TypedDict
 
 CONFIG = '.herdr-fleet.toml'
 HERDR = os.environ.get('FLEET_HERDR') or os.environ.get('HERDR_BIN_PATH') or 'herdr'
@@ -29,6 +32,18 @@ SETTINGS = {}
 
 class SubmissionError(RuntimeError):
     pass
+
+
+class InboxEvent(TypedDict):
+    root: str
+    slug: str
+    coordinator_pane: str
+    status: str
+    created: str
+    dedup_key: str
+    delivery: Literal['pending', 'delivered']
+    attempts: int
+    last_error: str | None
 
 
 def run(*args, cwd=None, check=True, input=None):
@@ -191,6 +206,79 @@ def save(data):
     path.write_text(before + '```json\n' + json.dumps(data, ensure_ascii=False, indent=2) + '\n```' + after)
 
 
+@contextmanager
+def fleet_state(write=False):
+    directory = Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local/state') / 'herdr-fleet'
+    directory.mkdir(parents=True, exist_ok=True)
+    with (directory / 'lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        def read(name, default):
+            path = directory / name
+            return json.loads(path.read_text()) if path.exists() else default
+        panes, inbox = read('panes.json', {}), read('inbox.json', [])
+        yield panes, inbox
+        if write:
+            for name, value in (('panes.json', panes), ('inbox.json', inbox)):
+                with tempfile.NamedTemporaryFile(mode='w', dir=directory, delete=False) as out:
+                    json.dump(value, out, ensure_ascii=False, indent=2)
+                    temp = out.name
+                os.replace(temp, directory / name)
+
+
+def prune_coordinators(panes):
+    active = {d.get('coordinator_pane') for d in tasks()}
+    for pane, entry in list(panes.items()):
+        if entry.get('root') == str(ROOT) and entry.get('role') == 'coordinator' and pane not in active:
+            del panes[pane]
+
+
+def register_task(data, pane):
+    coordinator = os.environ.get('HERDR_PANE_ID')
+    if not coordinator:
+        return
+    with fleet_state(write=True) as (panes, inbox):
+        data['coordinator_pane'] = coordinator
+        save(data)
+        for old, entry in list(panes.items()):
+            if entry == {'root': str(ROOT), 'slug': data['slug'], 'role': 'task'}:
+                del panes[old]
+        panes[pane] = {'root': str(ROOT), 'slug': data['slug'], 'role': 'task'}
+        panes[coordinator] = {'root': str(ROOT), 'role': 'coordinator'}
+        prune_coordinators(panes)
+
+
+def bind():
+    coordinator = os.environ.get('HERDR_PANE_ID')
+    if not coordinator:
+        raise RuntimeError('请在 herdr pane 中运行 fleet bind')
+    tabs, agents = herdr_state()
+    with fleet_state(write=True) as (panes, inbox):
+        current = tasks()
+        for data in current:
+            data['coordinator_pane'] = coordinator
+            save(data)
+            tab = find_tab(data['slug'], tabs)
+            agent = next((item for item in agents if tab and item.get('tab_id') == tab['tab_id']), None)
+            if agent:
+                for pane, entry in list(panes.items()):
+                    if entry == {'root': str(ROOT), 'slug': data['slug'], 'role': 'task'}:
+                        del panes[pane]
+                panes[agent['pane_id']] = {'root': str(ROOT), 'slug': data['slug'], 'role': 'task'}
+        slugs = {data['slug'] for data in current}
+        for event in inbox:
+            if event.get('root') == str(ROOT) and event.get('slug') in slugs and event.get('delivery') == 'pending':
+                event['coordinator_pane'] = coordinator
+        if current:
+            panes[coordinator] = {'root': str(ROOT), 'role': 'coordinator'}
+        prune_coordinators(panes)
+
+
+def inbox_list(a):
+    with fleet_state() as (_, inbox):
+        events = [event for event in inbox if event.get('root') == str(ROOT) and (a.all or event.get('delivery') == 'pending')]
+    display(events, a.json)
+
+
 def submit(data, pane, text):
     agent = herdr('agent', 'get', pane)['agent']
     if agent['agent_status'] == 'blocked':
@@ -293,6 +381,7 @@ def create_tab(data, agent, focus=False, explicit=None, prompt=None):
     except Exception:
         herdr('tab', 'close', tid)
         raise
+    register_task(data, pane)
     if prompt and agent['kind'] != 'none':
             context = [f'任务目录：{dest}']
             for key, details in data['repos'].items():
@@ -653,6 +742,12 @@ def done(a):
         git(repo, 'worktree', 'prune')
     (dest / 'TASK.md').unlink()
     dest.rmdir()
+    with fleet_state(write=True) as (panes, inbox):
+        for pane, entry in list(panes.items()):
+            if entry == {'root': str(ROOT), 'slug': a.slug, 'role': 'task'}:
+                del panes[pane]
+        inbox[:] = [event for event in inbox if not (event.get('root') == str(ROOT) and event.get('slug') == a.slug)]
+        prune_coordinators(panes)
     print('完成', flush=True)
     if tab:
         herdr('tab', 'close', tab['tab_id'])
@@ -726,6 +821,8 @@ def main():
     o.add_argument('--agent-arg', action='append', metavar='ARG', help='agent 启动参数，可重复；以 - 开头的值须写成 --agent-arg=--flag')
     d = sub.add_parser('done'); d.add_argument('slug'); d.add_argument('--force', action='store_true'); d.add_argument('--discard', action='store_true'); d.add_argument('--no-fetch', action='store_true'); d.add_argument('--dry-run', action='store_true')
     g = sub.add_parser('gc'); g.add_argument('--apply', action='store_true'); g.add_argument('--json', action='store_true')
+    i = sub.add_parser('inbox'); i.add_argument('--all', action='store_true'); i.add_argument('--json', action='store_true')
+    sub.add_parser('bind')
     a = p.parse_args()
     try:
         ROOT = find_root()
@@ -736,12 +833,18 @@ def main():
         elif a.command == 'wait': return wait(a)
         elif a.command == 'done': return done(a)
         elif a.command == 'gc': gc(a)
+        elif a.command == 'inbox': inbox_list(a)
+        elif a.command == 'bind': bind()
         elif a.command == 'peek': print(herdr('agent', 'read', task_agent(a.slug), '--source', 'recent-unwrapped', '--lines', a.lines, json_output=False))
         elif a.command == 'send': submit(load(a.slug), task_agent(a.slug), a.text)
         elif a.command == 'open':
             data = load(a.slug)
-            tab = find_tab(a.slug, herdr_state()[0])
-            if tab: herdr('tab', 'focus', tab['tab_id'])
+            tabs, agents = herdr_state()
+            tab = find_tab(a.slug, tabs)
+            if tab:
+                herdr('tab', 'focus', tab['tab_id'])
+                live = next((agent for agent in agents if agent.get('tab_id') == tab['tab_id']), None)
+                if live: register_task(data, live['pane_id'])
             else:
                 agent = agent_options(a, data)
                 if create_tab(data, agent, focus=True):

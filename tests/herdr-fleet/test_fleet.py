@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -47,7 +48,7 @@ elif args[:2] == ['agent', 'wait']:
     result = {}  # The real wait response schema is not specified by --help.
 elif args[:2] == ['agent', 'read']:
     print(os.environ.get('AGENT_OUTPUT', 'agent output tail')); sys.exit(0)
-elif args[:2] == ['tab', 'create']: result = {'tab': {'tab_id': 't'}, 'root_pane': {'pane_id': 'p'}}
+elif args[:2] == ['tab', 'create']: result = {'tab': {'tab_id': 't'}, 'root_pane': {'pane_id': os.environ.get('NEW_PANE', 'p')}}
 elif args[:2] == ['pane', 'split']: result = {'pane': {'pane_id': 'q'}}
 else: result = {}
 print(json.dumps({'result': result}))
@@ -86,8 +87,8 @@ def setup(tmp_path):
     fake = tmp_path / 'herdr'
     fake.write_text(FAKE_HERDR)
     fake.chmod(0o755)
-    env = {k: v for k, v in os.environ.items() if k not in ('HERDR_BIN_PATH', 'FLEET_ROOT')}
-    env.update(FLEET_ROOT=str(root), FLEET_HERDR=str(fake), LOG=str(tmp_path / 'log'), HERDR_ENV='1', HERDR_WORKSPACE_ID='w')
+    env = {k: v for k, v in os.environ.items() if k not in ('HERDR_BIN_PATH', 'FLEET_ROOT', 'HERDR_PANE_ID')}
+    env.update(FLEET_ROOT=str(root), FLEET_HERDR=str(fake), LOG=str(tmp_path / 'log'), HERDR_ENV='1', HERDR_WORKSPACE_ID='w', XDG_STATE_HOME=str(tmp_path / 'state'))
 
     def fleet(*args, check=True, cwd=None, drop=(), **updates):
         run_env = {k: v for k, v in {**env, **updates}.items() if k not in drop}
@@ -171,6 +172,66 @@ def test_round_wait_multiple_and_blocked(setup):
 def task_data(root, slug):
     text = (root / 'worktrees' / slug / 'TASK.md').read_text()
     return json.loads(text.split('```json\n', 1)[1].split('\n```', 1)[0])
+
+
+def test_registration_open_and_dry_run(setup):
+    root, fleet, log = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', HERDR_PANE_ID='coordinator')
+    assert task_data(root, 'hello')['coordinator_pane'] == 'coordinator'
+    index = json.loads((log.parent / 'state/herdr-fleet/panes.json').read_text())
+    assert index['p'] == {'root': str(root), 'slug': 'hello', 'role': 'task'}
+    assert index['coordinator'] == {'root': str(root), 'role': 'coordinator'}
+    assert {p.name for p in (root / 'worktrees/hello').iterdir()} == {'TASK.md', 'web'}
+    fleet('done', 'hello', '--dry-run', '--no-fetch')
+    fleet('open', 'hello', NOTAB='1', NEW_PANE='new-task', HERDR_PANE_ID='new-coordinator')
+    assert task_data(root, 'hello')['coordinator_pane'] == 'new-coordinator'
+    index = json.loads((log.parent / 'state/herdr-fleet/panes.json').read_text())
+    assert 'p' not in index and 'coordinator' not in index
+    assert index['new-task']['slug'] == 'hello' and 'new-coordinator' in index
+
+
+def test_inbox_bind_and_cleanup(setup):
+    root, fleet, log = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', HERDR_PANE_ID='old')
+    path = log.parent / 'state/herdr-fleet/inbox.json'
+    events = [dict(root=str(root), slug='hello', coordinator_pane='old', status=s, delivery=d,
+                   created='2026-01-01', dedup_key=str(i), attempts=0, last_error=None)
+              for i, (s, d) in enumerate([('idle', 'pending'), ('blocked', 'delivered')])]
+    path.write_text(json.dumps(events))
+    before = path.read_bytes()
+    assert json.loads(fleet('inbox', '--json').stdout) == events[:1]
+    assert json.loads(fleet('inbox', '--all', '--json').stdout) == events
+    assert 'hello' in fleet('inbox').stdout and path.read_bytes() == before
+    fleet('bind', HERDR_PANE_ID='new')
+    assert task_data(root, 'hello')['coordinator_pane'] == 'new'
+    assert [event['coordinator_pane'] for event in json.loads(path.read_text())] == ['new', 'old']
+    fleet('done', 'hello', '--no-fetch')
+    assert json.loads(path.read_text()) == []
+    assert not json.loads((path.parent / 'panes.json').read_text())
+
+
+def test_concurrent_done_preserves_unrelated_inbox_records(setup):
+    root, fleet, log = setup
+    for slug in ('hello', 'other'):
+        fleet('new', slug, '-r', 'web', '--no-fetch', HERDR_PANE_ID='coordinator', NEW_PANE=slug)
+    path = log.parent / 'state/herdr-fleet/inbox.json'
+    events = [dict(root=str(root), slug=s, coordinator_pane='coordinator', status='idle', delivery='pending',
+                   created='2026-01-01', dedup_key=s, attempts=0, last_error=None) for s in ('hello', 'other', 'keep')]
+    path.write_text(json.dumps(events))
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda s: fleet('done', s, '--no-fetch'), ('hello', 'other')))
+    assert all(r.returncode == 0 for r in results)
+    assert json.loads(path.read_text()) == events[2:]
+
+
+def test_legacy_task_without_coordinator_and_bind_requires_pane(setup):
+    root, fleet, log = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch')
+    assert 'coordinator_pane' not in task_data(root, 'hello')
+    assert fleet('bind', check=False).returncode == 1
+    assert json.loads(fleet('inbox', '--json').stdout) == []
+    fleet('done', 'hello', '--no-fetch')
+    assert not (root / 'worktrees/hello').exists()
 
 
 def starts(log):
