@@ -1124,6 +1124,8 @@ def report_fixture(name):
     ('FLEET-REPORT\nold\nEND FLEET-REPORT\nFLEET-REPORT\nincomplete', 'FLEET-REPORT\nold\nEND FLEET-REPORT'),
     ('nothing', None),
     ('前文\n   FLEET-REPORT\n   结果：完成\n     - 细节\n   END FLEET-REPORT', 'FLEET-REPORT\n结果：完成\n  - 细节\nEND FLEET-REPORT'),
+    ('   FLEET-REPORT\n   结果：完成\n     - 细节\n   END FLEET-REPORT', 'FLEET-REPORT\n结果：完成\n  - 细节\nEND FLEET-REPORT'),
+    ('   FLEET-REPORT 结果：完\n   成 END FLEET-REPORT', 'FLEET-REPORT 结果：完\n成 END FLEET-REPORT'),
     ('前文\n\tFLEET-REPORT\n\t结果：完成\n\tEND FLEET-REPORT', 'FLEET-REPORT\n结果：完成\nEND FLEET-REPORT'),
     ('前文\nFLEET-REPORT 结果：完成 PR：无 END FLEET-REPORT', 'FLEET-REPORT 结果：完成 PR：无 END FLEET-REPORT'),
     ('前文\n FLEET-REPORT 结果：完\n 成 END FLEET-REPORT', 'FLEET-REPORT 结果：完\n成 END FLEET-REPORT'),

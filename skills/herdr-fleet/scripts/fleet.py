@@ -856,6 +856,14 @@ REPORT_START = re.compile(r'^[ \t]*FLEET-REPORT(?![A-Za-z0-9_-])', re.M)
 REPORT_END = re.compile(r'(?<![A-Za-z0-9_-])END FLEET-REPORT(?![A-Za-z0-9_-])')
 
 
+def agent_output(pane, lines):
+    p = subprocess.run([HERDR, 'agent', 'read', pane, '--source', 'recent-unwrapped', '--lines', str(lines)], capture_output=True, text=True)
+    if p.returncode:
+        raise RuntimeError(f"命令失败 herdr agent read {pane}: {p.stderr.strip()}")
+    # rstrip only: leading whitespace carries the report block's own indentation.
+    return p.stdout.rstrip()
+
+
 def last_report(output):
     marks = [(m.start(), m.end(), True) for m in REPORT_START.finditer(output)]
     marks += [(m.start(), m.end(), False) for m in REPORT_END.finditer(output)]
@@ -894,7 +902,7 @@ def status(a):
             del row['repos'][key]
     tab = find_tab(a.slug, tabs)
     agent = next((x for x in agents if tab and x.get('tab_id') == tab['tab_id']), None)
-    row['agent_output'] = herdr('agent', 'read', agent['pane_id'], '--source', 'recent-unwrapped', '--lines', a.lines, json_output=False) if agent and a.lines else ''
+    row['agent_output'] = agent_output(agent['pane_id'], a.lines) if agent and a.lines else ''
     row['report'] = last_report(row['agent_output'])
     if a.json:
         print(json.dumps(row, ensure_ascii=False, indent=2)); return
@@ -1135,7 +1143,7 @@ def main():
         elif a.command == 'bind': bind()
         elif a.command == 'doctor': return doctor()
         elif a.command == 'event': event(a)
-        elif a.command == 'peek': print(herdr('agent', 'read', task_agent(a.slug), '--source', 'recent-unwrapped', '--lines', a.lines, json_output=False))
+        elif a.command == 'peek': print(agent_output(task_agent(a.slug), a.lines))
         elif a.command == 'send': submit(load(a.slug), task_agent(a.slug), a.text)
         elif a.command == 'open':
             data = load(a.slug)
