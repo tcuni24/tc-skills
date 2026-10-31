@@ -176,7 +176,7 @@ PR 合并只说明成果已交付，协调者的收尾对象还有任务 tab、�
 在 `fleet ls` 显示 merged（或用户确认放弃）且任务 agent 已停写之后。停写须有成功观察为据：`wait` 观察到终态返回（idle/done 为 0、blocked 为 3），或 `status`/`ls`/`peek` 显示 idle/done/已退出且无仍在产生的输出；`wait` 超时（4）与出错（1）不能充当停写证据，`exited` 不经 `wait` 判定，由通知、`ls`、`peek` 观察：
 
 1. 逐仓库真实核查：`fleet status <slug>` 看提交、diff 统计、未提交文件与 PR 三态，对照 `fleet ls` 的 phase；不凭通知或记忆下结论。
-2. 依赖核查：本 worktree 的内容、共享 venv、软链是否还被其他任务或进程引用。`done` 只摘除本 worktree 里 `shared` 配置项的出向软链（指向主 checkout），不会像 `gc --apply` 那样改指其他 worktree 指进来的入向依赖；`fleet gc` 只读报告的 `dependents` 列即各 worktree 的入向消费者，再 `readlink` 核实指向。有消费者时先按「任务目录含额外文件」一节解决依赖或写明保留条件，不能先 `done` 事后才发现。
+2. 依赖核查：本 worktree 的内容、共享 venv、软链是否还被其他任务或进程引用。`done` 只摘除本 worktree 里 `shared` 配置项的出向软链（指向主 checkout），不会像 `gc --apply` 那样改指其他 worktree 指进来的入向依赖。`fleet gc` 报告的 `dependents` 列只覆盖一种入向形式：其他 worktree 根下、名字恰为配置 `shared` 项、且解析后落在本 worktree 内的符号链接——其他位置的软链、非链接的路径引用（如共享 venv、写死的产物路径）和进程占用都不在统计内，`dependents` 为空不能当作无依赖证据，须另行核实（如扫描指向本任务路径的符号链接与引用，或询问任务 agent）。有消费者时先按「任务目录含额外文件」一节解决依赖或写明保留条件，不能先 `done` 事后才发现。
 3. `fleet done <slug> --dry-run` 预览：逐仓库看是"将删除"还是"被拒绝"。
 4. `fleet done <slug>` 执行：先摘除 worktree 内指向主 checkout 的共享软链，再删 worktree；merged/no-commits 删本地分支，unmerged 保留分支（需 `--force`，属放弃授权）；删 `TASK.md`、任务目录和 pane/收件箱记录；关闭存在的 tab。`done` 只动本地分支，不删远端分支。
 5. 收尾后再核查：`fleet ls` 中该任务已消失；各主 checkout 里 `git worktree list` 不再列出这些 worktree、`git branch` 不再有已删分支；tab 已关闭；`git status` 确认主 checkout 未被改动；其他任务的 worktree 与分支不受影响。
