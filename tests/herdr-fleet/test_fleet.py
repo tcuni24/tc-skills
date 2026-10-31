@@ -11,6 +11,7 @@ import pytest
 
 SKILL = Path(__file__).resolve().parents[2] / 'skills' / 'herdr-fleet'
 SCRIPT = SKILL / 'scripts' / 'fleet.py'
+FIXTURES = Path(__file__).resolve().parent / 'fixtures'
 
 CONFIG = '''agent = "pi"
 
@@ -1266,12 +1267,31 @@ def test_delivery_notice_marks_unknown_and_mixed_pr(setup, tmp_path):
     assert next(line for line in prompts[0][3].splitlines() if line.startswith('nope')).endswith(' -')
 
 
+def report_fixture(name):
+    # 真实 agent_output 裁剪件与其对应的期望回报块（*.report.txt），来源见各文件首行
+    return (FIXTURES / f'{name}.txt').read_text(), (FIXTURES / f'{name}.report.txt').read_text().rstrip('\n')
+
+
 @pytest.mark.parametrize(('output', 'expected'), [
     ('before\nFLEET-REPORT\n结果：完成\nEND FLEET-REPORT\nafter', 'FLEET-REPORT\n结果：完成\nEND FLEET-REPORT'),
     ('FLEET-REPORT\nold\nEND FLEET-REPORT\nFLEET-REPORT\nnew\nEND FLEET-REPORT', 'FLEET-REPORT\nnew\nEND FLEET-REPORT'),
     ('FLEET-REPORT\nincomplete', None),
     ('FLEET-REPORT\nold\nEND FLEET-REPORT\nFLEET-REPORT\nincomplete', 'FLEET-REPORT\nold\nEND FLEET-REPORT'),
     ('nothing', None),
+    ('前文\n   FLEET-REPORT\n   结果：完成\n     - 细节\n   END FLEET-REPORT', 'FLEET-REPORT\n结果：完成\n  - 细节\nEND FLEET-REPORT'),
+    ('   FLEET-REPORT\n   结果：完成\n     - 细节\n   END FLEET-REPORT', 'FLEET-REPORT\n结果：完成\n  - 细节\nEND FLEET-REPORT'),
+    ('   FLEET-REPORT 结果：完\n   成 END FLEET-REPORT', 'FLEET-REPORT 结果：完\n成 END FLEET-REPORT'),
+    ('前文\n\tFLEET-REPORT\n\t结果：完成\n\tEND FLEET-REPORT', 'FLEET-REPORT\n结果：完成\nEND FLEET-REPORT'),
+    ('前文\nFLEET-REPORT 结果：完成 PR：无 END FLEET-REPORT', 'FLEET-REPORT 结果：完成 PR：无 END FLEET-REPORT'),
+    ('前文\n FLEET-REPORT 结果：完\n 成 END FLEET-REPORT', 'FLEET-REPORT 结果：完\n成 END FLEET-REPORT'),
+    ('FLEET-REPORT-EXAMPLE\n结果：完成\nEND FLEET-REPORT', None),
+    ('FLEET-REPORT\n结果：完成\nEND FLEET-REPORT-EXAMPLE', None),
+    ('前奏 FLEET-REPORT\n结果：完成\nEND FLEET-REPORT', None),
+    ('FLEET-REPORT\n结果：完成\nAPPEND FLEET-REPORT', None),
+    ('FLEET-REPORT\n结果：完成\nEND FLEET-REPORT\nFLEET-REPORT\n结果：覆盖\nEND FLEET-REPORT-EXAMPLE', 'FLEET-REPORT\n结果：完成\nEND FLEET-REPORT'),
+    ('FLEET-REPORT\n结果：弃\nFLEET-REPORT\n结果：新\nEND FLEET-REPORT', 'FLEET-REPORT\n结果：新\nEND FLEET-REPORT'),
+    report_fixture('agent-output-markdown-folded'),
+    report_fixture('agent-output-fenced-indented'),
 ])
 def test_status_report_blocks(setup, output, expected):
     _, fleet, _ = setup

@@ -77,7 +77,7 @@ fleet gc [--apply]                       # 报告所有仓库的全部 worktree�
 
 仅在真机 herdr 0.9.1 上实测，`state_change_seq` 跨 pane 全局递增（多个 pane 间从 9185 到 9238），新 pane 不复用旧序号；因此该版本中 `open` 重建后保留旧 `submit_seq`/`event_round` 不会因序号复用而误去重。
 
-`new` 要求任务 agent 在最终回复中输出回报块：
+`new` 要求任务 agent 在最终回复中输出回报块，并放进 `` ```text `` fenced code block：
 
 ```text
 FLEET-REPORT
@@ -89,7 +89,9 @@ PR：链接或无
 END FLEET-REPORT
 ```
 
-`status` 从所读取的最近输出中摘取最后一个完整回报块，文本显示在「回报」一节，JSON 的 `report` 为原文或 `null`。只有开头没有结尾不算完整块；输出行数不足可能截断回报，可增大 `--lines`。`--lines 0` 不读取 agent 输出，也不摘取回报块。`send` 的补充说明不改变回报要求。
+普通 Markdown 段落会把单换行折叠成一段（字段和标记挤在同一逻辑行），fenced code block 才能保留逐行字段；解析器按原样摘取文本，不还原被折叠的换行语义。
+
+`status` 从所读取的最近输出中摘取最后一个完整回报块：开始标记是行首的 `FLEET-REPORT`（允许前导空白），结束标记是 `END FLEET-REPORT` 子串（可跟在字段内容同一行）。标记不得与字母、数字、`-`、`_` 直接相邻，因此 `FLEET-REPORT-EXAMPLE`、`APPEND FLEET-REPORT` 之类不算标记。摘取结果做 dedent：去掉各行公共前导空白，字段自身的缩进和已有换行保留。文本显示在「回报」一节，JSON 的 `report` 为原文或 `null`。只有开头没有结尾不算完整块，末尾未闭合的块不会盖掉前一个完整块；输出行数不足可能截断回报，可增大 `--lines`。`--lines 0` 不读取 agent 输出，也不摘取回报块。`send` 的补充说明不改变回报要求。
 
 herdr 可执行文件依次取 `FLEET_HERDR`、`HERDR_BIN_PATH`，都没有时用 `herdr`。
 PR 查询用 `FLEET_GH` 指定可执行文件，默认 `gh`。fleet 以 `pr list --head <分支> --state all --json number,url,state --limit 1` 调用它（工作目录为该仓库主 checkout），期望输出与 `gh pr list` 相同的 JSON 数组：空数组表示没有 PR；每项须是含 `number`（正整数）、`url`（非空字符串）、`state`（非空字符串，不限枚举）的对象；查询失败要以非零退出码结束并在 stderr 写明原因。对接其他代码托管时，`FLEET_GH` 可指向满足同一参数与输出契约的适配程序；该适配程序的失败同样只产生 unknown，不影响任务信息展示。
