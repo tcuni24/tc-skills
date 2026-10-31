@@ -415,13 +415,34 @@ def doctor():
     return 0 if ok and not pending else 1
 
 
-def task_event(a):
+def task_event(a, slug):
+    """Record a pane event for `slug`; the caller holds task_lock(slug).
+
+    The `agent get` query runs under only the per-task lock — the cross-task
+    state lock is never held while calling herdr (the same discipline the
+    deliver path documents below), so a stalled IPC queues at most this
+    task's own send/event, not other tasks' events or inbox. The write phase
+    then re-checks that the pane still names this task and reloads TASK.md,
+    so round/dedup/supersede decisions use the latest state.
+    """
+    try:
+        data = load(slug)
+    except RuntimeError:
+        return
+    if not data.get('coordinator_pane'):
+        return
+    seq = status = None
+    if a.status != 'exited':
+        agent = herdr('agent', 'get', a.pane)['agent']
+        seq = agent['state_change_seq']
+        if not isinstance(seq, int):
+            raise RuntimeError('agent 未提供有效的 state_change_seq')
+        status = agent['agent_status']
     with fleet_state(write=True) as (panes, inbox):
-        entry = panes.get(a.pane)
-        if not entry or entry.get('role') != 'task' or entry.get('root') != str(ROOT):
+        if not task_index_matches(panes.get(a.pane) or {}, slug):
             return
         try:
-            data = load(entry['slug'])
+            data = load(slug)
         except RuntimeError:
             return
         coordinator = data.get('coordinator_pane')
@@ -431,13 +452,7 @@ def task_event(a):
         if a.status == 'exited':
             if not round_state or round_state['notified']:
                 return
-            seq = None
         else:
-            agent = herdr('agent', 'get', a.pane)['agent']
-            seq = agent['state_change_seq']
-            if not isinstance(seq, int):
-                raise RuntimeError('agent 未提供有效的 state_change_seq')
-            status = agent['agent_status']
             if a.status == 'working':
                 if status not in ('working', 'idle', 'done', 'blocked'):
                     return
@@ -667,7 +682,7 @@ def event(a):
     if entry.get('role') != 'task' or entry.get('root') != str(ROOT):
         return
     with task_lock(entry['slug']):
-        target = task_event(a)
+        target = task_event(a, entry['slug'])
     if target:
         deliver(target)
 
