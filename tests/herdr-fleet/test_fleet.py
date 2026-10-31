@@ -97,6 +97,7 @@ elif mode == 'bad-json': print('oops'); sys.exit(0)
 elif mode == 'dict': print(json.dumps({'prs': []})); sys.exit(0)
 elif mode == 'missing-keys': print(json.dumps([{'number': 12}])); sys.exit(0)
 elif mode == 'found': print(json.dumps([{'number': 12, 'url': 'https://example.test/pr/12', 'state': 'OPEN'}])); sys.exit(0)
+elif mode == 'raw': print(os.environ.get('GH_OUTPUT', '[]')); sys.exit(0)
 print('[]')
 '''
 
@@ -1167,6 +1168,42 @@ def test_status_pr_query_states(setup, tmp_path, mode, state, error):
         assert 'PR: 无' in text and '查询失败' not in text
     else:
         assert 'PR: 未知（查询失败：' in text and error in text
+
+
+@pytest.mark.parametrize('item,bad', [
+    ({'number': 12, 'url': {}, 'state': 'OPEN'}, 'url'),
+    ({'number': 12, 'url': ['https://example.test/pr/12'], 'state': 'OPEN'}, 'url'),
+    ({'number': 12, 'url': None, 'state': 'OPEN'}, 'url'),
+    ({'number': 12, 'url': '', 'state': 'OPEN'}, 'url'),
+    ({'number': True, 'url': 'https://example.test/pr/12', 'state': 'OPEN'}, 'number'),
+    ({'number': '12', 'url': 'https://example.test/pr/12', 'state': 'OPEN'}, 'number'),
+    ({'number': 0, 'url': 'https://example.test/pr/12', 'state': 'OPEN'}, 'number'),
+    ({'number': 12, 'url': 'https://example.test/pr/12', 'state': 12}, 'state'),
+    ({'number': 12, 'url': 'https://example.test/pr/12', 'state': ''}, 'state'),
+])
+def test_status_pr_field_types(setup, tmp_path, item, bad):
+    root, fleet, _ = setup
+    gh = fake_gh(tmp_path)
+    fleet('new', 'hello', '-r', 'web', '--no-fetch')
+    env = {'FLEET_GH': str(gh), 'GH_MODE': 'raw', 'GH_OUTPUT': json.dumps([item])}
+    repo = json.loads(fleet('status', 'hello', '--json', '--lines', '0', **env).stdout)['repos']['web']
+    assert repo['pr_state'] == 'unknown' and repo['pr'] is None and bad in repo['pr_error']
+    text = fleet('status', 'hello', '--lines', '0', **env).stdout
+    assert 'PR: 未知（查询失败：' in text
+
+
+def test_delivery_notice_bad_pr_fields_marks_unknown(setup, tmp_path):
+    _, fleet, log = setup
+    gh = fake_gh(tmp_path)
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
+    log.write_text('')
+    result = fleet('event', '--pane', 'p', '--status', 'idle', GET_SEQ='12', COORD_STATUS='idle',
+                   FLEET_GH=str(gh), GH_MODE='raw', GH_OUTPUT='[{"number":12,"url":{},"state":"OPEN"}]')
+    assert result.returncode == 0
+    prompts = [c for line in log.read_text().splitlines() if (c := json.loads(line))[:2] == ['agent', 'prompt']]
+    assert len(prompts) == 1
+    line = next(l for l in prompts[0][3].splitlines() if l.startswith('hello'))
+    assert line.endswith(' ?')
 
 
 def test_status_pr_query_timeout(setup, tmp_path):

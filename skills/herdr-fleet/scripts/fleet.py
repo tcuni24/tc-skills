@@ -869,8 +869,17 @@ def pr_info(repo, branch):
     except ValueError:
         return {'state': 'unknown', 'pr': None, 'error': '输出不是合法 JSON'}
     fields = {'number', 'url', 'state'}
-    if not isinstance(result, list) or not all(isinstance(item, dict) and fields <= item.keys() for item in result):
+    expected = {'number': lambda v: type(v) is int and v > 0,
+                'url': lambda v: isinstance(v, str) and v != '',
+                'state': lambda v: isinstance(v, str) and v != ''}
+    if not isinstance(result, list):
         return {'state': 'unknown', 'pr': None, 'error': '输出不是预期的 PR 数组'}
+    for i, item in enumerate(result):
+        if not isinstance(item, dict) or not fields <= item.keys():
+            return {'state': 'unknown', 'pr': None, 'error': '输出不是预期的 PR 数组'}
+        bad = next((name for name, ok in expected.items() if not ok(item[name])), None)
+        if bad:
+            return {'state': 'unknown', 'pr': None, 'error': f'第 {i + 1} 项 {bad} 值无效：{item[bad]!r}'[:200]}
     if not result:
         return {'state': 'none', 'pr': None, 'error': None}
     return {'state': 'found', 'pr': result[0], 'error': None}
