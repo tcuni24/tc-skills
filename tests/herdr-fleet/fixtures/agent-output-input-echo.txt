@@ -1,4 +1,4 @@
-# 最小化自 docs/reports/herdr-fleet/2026-10-31-devin-perf-parallel/perf-*-initial-status.json 的
+# 最小化自 2026-10-31 Devin 并行性能运行的原始 status 快照；完整原件见 docs/reports/herdr-fleet/README.md。
 # agent_output（任务内容已匿名化，逐行缩进与标记结构按原样保留）：Devin 输入回显以 `❭ ` 起始、
 # 续行 2 空格悬挂缩进，回报模板块混在回显中；其后只有 agent 开场行，尚无回报。
 ⠀⣤⣶⣦⣴⠿⢿⠿⠃  v3000.11.234

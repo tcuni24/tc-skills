@@ -1,6 +1,0 @@
-exit=1
-stdout:
-
-stderr:
-错误：开始确认失败：{"error":{"code":"timeout","message":"timed out waiting for agent status"},"id":"cli:agent:prompt"}
-

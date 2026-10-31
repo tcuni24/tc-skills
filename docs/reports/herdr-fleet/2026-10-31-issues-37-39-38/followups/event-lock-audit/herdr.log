@@ -1,8 +1,0 @@
-["agent", "get", "pa"]
-["tab", "list", "--workspace", "w"]
-["agent", "get", "pb"]
-["agent", "list"]
-["tab", "list", "--workspace", "w"]
-["agent", "get", "coordinator"]
-["agent", "list"]
-["agent", "get", "coordinator"]

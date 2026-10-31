@@ -18,6 +18,8 @@ description: 在 Herdr 里担任并行开发的主 agent（coordinator）：把�
 
 ## 1. 拆分
 
+运行原始材料放在 `${XDG_STATE_HOME:-$HOME/.local/state}/herdr-fleet/runs/<project-key>/<run-id>/`，不要放进仓库；project-key 须稳定地区分项目，run-id 每次唯一且不得覆盖。它是需保留的证据，不是 cache，也不是 inbox runtime state。仓库 `docs/reports` 只留自包含的精选结论；共享完整证据须另行打包。备份位置必须在全部待清理任务目录之外。详见 `references/workflow.md`。
+
 - 一个任务对应一项可以单独验收、单独合并的成果。同一功能涉及多个仓库时放在同一个任务里（`-r web,be`），不要拆成多个 tab。
 - 会改同一批文件、同一个接口或同一份 schema 的需求，要么合并为一个任务，要么串行执行：先开前一个，合并后再开后一个。两个任务不能并行改同一处。
 - 只涉及部分仓库时用 `-r <键>` 只建用得到的 worktree。默认建配置里的全部仓库。

@@ -1,4 +1,4 @@
-# 裁剪自 docs/reports/herdr-fleet/2026-10-30-devin-perf-smoke/backend-status-final-done.json 的 agent_output
+# 裁剪自 2026-10-30 Devin 性能试运行的 backend status agent_output；完整原件见 docs/reports/herdr-fleet/README.md
 # 同一输出含两段完整回报：前段为折叠格式、行中另有 终FLEET-REPORT 提及；取最后一段（fenced text，每行 3 空格缩进）
 次用 curl 建出后随即 PATCH 为正式标题/正文（现为最终态）。
 

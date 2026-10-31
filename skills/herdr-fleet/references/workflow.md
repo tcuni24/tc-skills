@@ -13,6 +13,12 @@
 - **主 agent**（控制 tab，加载本 skill）：拆分需求，`fleet new` 开任务，`fleet ls/peek` 查看情况，`fleet send` 转达指令，`fleet done` 收尾。不写代码。
 - **任务 agent**（任务 tab）：在 `worktrees/<slug>` 中按项目约定实现、测试、提 PR。
 
+## 运行材料与回报边界
+
+原始日志、快照、备份等证据放在 `${XDG_STATE_HOME:-$HOME/.local/state}/herdr-fleet/runs/<project-key>/<run-id>/`。project-key 稳定区分不同项目，run-id 每次唯一、只新增不覆盖；这是保留证据，不是 cache，也不是 pane/inbox runtime state。备份必须在全部待清理任务目录之外，核对后才移出源文件。`docs/reports` 只保留可独立理解的精选结论、命令和限制；本机证据不能跨机器访问，分享完整证据须另行打包并检查敏感信息。
+
+当前回报摘取对 Devin 采用保守判断，来源不明时可能为 null；扩大 `--lines` 或用 `fleet peek` 人工查看，其他 agent 的回显形态未验证。未来方向是正式提交回报，关联任务与轮次、确保完整写入并防止混淆旧回报；该机制尚未设计或实现，收到回报也不等于验收通过。
+
 ## 配置
 
 项目根放一个 `.herdr-fleet.toml`。`fleet` 从当前目录向上找它；也可以用环境变量 `FLEET_ROOT` 指定项目根。

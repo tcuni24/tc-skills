@@ -18,6 +18,12 @@ herdr plugin unlink tc.herdr-fleet
 
 通知未到时，用 `herdr plugin log list` 检查钩子记录，并用 `fleet status <slug>` 核查任务。插件卸载后其他 fleet 命令仍可使用。
 
+## 运行材料
+
+原始证据不是 cache 或 inbox runtime state，按 `${XDG_STATE_HOME:-$HOME/.local/state}/herdr-fleet/runs/<project-key>/<run-id>/` 留在仓库外：project-key 稳定区分项目，run-id 唯一且不覆盖。报告自包含，完整证据需另行打包共享；备份放在全部待清理任务目录之外。操作边界见 [工作流](references/workflow.md#运行材料与回报边界)。
+
+本机历史归档为 `/home/glx/.local/state/herdr-fleet/runs/tc-skills-e9fbca96ba83/archive-migration-20261031T233917Z/original-reports/`，其他机器不能直接访问；按上述 state 路径和项目、运行标识定位。[精选历史报告](../../docs/reports/herdr-fleet/README.md)保留结论与限制。
+
 ## ask_user 扩展（pi）
 
 `extensions/ask-user.ts` 是一个 pi 扩展，注册 `ask_user` 工具和 `/ask-user` 命令。工具在等待用户输入期间经 pi 事件总线发出 `herdr:blocked { active: true, label: <问题> }`，等待结束（回答、取消、中止或出错）后发出一次 `{ active: false }`。herdr 的 pi 集成（`herdr-agent-state.ts`）按 active 计数上报 pane 状态：等待期间显示 blocked（label 作为阻塞原因），恢复后回到 working/idle。扩展与集成的契约是配平计数——只在确实等待过的调用上发 `{ active: false }`，不会提前释放其他 blocked 所有者。未安装集成时事件无人消费，工具退化为普通提问。

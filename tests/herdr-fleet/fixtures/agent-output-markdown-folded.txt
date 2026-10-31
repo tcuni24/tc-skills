@@ -1,4 +1,4 @@
-# 裁剪自 docs/reports/herdr-fleet/2026-10-30-devin-perf-smoke/web-status-done.json 的 agent_output
+# 裁剪自 2026-10-30 Devin 性能试运行的 web status agent_output；完整原件见 docs/reports/herdr-fleet/README.md
 # Devin 普通 Markdown 段落：回报折叠成一个逻辑行后由终端宽度折行，每行带 1 个前导空格
 证据： .cache/perf-build-hygiene/{audit.py,audit-output.txt,asset-case-audit.txt} （gitignored，工作树干净）。
 
