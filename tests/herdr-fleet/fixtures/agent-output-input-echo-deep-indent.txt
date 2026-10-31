@@ -1,0 +1,24 @@
+# 最小化自真实续轮现场（perf-lazy-export pane，结构原样、内容匿名化）：输入文本自带缩进的行在回显中
+# 渲染为更深缩进（≥2，如缩进 JSON 行），整段仍属回显，其中模板不算回报；首个 <2 缩进非空行结束回显后，
+# agent 的 fenced 回报正常摘取。
+ 上一轮叙述文本
+❭ 请按此格式补充证据：
+      "items": [
+        "a",
+        "b"
+      ]
+  FLEET-REPORT
+  结果：
+  PR：
+  END FLEET-REPORT
+  照此格式回报
+ 我先核对结构
+ ✓ Read
+ 证据已补齐，回报：
+   FLEET-REPORT
+   结果：完成
+   PR：https://example.test/pr/3
+   测试：pytest -q → 0
+   证据边界：fixture 证据
+   需要决策：无
+   END FLEET-REPORT

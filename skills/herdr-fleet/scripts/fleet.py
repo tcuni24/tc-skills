@@ -1036,37 +1036,53 @@ def echo_lines(output):
 
     recent-unwrapped carries no role/source field, so attribution can only
     use what the TUI renders. Devin replays a submitted prompt behind a `❭ `
-    glyph and gives every rendered line of that echo its two-cell hanging
-    indent; observed agent output (text, tool lines, fenced report blocks)
-    sits at other indents. Blank lines stay inside a run: an echoed empty
-    input line and the blank the TUI draws after input look identical. A
-    capture that opens with `  `/blank lines may start mid-echo — the `❭`
-    scrolled off — so that leading run is treated as unattributed as well.
+    glyph at column 0 and gives every rendered line of that echo a hanging
+    indent of at least two cells — deeper when the input text itself was
+    indented — so the echo run continues through any `  `+ or blank line
+    and ends at the first non-blank line with less indentation. Agent
+    output (text, tool lines, fenced report blocks) observed in real
+    panes sits at other indents, which is why a `❭` run is only ever
+    closed by a shallower line. Blank lines stay inside a run: an echoed
+    empty input line and the blank the TUI draws after input look
+    identical. A capture that opens with `  `+/blank lines may start
+    mid-echo — the `❭` scrolled off — so that leading run is treated as
+    unattributed as well.
     """
     echo, in_echo = [], True
     for line in output.split('\n'):
-        lead = len(line) - len(line.lstrip(' '))
+        lead = len(line) - len(line.lstrip())
         if line.startswith('❭ '):
             in_echo = True
-        elif lead != 2 and line.strip():
+        elif lead < 2 and line.strip():
             in_echo = False
         echo.append(in_echo)
     return echo
 
 
 def last_report(output):
-    # Marker matches inside an echo run are the coordinator's own submitted
-    # template, not an agent report; drop those lines before scanning.
-    lines = output.split('\n')
-    trusted = '\n'.join(line for line, echo in zip(lines, echo_lines(output)) if not echo)
-    marks = [(m.start(), m.end(), True) for m in REPORT_START.finditer(trusted)]
-    marks += [(m.start(), m.end(), False) for m in REPORT_END.finditer(trusted)]
-    start = report = None
-    for begin, end, is_start in sorted(marks):
+    # Markers inside an echo run are the coordinator's own submitted text,
+    # not an agent report, and an echo run is a hard pairing boundary: a
+    # START before it can never close with an END after it. Report slices
+    # therefore always come from one contiguous trusted run of the
+    # original output — nothing is deleted or spliced mid-block.
+    marks, start, report = [], None, None
+    pos = sec = 0
+    prev = True
+    for line, echo in zip(output.split('\n'), echo_lines(output)):
+        if echo != prev:
+            sec += 1
+        prev = echo
+        if not echo:
+            for m in REPORT_START.finditer(line):
+                marks.append((pos + m.start(), pos + m.end(), True, sec))
+            for m in REPORT_END.finditer(line):
+                marks.append((pos + m.start(), pos + m.end(), False, sec))
+        pos += len(line) + 1
+    for begin, end, is_start, mark_sec in sorted(marks):
         if is_start:
-            start = begin
-        elif start is not None:
-            report = trusted[start:end]
+            start = (begin, mark_sec)
+        elif start is not None and start[1] == mark_sec:
+            report = output[start[0]:end]
             start = None
     return textwrap.dedent(report).rstrip('\r\n') if report is not None else None
 
