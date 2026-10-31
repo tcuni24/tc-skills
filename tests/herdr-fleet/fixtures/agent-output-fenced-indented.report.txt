@@ -1,0 +1,21 @@
+FLEET-REPORT
+结果：完成（证据包 + PR 元数据校正；未改业务代码、未合并 PR、未跑全量）
+PR：https://gitee.com/chengdu-tiancheng-future/deliver-backend/pulls/401
+    open、未合并；head feat/perf-runtime-config @65d7788 → base develop @f4387736
+    已 PATCH：中文标题 + 规范四节正文，正文改为最终全量 2064/3 失败的真实结果
+测试（cwd 均为 backend worktree，venv python 3.12.14）：
+  - Gitee API GET /pulls/401（带 GITEE_TOKEN，env 不落盘）→ exit 0；脱敏 JSON 已存 pr-401.json；匿名 GET 404 为私有仓预期
+  - Gitee API PATCH /pulls/401 → exit 0（pr-401-update-and-refetch.log）
+  - pytest tests/test_secret_key_isolation.py -q → exit 1，2 failed（堆栈留存）；docker compose version → exit 1「unknown command」，dock
+er-compose version → v2.40.3 exit 0：确证插件缺失为环境性失败
+  - pytest tests/perf tests/test_account_scope.py tests/test_admin_users_n1.py -q（base /tmp 只读快照）→ 首轮 exit 1 复现同一断言失败
+{2:6,8:9}；后续 7 次同序复跑全部 exit 0
+  - 同序子集在分支上两次复跑 → exit 0（16 passed）；单独复跑 5 passed exit 0（既有日志归档）
+证据边界：
+  - admin 失败=base 固有的低概率非确定性计数失败（base 复现成功），机制未查明、样本有限，不排除 diff 影响触发概率的极端情形——PR 正文按此
+措辞
+  - 原全量运行 stdout 未完整落盘（admin 那次失败计数未见），已用 base 复现堆栈补位并在 README 标注缺口
+  - 真实验证=Flask+sqlite；无 PG 实库（仅参数/装配层）；无 docker compose 插件
+  - pr-401.json 无 token/cookie/DSN；测试 JWT 已脱敏
+需要决策：无（分支命名/commit 前缀与团队规范的偏差已在 PR 注意事项中如实记录，未改写已推送历史）
+END FLEET-REPORT
