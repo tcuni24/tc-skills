@@ -452,18 +452,22 @@ def notice_text(events):
     footer = '请逐个使用 fleet status <slug> 核查。'
     lines = []
     for item in events:
-        phase, prs = 'unknown', []
+        phase, prs, pr_failed = 'unknown', [], False
         try:
             data = load(item['slug'])
             repos = {}
             for key, info in data['repos'].items():
                 repo = REPOS[key]['path']
                 repos[key] = repo_info(repo, task_dir(item['slug']) / REPOS[key]['dir'], info['branch'], info['base'], info['base_commit'])
-                pr = pr_info(repo, info['branch'])
-                if pr and pr.get('url'): prs.append(pr['url'])
+                result = pr_info(repo, info['branch'])
+                if result['state'] == 'found' and result['pr'].get('url'):
+                    prs.append(result['pr']['url'])
+                elif result['state'] == 'unknown':
+                    pr_failed = True
             phase = task_phase(item['status'], repos)
         except (RuntimeError, OSError, ValueError, KeyError):
             pass
+        if pr_failed: prs.append('?')
         lines.append(f"{item['slug']} {item['status']} {phase} {','.join(prs) or '-'}".replace('\n', ' '))
     shown = []
     for line in lines:
@@ -843,12 +847,33 @@ def task_agent(slug):
 
 
 def pr_info(repo, branch):
+    """Look up the head-branch PR via FLEET_GH (default gh); tri-state found/none/unknown.
+
+    'none' is only a successful query with an empty array; every failure — non-zero
+    exit, missing executable, timeout, invalid JSON or an unexpected JSON shape —
+    is 'unknown' with an error summary, never silently 'no PR'.
+    """
+    gh = os.environ.get('FLEET_GH', 'gh')
     try:
-        p = subprocess.run([os.environ.get('FLEET_GH', 'gh'), 'pr', 'list', '--head', branch, '--state', 'all', '--json', 'number,url,state', '--limit', '1'], cwd=repo, capture_output=True, text=True, timeout=10)
-        result = json.loads(p.stdout) if p.returncode == 0 else []
-        return result[0] if isinstance(result, list) and result else None
-    except (OSError, ValueError, subprocess.TimeoutExpired):
-        return None
+        p = subprocess.run([gh, 'pr', 'list', '--head', branch, '--state', 'all', '--json', 'number,url,state', '--limit', '1'],
+                           cwd=repo, capture_output=True, text=True, timeout=10)
+    except subprocess.TimeoutExpired:
+        return {'state': 'unknown', 'pr': None, 'error': '查询超时（10s）'}
+    except OSError as e:
+        return {'state': 'unknown', 'pr': None, 'error': f'无法执行 {gh}：{e}'}
+    if p.returncode:
+        detail = (p.stderr or p.stdout).strip() or f'{gh} 退出码 {p.returncode}'
+        return {'state': 'unknown', 'pr': None, 'error': detail[:500]}
+    try:
+        result = json.loads(p.stdout)
+    except ValueError:
+        return {'state': 'unknown', 'pr': None, 'error': '输出不是合法 JSON'}
+    fields = {'number', 'url', 'state'}
+    if not isinstance(result, list) or not all(isinstance(item, dict) and fields <= item.keys() for item in result):
+        return {'state': 'unknown', 'pr': None, 'error': '输出不是预期的 PR 数组'}
+    if not result:
+        return {'state': 'none', 'pr': None, 'error': None}
+    return {'state': 'found', 'pr': result[0], 'error': None}
 
 
 def last_report(output):
@@ -874,6 +899,7 @@ def status(a):
                    'idle-empty': '使用 fleet peek 确认是否卡住', 'merged': f'先执行 fleet done {a.slug} --dry-run，再执行 fleet done {a.slug}',
                    'no-tab': f'使用 fleet open {a.slug}', 'unknown': '使用 fleet peek 检查状态', 'error': '检查仓库错误'}
     row['next_step'] = suggestions[row['phase']]
+    pr_failed = []
     for key, info in data['repos'].items():
         if key not in row['repos']: continue
         repo, path = REPOS[key]['path'], task_dir(a.slug) / REPOS[key]['dir']
@@ -881,12 +907,21 @@ def status(a):
             changes = git(path, 'status', '--porcelain').splitlines()
             commits = git(repo, 'log', '--oneline', f"{info['base']}..{info['branch']}", '-10').splitlines()
             stat = git(repo, 'diff', '--stat', f"{info['base']}...{info['branch']}").splitlines()
+            result = pr_info(repo, info['branch'])
             row['repos'][key].update(base=info['base'], files=changes[:20], files_omitted=max(0, len(changes)-20),
-                                     commits=commits, diff_stat=stat[:20], diff_stat_omitted=max(0, len(stat)-20), pr=pr_info(repo, info['branch']))
+                                     commits=commits, diff_stat=stat[:20], diff_stat_omitted=max(0, len(stat)-20),
+                                     pr=result['pr'], pr_state=result['state'], pr_error=result['error'])
+            if result['state'] == 'unknown': pr_failed.append(key)
         except (RuntimeError, OSError, ValueError, KeyError) as e:
             row['phase'], row['next_step'] = 'error', suggestions['error']
             row['error'] = '; '.join(filter(None, (row.get('error'), f'{key}: {e}')))
             del row['repos'][key]
+    if pr_failed:
+        note = f"PR 查询失败（{','.join(pr_failed)}）：请人工核查 PR 是否已存在"
+        if row['phase'] == 'review':
+            row['next_step'] = f'核查 diff；{note}，再让 agent 推送或提 PR'
+        else:
+            row['next_step'] = f"{row['next_step']}；{note}"
     tab = find_tab(a.slug, tabs)
     agent = next((x for x in agents if tab and x.get('tab_id') == tab['tab_id']), None)
     row['agent_output'] = herdr('agent', 'read', agent['pane_id'], '--source', 'recent-unwrapped', '--lines', a.lines, json_output=False) if agent and a.lines else ''
@@ -902,7 +937,15 @@ def status(a):
         print('提交：\n' + ('\n'.join(info['commits']) or '无'))
         print('diff stat：\n' + ('\n'.join(info['diff_stat']) or '无'))
         if info['diff_stat_omitted']: print(f"另有 {info['diff_stat_omitted']} 行")
-        print('PR: ' + (f"#{info['pr']['number']} {info['pr']['state']} {info['pr']['url']}" if info['pr'] else '未知'))
+        pr_state = info.get('pr_state')
+        if pr_state == 'found' and info.get('pr'):
+            cell = f"#{info['pr']['number']} {info['pr']['state']} {info['pr']['url']}"
+        elif pr_state == 'none':
+            cell = '无'
+        else:
+            detail = ' '.join(str(info.get('pr_error') or '原因不明').split())
+            cell = f'未知（查询失败：{detail}）'
+        print('PR: ' + cell)
     print('\n回报：\n' + (row['report'] or '未找到回报块'))
     if row['agent_output']: print('\nagent 最近输出：\n' + row['agent_output'])
 
