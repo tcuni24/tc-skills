@@ -167,6 +167,39 @@ devin 任务 agent 在未曾信任过的目录（如 `fleet new` 刚建出的 `w
 
 本节是操作规避：绕开"信任选择页被判为就绪"的检测缺口，不代表 herdr 或 devin 的就绪检测已修复。超时 prompt 的去向不要臆测：未被证实被信任页消耗，也不要归因为额度。
 
+## 任务收尾
+
+PR 合并只说明成果已交付，协调者的收尾对象还有任务 tab、各仓库 worktree、本地分支、`TASK.md` 和 pane/收件箱状态记录。SKILL.md 第 4 节给出入口与授权边界：已授权的合并及常规收尾沿用会话授权，本节不构成对未授权合并、放弃、`--discard`、解锁或 `gc --apply` 的授权。
+
+### 核查顺序
+
+在 `fleet ls` 显示 merged（或用户确认放弃）且任务 agent 已停写（`wait` 返回，`status`/`peek` 显示 idle/done/exited，没有仍在产生的输出）之后：
+
+1. 逐仓库真实核查：`fleet status <slug>` 看提交、diff 统计、未提交文件与 PR 三态，对照 `fleet ls` 的 phase；不凭通知或记忆下结论。
+2. `fleet done <slug> --dry-run` 预览：逐仓库看是"将删除"还是"被拒绝"。
+3. `fleet done <slug>` 执行：先摘除 worktree 内指向主 checkout 的共享软链，再删 worktree；merged/no-commits 删本地分支，unmerged 保留分支（需 `--force`，属放弃授权）；删 `TASK.md`、任务目录和 pane/收件箱记录；关闭存在的 tab。`done` 只动本地分支，不删远端分支。
+4. 收尾后再核查：`fleet ls` 中该任务已消失；各主 checkout 里 `git worktree list` 不再列出这些 worktree、`git branch` 不再有已删分支；tab 已关闭；`git status` 确认主 checkout 未被改动；其他任务的 worktree 与分支不受影响。
+
+几个边界：
+
+- PR 仍 OPEN（待 review/merge）时不为通过清理强行删 worktree：等合并，或按已授权的放弃流程处理。
+- `no-commits`/`idle-empty` 常见于诊断、答疑类任务，只说明相对 base 没有新提交，既不等于"已合并"也不等于"无需收尾"：先 `status`/`peek`/`ls` 确认没有仍需保留的工作（未推送提交、未提的 PR、留在 worktree 里的结论文件），再照常 dry-run → done；要保留的内容先按下节移出。
+- `done` 只处理本任务声明的 worktree 与状态。`gc --apply` 只删干净且已合并的 worktree（删前把其他 worktree 指向它的共享软链改指主 checkout 同名条目），不管 tab、`TASK.md`、分支和状态记录：任务收尾走 `done`，`gc` 留给 `done` 之外的遗留，且按既有授权边界先出报告。
+
+### 任务目录含额外文件：先备份再移出
+
+`done` 预检要求任务目录恰为 `TASK.md` 加各仓库子目录；多出的文件或目录（产物、日志、依赖目录，含点文件）直接拒绝。这一拒绝与 dirty/unmerged/locked 相互独立，不自动等于"可丢弃"；不得为此加 `--force`/`--discard` 或 `rm -rf`/`git clean` 强推。fleet 没有自动备份能力，以下由协调者手动执行：
+
+1. **清点**：列出额外条目，确认各自由谁产生、还有谁在用。特别注意符号链接与共享依赖：配置 `shared` 的目录（如 `node_modules`、venv）可能正被其他任务的 worktree 软链引用，整体搬走会弄断它们。用 `readlink`/`ls -l` 核对每个链接指向哪里、还有谁指着它。
+2. **备份**：把需保全的材料复制到任务目录以外的唯一路径，至少含 `TASK.md`、各 worktree 的 `git branch --show-current` 与 `git rev-parse HEAD`（对照 TASK.md 的 branch/base/base_commit）、关键命令与退出码、原始日志和证据文件。
+3. **核对备份**：对照源清单逐项核对——普通文件字节一致（`diff -r`/`sha256sum`），符号链接核对 `readlink` 目标而不是跟随进共享目录比内容。备份失败或核对不一致时不删源、不继续 `done`。
+4. **移出**：确认依赖已解决（没有其他任务或进程仍在引用）后，把额外条目 `mv` 到任务目录以外、仍可找回的位置，保持可逆；仍被引用的共享目录先解决依赖再动。
+5. **重跑预检**：`done --dry-run` 通过后再 `done`。备份完成不是收尾终点，`done` 成功且事后核查通过才算收尾。
+
+### 收尾汇报
+
+向用户的最终汇报必须写清：清理是否完成（`done` 真正执行且事后核查通过，而不是只有"PR 已合并"）；证据与备份的绝对路径；每项保留例外的具体原因与再处理条件（如"PR #N 待 review，合并后重跑 `done`""`<路径>` 仍被 `<任务>` 的软链引用，待其收尾后处理"）。只写"worktree 保留"不构成汇报；默认可执行的常规收尾应继续做，确有阻塞才报未完成，未合并的 PR 不得声称已全部收尾。
+
 ## 安全规则
 
 - `new` 创建 worktree、tab、agent 或 pane 失败时，回滚已建的 worktree、新建的分支和 tab；提交 prompt 后开始确认失败则保留 worktree 和 tab，供检查和恢复。
