@@ -1031,15 +1031,42 @@ def agent_output(pane, lines):
     return p.stdout.rstrip()
 
 
+def echo_lines(output):
+    """Flag lines attributable to a user-input echo, not to the agent.
+
+    recent-unwrapped carries no role/source field, so attribution can only
+    use what the TUI renders. Devin replays a submitted prompt behind a `❭ `
+    glyph and gives every rendered line of that echo its two-cell hanging
+    indent; observed agent output (text, tool lines, fenced report blocks)
+    sits at other indents. Blank lines stay inside a run: an echoed empty
+    input line and the blank the TUI draws after input look identical. A
+    capture that opens with `  `/blank lines may start mid-echo — the `❭`
+    scrolled off — so that leading run is treated as unattributed as well.
+    """
+    echo, in_echo = [], True
+    for line in output.split('\n'):
+        lead = len(line) - len(line.lstrip(' '))
+        if line.startswith('❭ '):
+            in_echo = True
+        elif lead != 2 and line.strip():
+            in_echo = False
+        echo.append(in_echo)
+    return echo
+
+
 def last_report(output):
-    marks = [(m.start(), m.end(), True) for m in REPORT_START.finditer(output)]
-    marks += [(m.start(), m.end(), False) for m in REPORT_END.finditer(output)]
+    # Marker matches inside an echo run are the coordinator's own submitted
+    # template, not an agent report; drop those lines before scanning.
+    lines = output.split('\n')
+    trusted = '\n'.join(line for line, echo in zip(lines, echo_lines(output)) if not echo)
+    marks = [(m.start(), m.end(), True) for m in REPORT_START.finditer(trusted)]
+    marks += [(m.start(), m.end(), False) for m in REPORT_END.finditer(trusted)]
     start = report = None
     for begin, end, is_start in sorted(marks):
         if is_start:
             start = begin
         elif start is not None:
-            report = output[start:end]
+            report = trusted[start:end]
             start = None
     return textwrap.dedent(report).rstrip('\r\n') if report is not None else None
 
