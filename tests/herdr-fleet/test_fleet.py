@@ -86,6 +86,29 @@ else: result = {}
 print(json.dumps({'result': result}))
 '''
 
+# Receives the same arguments as `gh pr list`; GH_MODE sets the outcome, GH_MODES a
+# JSON map from repository directory basename (the subprocess cwd) to the outcome.
+FAKE_GH = '''#!/usr/bin/env python3
+import json, os, sys, time
+modes = json.loads(os.environ.get('GH_MODES', '{}'))
+mode = modes.get(os.path.basename(os.getcwd()), os.environ.get('GH_MODE', 'empty'))
+if mode == 'sleep': time.sleep(30)
+elif mode == 'fail': print('no GitHub host configured', file=sys.stderr); sys.exit(1)
+elif mode == 'bad-json': print('oops'); sys.exit(0)
+elif mode == 'dict': print(json.dumps({'prs': []})); sys.exit(0)
+elif mode == 'missing-keys': print(json.dumps([{'number': 12}])); sys.exit(0)
+elif mode == 'found': print(json.dumps([{'number': 12, 'url': 'https://example.test/pr/12', 'state': 'OPEN'}])); sys.exit(0)
+elif mode == 'raw': print(os.environ.get('GH_OUTPUT', '[]')); sys.exit(0)
+print('[]')
+'''
+
+
+def fake_gh(tmp_path):
+    gh = tmp_path / 'fake-gh'
+    gh.write_text(FAKE_GH)
+    gh.chmod(0o755)
+    return gh
+
 
 def cmd(*args, cwd=None, env=None, check=True):
     return subprocess.run(list(map(str, args)), cwd=cwd, env=env, text=True, capture_output=True, check=check)
@@ -712,7 +735,7 @@ def test_delivery_does_not_hold_global_lock_during_prompt(setup):
 def test_delivery_truncates_oversized_notice(setup, tmp_path):
     _, fleet, log = setup
     gh = tmp_path / 'fake-gh'
-    gh.write_text('#!/usr/bin/env python3\nimport json\nprint(json.dumps([{"url": "x" * 125000}]))\n')
+    gh.write_text('#!/usr/bin/env python3\nimport json\nprint(json.dumps([{"number": 1, "url": "x" * 125000, "state": "OPEN"}]))\n')
     gh.chmod(0o755)
     fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
     log.write_text('')
@@ -1099,17 +1122,149 @@ def test_status_and_pr(setup, tmp_path):
     git(path, 'add', 'file'); git(path, 'commit', '-m', 'example commit')
     (path / 'untracked').write_text('x')
     p = fleet('status', 'hello', FLEET_GH=str(tmp_path / 'missing'))
-    assert all(s in p.stdout for s in ('uncommitted', 'example commit', 'file |', '?? untracked', 'agent output tail', 'PR: 未知'))
+    assert all(s in p.stdout for s in ('uncommitted', 'example commit', 'file |', '?? untracked', 'agent output tail', 'PR: 未知（查询失败：'))
+    missing = json.loads(fleet('status', 'hello', '--json', FLEET_GH=str(tmp_path / 'missing')).stdout)['repos']['web']
+    assert missing['pr'] is None and missing['pr_state'] == 'unknown' and missing['pr_error']
     gh = tmp_path / 'gh'
     gh.write_text('#!/bin/sh\nprintf \'[{"number":12,"url":"https://example.test/pr/12","state":"OPEN"}]\'\n')
     gh.chmod(0o755)
     row = json.loads(fleet('status', 'hello', '--json', FLEET_GH=str(gh)).stdout)
     assert row['repos']['web']['pr']['url'] == 'https://example.test/pr/12'
+    assert row['repos']['web']['pr_state'] == 'found' and row['repos']['web']['pr_error'] is None
     assert row['repos']['web']['files'] == ['?? untracked']
     assert 'example commit' in row['repos']['web']['commits'][0]
     assert row['repos']['web']['diff_stat'] and row['agent_output'] == 'agent output tail'
     assert 'https://example.test/pr/12' in fleet('status', 'hello', FLEET_GH=str(gh)).stdout
     assert not json.loads(fleet('status', 'hello', '--json', '--lines', '0', NOTAB='1').stdout)['agent_output']
+
+
+@pytest.mark.parametrize('mode,state,error', [
+    ('fail', 'unknown', 'no GitHub host'),
+    ('bad-json', 'unknown', 'JSON'),
+    ('dict', 'unknown', '数组'),
+    ('missing-keys', 'unknown', '数组'),
+    ('empty', 'none', None),
+    ('found', 'found', None),
+])
+def test_status_pr_query_states(setup, tmp_path, mode, state, error):
+    root, fleet, _ = setup
+    gh = fake_gh(tmp_path)
+    fleet('new', 'hello', '-r', 'web', '--no-fetch')
+    env = {'FLEET_GH': str(gh), 'GH_MODE': mode}
+    row = json.loads(fleet('status', 'hello', '--json', '--lines', '0', **env).stdout)
+    repo = row['repos']['web']
+    assert repo['pr_state'] == state
+    if state == 'found':
+        assert repo['pr'] == {'number': 12, 'url': 'https://example.test/pr/12', 'state': 'OPEN'}
+    else:
+        assert repo['pr'] is None
+    if error:
+        assert error in repo['pr_error']
+    else:
+        assert repo['pr_error'] is None
+    text = fleet('status', 'hello', '--lines', '0', **env).stdout
+    if state == 'found':
+        assert 'PR: #12 OPEN https://example.test/pr/12' in text
+    elif state == 'none':
+        assert 'PR: 无' in text and '查询失败' not in text
+    else:
+        assert 'PR: 未知（查询失败：' in text and error in text
+
+
+@pytest.mark.parametrize('item,bad', [
+    ({'number': 12, 'url': {}, 'state': 'OPEN'}, 'url'),
+    ({'number': 12, 'url': ['https://example.test/pr/12'], 'state': 'OPEN'}, 'url'),
+    ({'number': 12, 'url': None, 'state': 'OPEN'}, 'url'),
+    ({'number': 12, 'url': '', 'state': 'OPEN'}, 'url'),
+    ({'number': True, 'url': 'https://example.test/pr/12', 'state': 'OPEN'}, 'number'),
+    ({'number': '12', 'url': 'https://example.test/pr/12', 'state': 'OPEN'}, 'number'),
+    ({'number': 0, 'url': 'https://example.test/pr/12', 'state': 'OPEN'}, 'number'),
+    ({'number': 12, 'url': 'https://example.test/pr/12', 'state': 12}, 'state'),
+    ({'number': 12, 'url': 'https://example.test/pr/12', 'state': ''}, 'state'),
+])
+def test_status_pr_field_types(setup, tmp_path, item, bad):
+    root, fleet, _ = setup
+    gh = fake_gh(tmp_path)
+    fleet('new', 'hello', '-r', 'web', '--no-fetch')
+    env = {'FLEET_GH': str(gh), 'GH_MODE': 'raw', 'GH_OUTPUT': json.dumps([item])}
+    repo = json.loads(fleet('status', 'hello', '--json', '--lines', '0', **env).stdout)['repos']['web']
+    assert repo['pr_state'] == 'unknown' and repo['pr'] is None and bad in repo['pr_error']
+    text = fleet('status', 'hello', '--lines', '0', **env).stdout
+    assert 'PR: 未知（查询失败：' in text
+
+
+def test_delivery_notice_bad_pr_fields_marks_unknown(setup, tmp_path):
+    _, fleet, log = setup
+    gh = fake_gh(tmp_path)
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
+    log.write_text('')
+    result = fleet('event', '--pane', 'p', '--status', 'idle', GET_SEQ='12', COORD_STATUS='idle',
+                   FLEET_GH=str(gh), GH_MODE='raw', GH_OUTPUT='[{"number":12,"url":{},"state":"OPEN"}]')
+    assert result.returncode == 0
+    prompts = [c for line in log.read_text().splitlines() if (c := json.loads(line))[:2] == ['agent', 'prompt']]
+    assert len(prompts) == 1
+    line = next(l for l in prompts[0][3].splitlines() if l.startswith('hello'))
+    assert line.endswith(' ?')
+
+
+def test_status_pr_query_timeout(setup, tmp_path):
+    root, fleet, _ = setup
+    gh = fake_gh(tmp_path)
+    fleet('new', 'hello', '-r', 'web', '--no-fetch')
+    row = json.loads(fleet('status', 'hello', '--json', '--lines', '0', FLEET_GH=str(gh), GH_MODE='sleep').stdout)
+    repo = row['repos']['web']
+    assert repo['pr_state'] == 'unknown' and repo['pr'] is None and '超时' in repo['pr_error']
+
+
+def test_status_pr_unknown_next_step(setup, tmp_path):
+    root, fleet, _ = setup
+    gh = fake_gh(tmp_path)
+    fleet('new', 'hello', '-r', 'web', '--no-fetch')
+    path = root / 'worktrees/hello/web'
+    (path / 'file').write_text('changed')
+    git(path, 'add', 'file'); git(path, 'commit', '-m', 'work')
+
+    def step(mode, **env):
+        row = json.loads(fleet('status', 'hello', '--json', '--lines', '0', FLEET_GH=str(gh), GH_MODE=mode, **env).stdout)
+        return row['phase'], row['next_step']
+
+    # Found or confirmed-absent PRs leave the suggestion unconditional.
+    for mode in ('found', 'empty'):
+        assert step(mode) == ('review', '核查 diff，让 agent 推送并提 PR')
+    # Unknown turns the review suggestion into a manual check first.
+    phase, next_step = step('fail')
+    assert phase == 'review' and '人工核查 PR 是否已存在' in next_step and 'PR 查询失败' in next_step
+    assert '提 PR' not in next_step.split('人工核查')[0]
+    # More urgent phases keep their advice and add the manual check.
+    phase, next_step = step('fail', AGENT_STATUS='blocked')
+    assert phase == 'blocked' and 'fleet peek 查看问题并交用户决策' in next_step and '人工核查 PR 是否已存在' in next_step
+
+
+def test_delivery_notice_marks_unknown_and_mixed_pr(setup, tmp_path):
+    _, fleet, log = setup
+    gh = fake_gh(tmp_path)
+    fleet('new', 'mixed', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
+    fleet('new', 'nope', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator', NEW_PANE='q')
+    fleet('event', '--pane', 'p', '--status', 'idle', GET_SEQ='12')
+    fleet('event', '--pane', 'q', '--status', 'idle', GET_SEQ='12', OTHER_SEQ='12')
+    log.write_text('')
+    # web's query fails, be's finds a PR: mixed keeps '?' alongside the link.
+    fleet('event', '--pane', 'coordinator', '--status', 'idle', COORD_STATUS='idle',
+          FLEET_GH=str(gh), GH_MODE='fail', GH_MODES='{"app-api": "found"}')
+    prompts = [c for line in log.read_text().splitlines() if (c := json.loads(line))[:2] == ['agent', 'prompt']]
+    assert len(prompts) == 1
+    mixed = next(line for line in prompts[0][3].splitlines() if line.startswith('mixed'))
+    nope = next(line for line in prompts[0][3].splitlines() if line.startswith('nope'))
+    assert mixed.endswith('https://example.test/pr/12,?')
+    assert nope.endswith(' ?')
+    # A confirmed-absent PR still reports '-', never '?'.
+    fleet('event', '--pane', 'q', '--status', 'working', OTHER_STATUS='working', OTHER_SEQ='13')
+    fleet('event', '--pane', 'q', '--status', 'idle', OTHER_STATUS='idle', OTHER_SEQ='14')
+    log.write_text('')
+    fleet('event', '--pane', 'coordinator', '--status', 'idle', COORD_STATUS='idle', FLEET_GH=str(gh), GH_MODE='empty')
+    prompts = [c for line in log.read_text().splitlines() if (c := json.loads(line))[:2] == ['agent', 'prompt']]
+    assert len(prompts) == 1
+    assert next(line for line in prompts[0][3].splitlines() if line.startswith('nope')).endswith(' -')
 
 
 def report_fixture(name):
