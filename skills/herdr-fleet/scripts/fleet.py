@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 import tomllib
 from contextlib import contextmanager, ExitStack
@@ -682,7 +683,7 @@ def create_tab(data, agent, focus=False, explicit=None, prompt=None):
                 how = f"执行 {info['command']}" if info.get('command') else '自行安装依赖'
                 context.append(f"{REPOS[key]['dir']} 未链接 {', '.join(REPOS[key]['shared'])}（{info['reason']}）：需要时在 {dest / REPOS[key]['dir']} {how}。")
             context.append(f'只在上述 worktree 中修改和提交，不要改主 checkout（{ROOT}/<仓库>）。开始前先读各 worktree 里的 AGENTS.md。')
-            context.append('最终回复必须包含以下回报块：\nFLEET-REPORT\n结果：完成 / 部分完成 / 阻塞\nPR：链接或无\n测试：每条命令及退出码\n证据边界：哪些已真实验证，哪些只是合成数据、mock、空页面或未覆盖\n需要决策：需要用户决定的事项或无\nEND FLEET-REPORT')
+            context.append('最终回复必须包含以下回报块，放在 ```text fenced code block 中输出：\nFLEET-REPORT\n结果：完成 / 部分完成 / 阻塞\nPR：链接或无\n测试：每条命令及退出码\n证据边界：哪些已真实验证，哪些只是合成数据、mock、空页面或未覆盖\n需要决策：需要用户决定的事项或无\nEND FLEET-REPORT\n不要用普通 Markdown 段落输出它：单换行会被折叠成一段，解析器按原样摘取，不还原被折叠的换行。')
             try:
                 submit(data, pane, '\n'.join(context) + '\n\n' + prompt)
             except (RuntimeError, OSError, ValueError, KeyError) as e:
@@ -851,17 +852,21 @@ def pr_info(repo, branch):
         return None
 
 
+REPORT_START = re.compile(r'^[ \t]*FLEET-REPORT(?![A-Za-z0-9_-])', re.M)
+REPORT_END = re.compile(r'(?<![A-Za-z0-9_-])END FLEET-REPORT(?![A-Za-z0-9_-])')
+
+
 def last_report(output):
-    lines = output.splitlines(keepends=True)
-    start = None
-    report = None
-    for i, line in enumerate(lines):
-        if line.rstrip('\r\n') == 'FLEET-REPORT':
-            start = i
-        elif line.rstrip('\r\n') == 'END FLEET-REPORT' and start is not None:
-            report = ''.join(lines[start:i + 1]).rstrip('\r\n')
+    marks = [(m.start(), m.end(), True) for m in REPORT_START.finditer(output)]
+    marks += [(m.start(), m.end(), False) for m in REPORT_END.finditer(output)]
+    start = report = None
+    for begin, end, is_start in sorted(marks):
+        if is_start:
+            start = begin
+        elif start is not None:
+            report = output[start:end]
             start = None
-    return report
+    return textwrap.dedent(report).rstrip('\r\n') if report is not None else None
 
 
 def status(a):
