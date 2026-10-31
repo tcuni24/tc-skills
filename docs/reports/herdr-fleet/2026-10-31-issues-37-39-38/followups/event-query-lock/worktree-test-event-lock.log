@@ -1,0 +1,15 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-9.2.0, pluggy-1.7.0 -- /home/glx/scripts/tc-skills-fleet/worktrees/report-block-37/.venv/bin/python
+cachedir: .pytest_cache
+rootdir: /home/glx/scripts/tc-skills-fleet/worktrees/event-query-lock/tc-skills
+configfile: pyproject.toml
+collecting ... collected 6 items
+
+tests/herdr-fleet/test_event_lock.py::test_event_get_does_not_block_other_tasks_or_inbox PASSED [ 16%]
+tests/herdr-fleet/test_event_lock.py::test_event_result_dropped_when_pane_rebound_during_query[other-task] PASSED [ 33%]
+tests/herdr-fleet/test_event_lock.py::test_event_result_dropped_when_pane_rebound_during_query[removed] PASSED [ 50%]
+tests/herdr-fleet/test_event_lock.py::test_same_task_event_waits_on_task_lock_not_state_lock PASSED [ 66%]
+tests/herdr-fleet/test_event_lock.py::test_send_waits_for_inflight_event_then_supersedes PASSED [ 83%]
+tests/herdr-fleet/test_event_lock.py::test_event_get_failure_and_exited_semantics_unchanged PASSED [100%]
+
+============================== 6 passed in 3.84s ===============================

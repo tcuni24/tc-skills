@@ -1,0 +1,41 @@
+{
+  "slug": "pr-state-39",
+  "tab": "wE:tM",
+  "agent": "done",
+  "repos": {
+    "tcskills": {
+      "branch": "fix/pr-state-39",
+      "dirty": 0,
+      "ahead": 2,
+      "behind": 0,
+      "merge": "unmerged",
+      "base": "origin/main",
+      "files": [],
+      "files_omitted": 0,
+      "commits": [
+        "4bcd7a4 fix(herdr-fleet): validate PR field types in pr_info",
+        "3377222 fix(herdr-fleet): distinguish PR query failure from no PR"
+      ],
+      "diff_stat": [
+        "skills/herdr-fleet/SKILL.md               |   2 +-",
+        " skills/herdr-fleet/references/workflow.md |   3 +-",
+        " skills/herdr-fleet/scripts/fleet.py       |  72 ++++++++++++--",
+        " tests/herdr-fleet/test_fleet.py           | 159 +++++++++++++++++++++++++++++-",
+        " 4 files changed, 222 insertions(+), 14 deletions(-)"
+      ],
+      "diff_stat_omitted": 0,
+      "pr": {
+        "number": 41,
+        "state": "OPEN",
+        "url": "https://github.com/tcuni24/tc-skills/pull/41"
+      },
+      "pr_state": "found",
+      "pr_error": null
+    }
+  },
+  "agent_kind": "devin",
+  "phase": "review",
+  "next_step": "核查 diff，让 agent 推送并提 PR",
+  "agent_output": "",
+  "report": null
+}

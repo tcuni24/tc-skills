@@ -1,0 +1,1557 @@
+From f3a18453dc0b5c7b856121553783b6414826443d Mon Sep 17 00:00:00 2001
+From: Devin <158243242+devin-ai-integration[bot]@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 08:23:35 +0800
+Subject: [PATCH 1/6] fix(herdr-fleet): extract indented and folded
+ FLEET-REPORT blocks
+
+---
+ skills/herdr-fleet/SKILL.md                   |  1 +
+ skills/herdr-fleet/references/workflow.md     |  6 +-
+ skills/herdr-fleet/scripts/fleet.py           | 25 +++++---
+ .../agent-output-fenced-indented.report.txt   | 21 +++++++
+ .../fixtures/agent-output-fenced-indented.txt | 61 +++++++++++++++++++
+ .../agent-output-markdown-folded.report.txt   |  7 +++
+ .../fixtures/agent-output-markdown-folded.txt | 13 ++++
+ tests/herdr-fleet/test_fleet.py               | 18 ++++++
+ 8 files changed, 140 insertions(+), 12 deletions(-)
+ create mode 100644 tests/herdr-fleet/fixtures/agent-output-fenced-indented.report.txt
+ create mode 100644 tests/herdr-fleet/fixtures/agent-output-fenced-indented.txt
+ create mode 100644 tests/herdr-fleet/fixtures/agent-output-markdown-folded.report.txt
+ create mode 100644 tests/herdr-fleet/fixtures/agent-output-markdown-folded.txt
+
+diff --git a/skills/herdr-fleet/SKILL.md b/skills/herdr-fleet/SKILL.md
+index ba49300..8a8b5ae 100644
+--- a/skills/herdr-fleet/SKILL.md
++++ b/skills/herdr-fleet/SKILL.md
+@@ -49,6 +49,7 @@ fleet new <slug> [-r <键>[,<键>]] [--fix] [--base <键>=<ref>] [--agent <种
+ 
+ - `fleet ls`：查看各任务的 tab、agent 状态、phase 和仓库汇总。
+ - `fleet status <slug>`：查看下一步建议、提交、diff 统计、未提交文件、PR 和 agent 最近输出。仓库异常时显示 `phase=error` 和原因，并尽力显示其他仓库；`--lines` 不接受负数。
++- `status` 的「回报」与 JSON `report` 摘取 agent 输出里最后一个完整 `FLEET-REPORT`…`END FLEET-REPORT` 块。启动提示要求任务 agent 把回报块放进 fenced text 代码块：普通 Markdown 段落会把单换行折叠成一段，解析器只按原样摘取、不还原被折叠的换行。`report` 为 null 时用 `--lines` 扩大读取或 `fleet peek` 人工查看，摘取规则见 `references/workflow.md`。
+ - `fleet wait <slug>... [--any|--all] [--timeout SEC]`：等待最近一次提交后的 idle/done/blocked；默认 `--all`，`--any` 等首个终态。返回码分别为 0/0/3；超时为 4，其他错误为 1。终态观察成功后仓库信息出错不改变返回码。
+ - 收到 herdr-fleet 自动通知后，先逐个执行 `fleet status <slug>` 核查，再向用户汇报；通知本身不是验收证据。
+ - 插件订阅 `pane.exited`、`pane.closed` 和 `tab.closed`；旧任务索引缺少 tab_id 时，运行 `fleet bind` 或重新打开任务以登记 tab。关 tab 的通知路径已在真机验证。
+diff --git a/skills/herdr-fleet/references/workflow.md b/skills/herdr-fleet/references/workflow.md
+index 123537a..7899b2a 100644
+--- a/skills/herdr-fleet/references/workflow.md
++++ b/skills/herdr-fleet/references/workflow.md
+@@ -77,7 +77,7 @@ fleet gc [--apply]                       # 报告所有仓库的全部 worktree
+ 
+ 仅在真机 herdr 0.9.1 上实测，`state_change_seq` 跨 pane 全局递增（多个 pane 间从 9185 到 9238），新 pane 不复用旧序号；因此该版本中 `open` 重建后保留旧 `submit_seq`/`event_round` 不会因序号复用而误去重。
+ 
+-`new` 要求任务 agent 在最终回复中输出回报块：
++`new` 要求任务 agent 在最终回复中输出回报块，并放进 `` ```text `` fenced code block：
+ 
+ ```text
+ FLEET-REPORT
+@@ -89,7 +89,9 @@ PR：链接或无
+ END FLEET-REPORT
+ ```
+ 
+-`status` 从所读取的最近输出中摘取最后一个完整回报块，文本显示在「回报」一节，JSON 的 `report` 为原文或 `null`。只有开头没有结尾不算完整块；输出行数不足可能截断回报，可增大 `--lines`。`--lines 0` 不读取 agent 输出，也不摘取回报块。`send` 的补充说明不改变回报要求。
++普通 Markdown 段落会把单换行折叠成一段（字段和标记挤在同一逻辑行），fenced code block 才能保留逐行字段；解析器按原样摘取文本，不还原被折叠的换行语义。
++
++`status` 从所读取的最近输出中摘取最后一个完整回报块：开始标记是行首的 `FLEET-REPORT`（允许前导空白），结束标记是 `END FLEET-REPORT` 子串（可跟在字段内容同一行）。标记不得与字母、数字、`-`、`_` 直接相邻，因此 `FLEET-REPORT-EXAMPLE`、`APPEND FLEET-REPORT` 之类不算标记。摘取结果做 dedent：去掉各行公共前导空白，字段自身的缩进和已有换行保留。文本显示在「回报」一节，JSON 的 `report` 为原文或 `null`。只有开头没有结尾不算完整块，末尾未闭合的块不会盖掉前一个完整块；输出行数不足可能截断回报，可增大 `--lines`。`--lines 0` 不读取 agent 输出，也不摘取回报块。`send` 的补充说明不改变回报要求。
+ 
+ herdr 可执行文件依次取 `FLEET_HERDR`、`HERDR_BIN_PATH`，都没有时用 `herdr`。
+ PR 查询用 `FLEET_GH` 指定可执行文件，默认 `gh`；失败或超时显示未知，不阻塞收尾。`ls --json` 保留原有键，新增 `agent_kind` 和 `phase`，出错时新增 `error`。
+diff --git a/skills/herdr-fleet/scripts/fleet.py b/skills/herdr-fleet/scripts/fleet.py
+index 3d251ea..daccb05 100755
+--- a/skills/herdr-fleet/scripts/fleet.py
++++ b/skills/herdr-fleet/scripts/fleet.py
+@@ -17,6 +17,7 @@ import shutil
+ import subprocess
+ import sys
+ import tempfile
++import textwrap
+ import time
+ import tomllib
+ from contextlib import contextmanager, ExitStack
+@@ -682,7 +683,7 @@ def create_tab(data, agent, focus=False, explicit=None, prompt=None):
+                 how = f"执行 {info['command']}" if info.get('command') else '自行安装依赖'
+                 context.append(f"{REPOS[key]['dir']} 未链接 {', '.join(REPOS[key]['shared'])}（{info['reason']}）：需要时在 {dest / REPOS[key]['dir']} {how}。")
+             context.append(f'只在上述 worktree 中修改和提交，不要改主 checkout（{ROOT}/<仓库>）。开始前先读各 worktree 里的 AGENTS.md。')
+-            context.append('最终回复必须包含以下回报块：\nFLEET-REPORT\n结果：完成 / 部分完成 / 阻塞\nPR：链接或无\n测试：每条命令及退出码\n证据边界：哪些已真实验证，哪些只是合成数据、mock、空页面或未覆盖\n需要决策：需要用户决定的事项或无\nEND FLEET-REPORT')
++            context.append('最终回复必须包含以下回报块，放在 ```text fenced code block 中输出：\nFLEET-REPORT\n结果：完成 / 部分完成 / 阻塞\nPR：链接或无\n测试：每条命令及退出码\n证据边界：哪些已真实验证，哪些只是合成数据、mock、空页面或未覆盖\n需要决策：需要用户决定的事项或无\nEND FLEET-REPORT\n不要用普通 Markdown 段落输出它：单换行会被折叠成一段，解析器按原样摘取，不还原被折叠的换行。')
+             try:
+                 submit(data, pane, '\n'.join(context) + '\n\n' + prompt)
+             except (RuntimeError, OSError, ValueError, KeyError) as e:
+@@ -851,17 +852,21 @@ def pr_info(repo, branch):
+         return None
+ 
+ 
++REPORT_START = re.compile(r'^[ \t]*FLEET-REPORT(?![A-Za-z0-9_-])', re.M)
++REPORT_END = re.compile(r'(?<![A-Za-z0-9_-])END FLEET-REPORT(?![A-Za-z0-9_-])')
++
++
+ def last_report(output):
+-    lines = output.splitlines(keepends=True)
+-    start = None
+-    report = None
+-    for i, line in enumerate(lines):
+-        if line.rstrip('\r\n') == 'FLEET-REPORT':
+-            start = i
+-        elif line.rstrip('\r\n') == 'END FLEET-REPORT' and start is not None:
+-            report = ''.join(lines[start:i + 1]).rstrip('\r\n')
++    marks = [(m.start(), m.end(), True) for m in REPORT_START.finditer(output)]
++    marks += [(m.start(), m.end(), False) for m in REPORT_END.finditer(output)]
++    start = report = None
++    for begin, end, is_start in sorted(marks):
++        if is_start:
++            start = begin
++        elif start is not None:
++            report = output[start:end]
+             start = None
+-    return report
++    return textwrap.dedent(report).rstrip('\r\n') if report is not None else None
+ 
+ 
+ def status(a):
+diff --git a/tests/herdr-fleet/fixtures/agent-output-fenced-indented.report.txt b/tests/herdr-fleet/fixtures/agent-output-fenced-indented.report.txt
+new file mode 100644
+index 0000000..2b03ac8
+--- /dev/null
++++ b/tests/herdr-fleet/fixtures/agent-output-fenced-indented.report.txt
+@@ -0,0 +1,21 @@
++FLEET-REPORT
++结果：完成（证据包 + PR 元数据校正；未改业务代码、未合并 PR、未跑全量）
++PR：https://gitee.com/chengdu-tiancheng-future/deliver-backend/pulls/401
++    open、未合并；head feat/perf-runtime-config @65d7788 → base develop @f4387736
++    已 PATCH：中文标题 + 规范四节正文，正文改为最终全量 2064/3 失败的真实结果
++测试（cwd 均为 backend worktree，venv python 3.12.14）：
++  - Gitee API GET /pulls/401（带 GITEE_TOKEN，env 不落盘）→ exit 0；脱敏 JSON 已存 pr-401.json；匿名 GET 404 为私有仓预期
++  - Gitee API PATCH /pulls/401 → exit 0（pr-401-update-and-refetch.log）
++  - pytest tests/test_secret_key_isolation.py -q → exit 1，2 failed（堆栈留存）；docker compose version → exit 1「unknown command」，dock
++er-compose version → v2.40.3 exit 0：确证插件缺失为环境性失败
++  - pytest tests/perf tests/test_account_scope.py tests/test_admin_users_n1.py -q（base /tmp 只读快照）→ 首轮 exit 1 复现同一断言失败
++{2:6,8:9}；后续 7 次同序复跑全部 exit 0
++  - 同序子集在分支上两次复跑 → exit 0（16 passed）；单独复跑 5 passed exit 0（既有日志归档）
++证据边界：
++  - admin 失败=base 固有的低概率非确定性计数失败（base 复现成功），机制未查明、样本有限，不排除 diff 影响触发概率的极端情形——PR 正文按此
++措辞
++  - 原全量运行 stdout 未完整落盘（admin 那次失败计数未见），已用 base 复现堆栈补位并在 README 标注缺口
++  - 真实验证=Flask+sqlite；无 PG 实库（仅参数/装配层）；无 docker compose 插件
++  - pr-401.json 无 token/cookie/DSN；测试 JWT 已脱敏
++需要决策：无（分支命名/commit 前缀与团队规范的偏差已在 PR 注意事项中如实记录，未改写已推送历史）
++END FLEET-REPORT
+diff --git a/tests/herdr-fleet/fixtures/agent-output-fenced-indented.txt b/tests/herdr-fleet/fixtures/agent-output-fenced-indented.txt
+new file mode 100644
+index 0000000..3a7dd6f
+--- /dev/null
++++ b/tests/herdr-fleet/fixtures/agent-output-fenced-indented.txt
+@@ -0,0 +1,61 @@
++# 裁剪自 docs/reports/herdr-fleet/2026-10-30-devin-perf-smoke/backend-status-final-done.json 的 agent_output
++# 同一输出含两段完整回报：前段为折叠格式、行中另有 终FLEET-REPORT 提及；取最后一段（fenced text，每行 3 空格缩进）
++次用 curl 建出后随即 PATCH 为正式标题/正文（现为最终态）。
++
++ FLEET-REPORT 结果：完成 PR：https://gitee.com/chengdu-tiancheng-future/deliver-backend/pulls/401 （feat/perf-runtime-config → develop，未合
++ 并） 测试：
++
++   •  PYTHONPATH=src python -m pytest tests/test_runtime_config.py  → 退出码 0，24 passed
++   •  PYTHONPATH=src python -m pytest tests/test_runtime_config.py tests/test_ikb7cb_bsa_storage_guard.py tests/test_health_commit.py tests/te
++     st_public_path_prefix.py tests/test_ikfjvh_telemetry_redaction.py tests/test_config_env_isolation.py tests/test_managed_release_gate.py
++     → 退出码 0，89 passed
++   •  PYTHONPATH=src python -m pytest tests/  → 退出码 1，2065/2064 passed；2 例环境性失败（ test_secret_key_isolation ：本机无  docker compos
++     e  插件，base 同失败），另 1 例  test_admin_users_n1  在一次全量中顺序依赖 flaky（单独跑 5 passed，与 diff 无关）
++   •  docker-compose -f docker-compose.yml config  /  -f docker-compose.test.yml config （env -i 注入必需变量）→ 退出码 0， DB_* / HEALTH_STOR
++     AGE_PROBE_TTL  默认与 deploy.env 覆盖均生效 证据边界：新增 24 例为真实 Flask app + test client 验证（debug 开/关 GET/POST、health 降级/恢
++     复/TTL/多实例隔离、perf 日志格式/不再 open/不落敏感字段、配置加载/sqlite 实连  SELECT 1 ）；PG 语句超时与连接池只验证到参数与  engine_fro
++     m_config  装配层（未连真实 PG）；flask db 长迁移可能受 60s 默认影响， DB_STATEMENT_TIMEOUT_MS=0  可关（PR 已注明）；MariaDB 的  max_state
++     ment_time  差异已注释为限制。证据存 worktree  .pytest_cache/fleet-evidence/ （gitignored）。 需要决策：无（如需调默认值——尤其
++     statement_timeout 60s 与健康 TTL 5s——可在 PR 评审中定） END FLEET-REPORT
++
++❭ 本次只交付一项『PR !401 最终验收证据包』，保持同一 Devin，不修改/重构业务代码、不新建其他任务，不合并PR。
++  协调者已只读核对提交65d778806f217da068055401b6257d5af9e189e5和89 passed日志，但 pytest-full-suite.log 只有3个失败名称与汇总，尚不能独立证
++  明“base同失败/与diff无关”；匿名Gitee API GET /repos/chengdu-tiancheng-future/deliver-backend/pulls/401 返回404，fleet PR=null。
++  请补齐这一份证据包到当前仓库 .pytest_cache/fleet-evidence/ 下：1) 用已使用的授权方式只读查询PR401，保存脱敏JSON，含正式标题/正文、state、
++  base/head分支、head SHA、merged及URL；不得保存token/cookie/认证URL或真实连接串。若不可查询如实报原始错误。2) 将三个失败的实际堆栈与各命令退
++  出码留存；检查两个secret-key失败是否确实因docker compose插件缺失，给出明确输出。3) 对
++  test_admin_users_sql_count_is_constant_across_page_sizes 给出隔离复跑结果（已有可核实日志可直接归档）；若要声称base也有问题，需要在只读base
++  代码的隔离测试路径复现同样调用顺序，不移动当前worktree分支、不修改主checkout、不写共享依赖，不必再次跑6分钟全量。无法复现则只写“归因尚未证
++  实”，不要声称与diff无关。
++  新增测试24例当前已包含在89例通过中，不为补证再跑全套。保留命令、cwd、退出码和关键输出，尤其区分真实Flask/sqlite与未连接PG边界。给一个简短最
++  终FLEET-REPORT；已知Devin普通Markdown段落回报会被折叠（#37），可用fenced text让人读清，勿自行修fleet。其他实现不变。
++
++[……中间任务输出略……]
++
++是低概率事件（base 1 败 7 过、分支多次全过），报告按此如实措辞，未声称"完全与 diff 无关"。
++
++
++   FLEET-REPORT
++   结果：完成（证据包 + PR 元数据校正；未改业务代码、未合并 PR、未跑全量）
++   PR：https://gitee.com/chengdu-tiancheng-future/deliver-backend/pulls/401
++       open、未合并；head feat/perf-runtime-config @65d7788 → base develop @f4387736
++       已 PATCH：中文标题 + 规范四节正文，正文改为最终全量 2064/3 失败的真实结果
++   测试（cwd 均为 backend worktree，venv python 3.12.14）：
++     - Gitee API GET /pulls/401（带 GITEE_TOKEN，env 不落盘）→ exit 0；脱敏 JSON 已存 pr-401.json；匿名 GET 404 为私有仓预期
++     - Gitee API PATCH /pulls/401 → exit 0（pr-401-update-and-refetch.log）
++     - pytest tests/test_secret_key_isolation.py -q → exit 1，2 failed（堆栈留存）；docker compose version → exit 1「unknown command」，dock
++   er-compose version → v2.40.3 exit 0：确证插件缺失为环境性失败
++     - pytest tests/perf tests/test_account_scope.py tests/test_admin_users_n1.py -q（base /tmp 只读快照）→ 首轮 exit 1 复现同一断言失败
++   {2:6,8:9}；后续 7 次同序复跑全部 exit 0
++     - 同序子集在分支上两次复跑 → exit 0（16 passed）；单独复跑 5 passed exit 0（既有日志归档）
++   证据边界：
++     - admin 失败=base 固有的低概率非确定性计数失败（base 复现成功），机制未查明、样本有限，不排除 diff 影响触发概率的极端情形——PR 正文按此
++   措辞
++     - 原全量运行 stdout 未完整落盘（admin 那次失败计数未见），已用 base 复现堆栈补位并在 README 标注缺口
++     - 真实验证=Flask+sqlite；无 PG 实库（仅参数/装配层）；无 docker compose 插件
++     - pr-401.json 无 token/cookie/DSN；测试 JWT 已脱敏
++   需要决策：无（分支命名/commit 前缀与团队规范的偏差已在 PR 注意事项中如实记录，未改写已推送历史）
++   END FLEET-REPORT
++
++
++ ⏺ /project/glx/app/deliver-workspace/worktrees/perf-runtime-config
+diff --git a/tests/herdr-fleet/fixtures/agent-output-markdown-folded.report.txt b/tests/herdr-fleet/fixtures/agent-output-markdown-folded.report.txt
+new file mode 100644
+index 0000000..d8bbd7c
+--- /dev/null
++++ b/tests/herdr-fleet/fixtures/agent-output-markdown-folded.report.txt
+@@ -0,0 +1,7 @@
++FLEET-REPORT 结果：完成（识别为已完成需求，无新代码/PR） PR：无（需求已由 https://gitee.com/chengdu-tiancheng-future/project-deliver-web/
++pulls/464 及 !383 合入 origin/develop；本分支与 base 零 diff） 测试：git log/diff/show 状态核对（exit 0）； python3 .cache/perf-build-hygien
++e/audit.py （exit 0，93 dep 零残留、1992 import 0 大小写错配）；asset 引用大小写审计脚本（exit 0，29 处 0 错配）；逐文件 grep/ls 核实 !464 清
++理项（exit 0） 证据边界：真实验证=manifest 引用关系与全仓大小写路径解析的静态审计、merge 后文件完整性。未验证=install/build:release/
++build:renderer/ts:check/vitest/浏览器烟测——本轮按协调者要求未跑昂贵全套且 node_modules 未安装；静态审计覆盖 issue 的具体失效模式（dep 缺失
++→import 失败、大小写→case-sensitive 构建断裂），但不等价于一次真实构建 需要决策：1) issue 07 可否按「已由 !464/!383 完成」关闭；2) 是否仍需在
++本 worktree  pnpm i  后补跑完整构建链留证（当前未装依赖，需要一次独立安装） END FLEET-REPORT
+diff --git a/tests/herdr-fleet/fixtures/agent-output-markdown-folded.txt b/tests/herdr-fleet/fixtures/agent-output-markdown-folded.txt
+new file mode 100644
+index 0000000..d7ad139
+--- /dev/null
++++ b/tests/herdr-fleet/fixtures/agent-output-markdown-folded.txt
+@@ -0,0 +1,13 @@
++# 裁剪自 docs/reports/herdr-fleet/2026-10-30-devin-perf-smoke/web-status-done.json 的 agent_output
++# Devin 普通 Markdown 段落：回报折叠成一个逻辑行后由终端宽度折行，每行带 1 个前导空格
++证据： .cache/perf-build-hygiene/{audit.py,audit-output.txt,asset-case-audit.txt} （gitignored，工作树干净）。
++
++ FLEET-REPORT 结果：完成（识别为已完成需求，无新代码/PR） PR：无（需求已由 https://gitee.com/chengdu-tiancheng-future/project-deliver-web/
++ pulls/464 及 !383 合入 origin/develop；本分支与 base 零 diff） 测试：git log/diff/show 状态核对（exit 0）； python3 .cache/perf-build-hygien
++ e/audit.py （exit 0，93 dep 零残留、1992 import 0 大小写错配）；asset 引用大小写审计脚本（exit 0，29 处 0 错配）；逐文件 grep/ls 核实 !464 清
++ 理项（exit 0） 证据边界：真实验证=manifest 引用关系与全仓大小写路径解析的静态审计、merge 后文件完整性。未验证=install/build:release/
++ build:renderer/ts:check/vitest/浏览器烟测——本轮按协调者要求未跑昂贵全套且 node_modules 未安装；静态审计覆盖 issue 的具体失效模式（dep 缺失
++ →import 失败、大小写→case-sensitive 构建断裂），但不等价于一次真实构建 需要决策：1) issue 07 可否按「已由 !464/!383 完成」关闭；2) 是否仍需在
++ 本 worktree  pnpm i  后补跑完整构建链留证（当前未装依赖，需要一次独立安装） END FLEET-REPORT
++
++ ⏺ /project/glx/app/deliver-workspace/worktrees/perf-build-hygiene
+diff --git a/tests/herdr-fleet/test_fleet.py b/tests/herdr-fleet/test_fleet.py
+index 8911d86..b02a5af 100644
+--- a/tests/herdr-fleet/test_fleet.py
++++ b/tests/herdr-fleet/test_fleet.py
+@@ -11,6 +11,7 @@ import pytest
+ 
+ SKILL = Path(__file__).resolve().parents[2] / 'skills' / 'herdr-fleet'
+ SCRIPT = SKILL / 'scripts' / 'fleet.py'
++FIXTURES = Path(__file__).resolve().parent / 'fixtures'
+ 
+ CONFIG = '''agent = "pi"
+ 
+@@ -1111,12 +1112,29 @@ def test_status_and_pr(setup, tmp_path):
+     assert not json.loads(fleet('status', 'hello', '--json', '--lines', '0', NOTAB='1').stdout)['agent_output']
+ 
+ 
++def report_fixture(name):
++    # 真实 agent_output 裁剪件与其对应的期望回报块（*.report.txt），来源见各文件首行
++    return (FIXTURES / f'{name}.txt').read_text(), (FIXTURES / f'{name}.report.txt').read_text().rstrip('\n')
++
++
+ @pytest.mark.parametrize(('output', 'expected'), [
+     ('before\nFLEET-REPORT\n结果：完成\nEND FLEET-REPORT\nafter', 'FLEET-REPORT\n结果：完成\nEND FLEET-REPORT'),
+     ('FLEET-REPORT\nold\nEND FLEET-REPORT\nFLEET-REPORT\nnew\nEND FLEET-REPORT', 'FLEET-REPORT\nnew\nEND FLEET-REPORT'),
+     ('FLEET-REPORT\nincomplete', None),
+     ('FLEET-REPORT\nold\nEND FLEET-REPORT\nFLEET-REPORT\nincomplete', 'FLEET-REPORT\nold\nEND FLEET-REPORT'),
+     ('nothing', None),
++    ('前文\n   FLEET-REPORT\n   结果：完成\n     - 细节\n   END FLEET-REPORT', 'FLEET-REPORT\n结果：完成\n  - 细节\nEND FLEET-REPORT'),
++    ('前文\n\tFLEET-REPORT\n\t结果：完成\n\tEND FLEET-REPORT', 'FLEET-REPORT\n结果：完成\nEND FLEET-REPORT'),
++    ('前文\nFLEET-REPORT 结果：完成 PR：无 END FLEET-REPORT', 'FLEET-REPORT 结果：完成 PR：无 END FLEET-REPORT'),
++    ('前文\n FLEET-REPORT 结果：完\n 成 END FLEET-REPORT', 'FLEET-REPORT 结果：完\n成 END FLEET-REPORT'),
++    ('FLEET-REPORT-EXAMPLE\n结果：完成\nEND FLEET-REPORT', None),
++    ('FLEET-REPORT\n结果：完成\nEND FLEET-REPORT-EXAMPLE', None),
++    ('前奏 FLEET-REPORT\n结果：完成\nEND FLEET-REPORT', None),
++    ('FLEET-REPORT\n结果：完成\nAPPEND FLEET-REPORT', None),
++    ('FLEET-REPORT\n结果：完成\nEND FLEET-REPORT\nFLEET-REPORT\n结果：覆盖\nEND FLEET-REPORT-EXAMPLE', 'FLEET-REPORT\n结果：完成\nEND FLEET-REPORT'),
++    ('FLEET-REPORT\n结果：弃\nFLEET-REPORT\n结果：新\nEND FLEET-REPORT', 'FLEET-REPORT\n结果：新\nEND FLEET-REPORT'),
++    report_fixture('agent-output-markdown-folded'),
++    report_fixture('agent-output-fenced-indented'),
+ ])
+ def test_status_report_blocks(setup, output, expected):
+     _, fleet, _ = setup
+-- 
+2.43.0
+
+
+From 69ea6432040d0371abb186c8a723eeedef36d9fe Mon Sep 17 00:00:00 2001
+From: Devin <158243242+devin-ai-integration[bot]@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 08:29:16 +0800
+Subject: [PATCH 2/6] fix(herdr-fleet): preserve leading indent when reading
+ agent output
+
+---
+ skills/herdr-fleet/scripts/fleet.py | 12 ++++++++++--
+ tests/herdr-fleet/test_fleet.py     |  2 ++
+ 2 files changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/skills/herdr-fleet/scripts/fleet.py b/skills/herdr-fleet/scripts/fleet.py
+index daccb05..2123755 100755
+--- a/skills/herdr-fleet/scripts/fleet.py
++++ b/skills/herdr-fleet/scripts/fleet.py
+@@ -856,6 +856,14 @@ REPORT_START = re.compile(r'^[ \t]*FLEET-REPORT(?![A-Za-z0-9_-])', re.M)
+ REPORT_END = re.compile(r'(?<![A-Za-z0-9_-])END FLEET-REPORT(?![A-Za-z0-9_-])')
+ 
+ 
++def agent_output(pane, lines):
++    p = subprocess.run([HERDR, 'agent', 'read', pane, '--source', 'recent-unwrapped', '--lines', str(lines)], capture_output=True, text=True)
++    if p.returncode:
++        raise RuntimeError(f"命令失败 herdr agent read {pane}: {p.stderr.strip()}")
++    # rstrip only: leading whitespace carries the report block's own indentation.
++    return p.stdout.rstrip()
++
++
+ def last_report(output):
+     marks = [(m.start(), m.end(), True) for m in REPORT_START.finditer(output)]
+     marks += [(m.start(), m.end(), False) for m in REPORT_END.finditer(output)]
+@@ -894,7 +902,7 @@ def status(a):
+             del row['repos'][key]
+     tab = find_tab(a.slug, tabs)
+     agent = next((x for x in agents if tab and x.get('tab_id') == tab['tab_id']), None)
+-    row['agent_output'] = herdr('agent', 'read', agent['pane_id'], '--source', 'recent-unwrapped', '--lines', a.lines, json_output=False) if agent and a.lines else ''
++    row['agent_output'] = agent_output(agent['pane_id'], a.lines) if agent and a.lines else ''
+     row['report'] = last_report(row['agent_output'])
+     if a.json:
+         print(json.dumps(row, ensure_ascii=False, indent=2)); return
+@@ -1135,7 +1143,7 @@ def main():
+         elif a.command == 'bind': bind()
+         elif a.command == 'doctor': return doctor()
+         elif a.command == 'event': event(a)
+-        elif a.command == 'peek': print(herdr('agent', 'read', task_agent(a.slug), '--source', 'recent-unwrapped', '--lines', a.lines, json_output=False))
++        elif a.command == 'peek': print(agent_output(task_agent(a.slug), a.lines))
+         elif a.command == 'send': submit(load(a.slug), task_agent(a.slug), a.text)
+         elif a.command == 'open':
+             data = load(a.slug)
+diff --git a/tests/herdr-fleet/test_fleet.py b/tests/herdr-fleet/test_fleet.py
+index b02a5af..1159315 100644
+--- a/tests/herdr-fleet/test_fleet.py
++++ b/tests/herdr-fleet/test_fleet.py
+@@ -1124,6 +1124,8 @@ def report_fixture(name):
+     ('FLEET-REPORT\nold\nEND FLEET-REPORT\nFLEET-REPORT\nincomplete', 'FLEET-REPORT\nold\nEND FLEET-REPORT'),
+     ('nothing', None),
+     ('前文\n   FLEET-REPORT\n   结果：完成\n     - 细节\n   END FLEET-REPORT', 'FLEET-REPORT\n结果：完成\n  - 细节\nEND FLEET-REPORT'),
++    ('   FLEET-REPORT\n   结果：完成\n     - 细节\n   END FLEET-REPORT', 'FLEET-REPORT\n结果：完成\n  - 细节\nEND FLEET-REPORT'),
++    ('   FLEET-REPORT 结果：完\n   成 END FLEET-REPORT', 'FLEET-REPORT 结果：完\n成 END FLEET-REPORT'),
+     ('前文\n\tFLEET-REPORT\n\t结果：完成\n\tEND FLEET-REPORT', 'FLEET-REPORT\n结果：完成\nEND FLEET-REPORT'),
+     ('前文\nFLEET-REPORT 结果：完成 PR：无 END FLEET-REPORT', 'FLEET-REPORT 结果：完成 PR：无 END FLEET-REPORT'),
+     ('前文\n FLEET-REPORT 结果：完\n 成 END FLEET-REPORT', 'FLEET-REPORT 结果：完\n成 END FLEET-REPORT'),
+-- 
+2.43.0
+
+
+From 5f08dcaf99587e8674f1d0390387283b7158b11c Mon Sep 17 00:00:00 2001
+From: oms004 <ricekent@163.com>
+Date: Sat, 31 Oct 2026 08:45:35 +0800
+Subject: [PATCH 3/6] fix(herdr-fleet): distinguish PR query failure from no PR
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+pr_info returned None for both "no PR" and every query failure, so a
+failed gh pr list (e.g. a non-GitHub remote like the Gitee host in
+issue #39) was reported as pr=null and next_step still suggested
+submitting a PR.
+
+pr_info now returns a tri-state: found / none / unknown with an error
+summary. Only a successful query with an empty array is none; non-zero
+exit, OSError, timeout, invalid JSON and structurally unexpected JSON
+are all unknown. status --json keeps repos.<key>.pr (the PR object when
+found, else null) and adds pr_state and pr_error; text shows
+"PR: #12 ..." / "PR: 无" / "PR: 未知（查询失败：…）". When any repo is
+unknown, next_step requires manually checking whether a PR exists
+instead of unconditionally suggesting one, while keeping more urgent
+advice like blocked. Notices mark unknown with "?", kept alongside
+found links in mixed-repository tasks; "-" now means confirmed absent.
+
+FLEET_GH keeps working as the provider adapter entry point; workflow.md
+documents its contract (same gh pr list arguments, same JSON array,
+non-zero exit with stderr on failure).
+
+Generated with [Devin](https://devin.ai)
+
+Co-Authored-By: Devin <158243242+devin-ai-integration[bot]@users.noreply.github.com>
+---
+ skills/herdr-fleet/SKILL.md               |   2 +-
+ skills/herdr-fleet/references/workflow.md |   3 +-
+ skills/herdr-fleet/scripts/fleet.py       |  63 +++++++++--
+ tests/herdr-fleet/test_fleet.py           | 122 +++++++++++++++++++++-
+ 4 files changed, 176 insertions(+), 14 deletions(-)
+
+diff --git a/skills/herdr-fleet/SKILL.md b/skills/herdr-fleet/SKILL.md
+index 8a8b5ae..36fc10d 100644
+--- a/skills/herdr-fleet/SKILL.md
++++ b/skills/herdr-fleet/SKILL.md
+@@ -48,7 +48,7 @@ fleet new <slug> [-r <键>[,<键>]] [--fix] [--base <键>=<ref>] [--agent <种
+ ## 3. 看情况
+ 
+ - `fleet ls`：查看各任务的 tab、agent 状态、phase 和仓库汇总。
+-- `fleet status <slug>`：查看下一步建议、提交、diff 统计、未提交文件、PR 和 agent 最近输出。仓库异常时显示 `phase=error` 和原因，并尽力显示其他仓库；`--lines` 不接受负数。
++- `fleet status <slug>`：查看下一步建议、提交、diff 统计、未提交文件、PR 和 agent 最近输出。仓库异常时显示 `phase=error` 和原因，并尽力显示其他仓库；`--lines` 不接受负数。PR 分三态：`PR: #12 …` / `PR: 无` / `PR: 未知（查询失败：…）`；查询失败时按提示人工核查 PR 是否已存在，通知里的 `?` 同样表示未知而非无 PR。
+ - `status` 的「回报」与 JSON `report` 摘取 agent 输出里最后一个完整 `FLEET-REPORT`…`END FLEET-REPORT` 块。启动提示要求任务 agent 把回报块放进 fenced text 代码块：普通 Markdown 段落会把单换行折叠成一段，解析器只按原样摘取、不还原被折叠的换行。`report` 为 null 时用 `--lines` 扩大读取或 `fleet peek` 人工查看，摘取规则见 `references/workflow.md`。
+ - `fleet wait <slug>... [--any|--all] [--timeout SEC]`：等待最近一次提交后的 idle/done/blocked；默认 `--all`，`--any` 等首个终态。返回码分别为 0/0/3；超时为 4，其他错误为 1。终态观察成功后仓库信息出错不改变返回码。
+ - 收到 herdr-fleet 自动通知后，先逐个执行 `fleet status <slug>` 核查，再向用户汇报；通知本身不是验收证据。
+diff --git a/skills/herdr-fleet/references/workflow.md b/skills/herdr-fleet/references/workflow.md
+index 7899b2a..1d9ff00 100644
+--- a/skills/herdr-fleet/references/workflow.md
++++ b/skills/herdr-fleet/references/workflow.md
+@@ -94,7 +94,8 @@ END FLEET-REPORT
+ `status` 从所读取的最近输出中摘取最后一个完整回报块：开始标记是行首的 `FLEET-REPORT`（允许前导空白），结束标记是 `END FLEET-REPORT` 子串（可跟在字段内容同一行）。标记不得与字母、数字、`-`、`_` 直接相邻，因此 `FLEET-REPORT-EXAMPLE`、`APPEND FLEET-REPORT` 之类不算标记。摘取结果做 dedent：去掉各行公共前导空白，字段自身的缩进和已有换行保留。文本显示在「回报」一节，JSON 的 `report` 为原文或 `null`。只有开头没有结尾不算完整块，末尾未闭合的块不会盖掉前一个完整块；输出行数不足可能截断回报，可增大 `--lines`。`--lines 0` 不读取 agent 输出，也不摘取回报块。`send` 的补充说明不改变回报要求。
+ 
+ herdr 可执行文件依次取 `FLEET_HERDR`、`HERDR_BIN_PATH`，都没有时用 `herdr`。
+-PR 查询用 `FLEET_GH` 指定可执行文件，默认 `gh`；失败或超时显示未知，不阻塞收尾。`ls --json` 保留原有键，新增 `agent_kind` 和 `phase`，出错时新增 `error`。
++PR 查询用 `FLEET_GH` 指定可执行文件，默认 `gh`。fleet 以 `pr list --head <分支> --state all --json number,url,state --limit 1` 调用它（工作目录为该仓库主 checkout），期望输出与 `gh pr list` 相同的 JSON 数组：空数组表示没有 PR；查询失败要以非零退出码结束并在 stderr 写明原因。对接其他代码托管时，`FLEET_GH` 可指向满足同一参数与输出契约的适配程序；该适配程序的失败同样只产生 unknown，不影响任务信息展示。
++查询结果分三态：`found`（查到 PR）、`none`（查询成功且返回空数组）、`unknown`（非零退出、无法执行、超时、非法 JSON 或结构不符）。`status` 文本依次显示 `PR: #12 …`、`PR: 无`、`PR: 未知（查询失败：…）`；`status --json` 的 `repos.<key>` 新增 `pr_state` 和 `pr_error`，`pr` 在 found 时为原 PR 对象、其余为 null。任一仓库为 unknown 时 `next_step` 会要求先人工核查 PR 是否已存在，不再无条件建议提 PR；自动通知里 unknown 以 `?` 标记（与已查到的链接并存时追加 `?`），`-` 只表示各仓库都确认无 PR。PR 查询失败不阻塞收尾。`ls --json` 保留原有键，新增 `agent_kind` 和 `phase`，出错时新增 `error`。
+ `ls` 表格包含 tab 列，tab 存在但没有 agent 时可与没有 tab 区分。`status` 的文本和 JSON 在仓库异常时显示 `phase=error` 和原因，尽力保留其他仓库的信息，返回码为 0（与 `ls` 一致）。
+ 
+ phase 按以下顺序判断（仓库异常时为 `error`）：
+diff --git a/skills/herdr-fleet/scripts/fleet.py b/skills/herdr-fleet/scripts/fleet.py
+index 2123755..1ca10f6 100755
+--- a/skills/herdr-fleet/scripts/fleet.py
++++ b/skills/herdr-fleet/scripts/fleet.py
+@@ -453,18 +453,22 @@ def notice_text(events):
+     footer = '请逐个使用 fleet status <slug> 核查。'
+     lines = []
+     for item in events:
+-        phase, prs = 'unknown', []
++        phase, prs, pr_failed = 'unknown', [], False
+         try:
+             data = load(item['slug'])
+             repos = {}
+             for key, info in data['repos'].items():
+                 repo = REPOS[key]['path']
+                 repos[key] = repo_info(repo, task_dir(item['slug']) / REPOS[key]['dir'], info['branch'], info['base'], info['base_commit'])
+-                pr = pr_info(repo, info['branch'])
+-                if pr and pr.get('url'): prs.append(pr['url'])
++                result = pr_info(repo, info['branch'])
++                if result['state'] == 'found' and result['pr'].get('url'):
++                    prs.append(result['pr']['url'])
++                elif result['state'] == 'unknown':
++                    pr_failed = True
+             phase = task_phase(item['status'], repos)
+         except (RuntimeError, OSError, ValueError, KeyError):
+             pass
++        if pr_failed: prs.append('?')
+         lines.append(f"{item['slug']} {item['status']} {phase} {','.join(prs) or '-'}".replace('\n', ' '))
+     shown = []
+     for line in lines:
+@@ -844,12 +848,33 @@ def task_agent(slug):
+ 
+ 
+ def pr_info(repo, branch):
++    """Look up the head-branch PR via FLEET_GH (default gh); tri-state found/none/unknown.
++
++    'none' is only a successful query with an empty array; every failure — non-zero
++    exit, missing executable, timeout, invalid JSON or an unexpected JSON shape —
++    is 'unknown' with an error summary, never silently 'no PR'.
++    """
++    gh = os.environ.get('FLEET_GH', 'gh')
+     try:
+-        p = subprocess.run([os.environ.get('FLEET_GH', 'gh'), 'pr', 'list', '--head', branch, '--state', 'all', '--json', 'number,url,state', '--limit', '1'], cwd=repo, capture_output=True, text=True, timeout=10)
+-        result = json.loads(p.stdout) if p.returncode == 0 else []
+-        return result[0] if isinstance(result, list) and result else None
+-    except (OSError, ValueError, subprocess.TimeoutExpired):
+-        return None
++        p = subprocess.run([gh, 'pr', 'list', '--head', branch, '--state', 'all', '--json', 'number,url,state', '--limit', '1'],
++                           cwd=repo, capture_output=True, text=True, timeout=10)
++    except subprocess.TimeoutExpired:
++        return {'state': 'unknown', 'pr': None, 'error': '查询超时（10s）'}
++    except OSError as e:
++        return {'state': 'unknown', 'pr': None, 'error': f'无法执行 {gh}：{e}'}
++    if p.returncode:
++        detail = (p.stderr or p.stdout).strip() or f'{gh} 退出码 {p.returncode}'
++        return {'state': 'unknown', 'pr': None, 'error': detail[:500]}
++    try:
++        result = json.loads(p.stdout)
++    except ValueError:
++        return {'state': 'unknown', 'pr': None, 'error': '输出不是合法 JSON'}
++    fields = {'number', 'url', 'state'}
++    if not isinstance(result, list) or not all(isinstance(item, dict) and fields <= item.keys() for item in result):
++        return {'state': 'unknown', 'pr': None, 'error': '输出不是预期的 PR 数组'}
++    if not result:
++        return {'state': 'none', 'pr': None, 'error': None}
++    return {'state': 'found', 'pr': result[0], 'error': None}
+ 
+ 
+ REPORT_START = re.compile(r'^[ \t]*FLEET-REPORT(?![A-Za-z0-9_-])', re.M)
+@@ -887,6 +912,7 @@ def status(a):
+                    'idle-empty': '使用 fleet peek 确认是否卡住', 'merged': f'先执行 fleet done {a.slug} --dry-run，再执行 fleet done {a.slug}',
+                    'no-tab': f'使用 fleet open {a.slug}', 'unknown': '使用 fleet peek 检查状态', 'error': '检查仓库错误'}
+     row['next_step'] = suggestions[row['phase']]
++    pr_failed = []
+     for key, info in data['repos'].items():
+         if key not in row['repos']: continue
+         repo, path = REPOS[key]['path'], task_dir(a.slug) / REPOS[key]['dir']
+@@ -894,12 +920,21 @@ def status(a):
+             changes = git(path, 'status', '--porcelain').splitlines()
+             commits = git(repo, 'log', '--oneline', f"{info['base']}..{info['branch']}", '-10').splitlines()
+             stat = git(repo, 'diff', '--stat', f"{info['base']}...{info['branch']}").splitlines()
++            result = pr_info(repo, info['branch'])
+             row['repos'][key].update(base=info['base'], files=changes[:20], files_omitted=max(0, len(changes)-20),
+-                                     commits=commits, diff_stat=stat[:20], diff_stat_omitted=max(0, len(stat)-20), pr=pr_info(repo, info['branch']))
++                                     commits=commits, diff_stat=stat[:20], diff_stat_omitted=max(0, len(stat)-20),
++                                     pr=result['pr'], pr_state=result['state'], pr_error=result['error'])
++            if result['state'] == 'unknown': pr_failed.append(key)
+         except (RuntimeError, OSError, ValueError, KeyError) as e:
+             row['phase'], row['next_step'] = 'error', suggestions['error']
+             row['error'] = '; '.join(filter(None, (row.get('error'), f'{key}: {e}')))
+             del row['repos'][key]
++    if pr_failed:
++        note = f"PR 查询失败（{','.join(pr_failed)}）：请人工核查 PR 是否已存在"
++        if row['phase'] == 'review':
++            row['next_step'] = f'核查 diff；{note}，再让 agent 推送或提 PR'
++        else:
++            row['next_step'] = f"{row['next_step']}；{note}"
+     tab = find_tab(a.slug, tabs)
+     agent = next((x for x in agents if tab and x.get('tab_id') == tab['tab_id']), None)
+     row['agent_output'] = agent_output(agent['pane_id'], a.lines) if agent and a.lines else ''
+@@ -915,7 +950,15 @@ def status(a):
+         print('提交：\n' + ('\n'.join(info['commits']) or '无'))
+         print('diff stat：\n' + ('\n'.join(info['diff_stat']) or '无'))
+         if info['diff_stat_omitted']: print(f"另有 {info['diff_stat_omitted']} 行")
+-        print('PR: ' + (f"#{info['pr']['number']} {info['pr']['state']} {info['pr']['url']}" if info['pr'] else '未知'))
++        pr_state = info.get('pr_state')
++        if pr_state == 'found' and info.get('pr'):
++            cell = f"#{info['pr']['number']} {info['pr']['state']} {info['pr']['url']}"
++        elif pr_state == 'none':
++            cell = '无'
++        else:
++            detail = ' '.join(str(info.get('pr_error') or '原因不明').split())
++            cell = f'未知（查询失败：{detail}）'
++        print('PR: ' + cell)
+     print('\n回报：\n' + (row['report'] or '未找到回报块'))
+     if row['agent_output']: print('\nagent 最近输出：\n' + row['agent_output'])
+ 
+diff --git a/tests/herdr-fleet/test_fleet.py b/tests/herdr-fleet/test_fleet.py
+index 1159315..75fcd99 100644
+--- a/tests/herdr-fleet/test_fleet.py
++++ b/tests/herdr-fleet/test_fleet.py
+@@ -86,6 +86,28 @@ else: result = {}
+ print(json.dumps({'result': result}))
+ '''
+ 
++# Receives the same arguments as `gh pr list`; GH_MODE sets the outcome, GH_MODES a
++# JSON map from repository directory basename (the subprocess cwd) to the outcome.
++FAKE_GH = '''#!/usr/bin/env python3
++import json, os, sys, time
++modes = json.loads(os.environ.get('GH_MODES', '{}'))
++mode = modes.get(os.path.basename(os.getcwd()), os.environ.get('GH_MODE', 'empty'))
++if mode == 'sleep': time.sleep(30)
++elif mode == 'fail': print('no GitHub host configured', file=sys.stderr); sys.exit(1)
++elif mode == 'bad-json': print('oops'); sys.exit(0)
++elif mode == 'dict': print(json.dumps({'prs': []})); sys.exit(0)
++elif mode == 'missing-keys': print(json.dumps([{'number': 12}])); sys.exit(0)
++elif mode == 'found': print(json.dumps([{'number': 12, 'url': 'https://example.test/pr/12', 'state': 'OPEN'}])); sys.exit(0)
++print('[]')
++'''
++
++
++def fake_gh(tmp_path):
++    gh = tmp_path / 'fake-gh'
++    gh.write_text(FAKE_GH)
++    gh.chmod(0o755)
++    return gh
++
+ 
+ def cmd(*args, cwd=None, env=None, check=True):
+     return subprocess.run(list(map(str, args)), cwd=cwd, env=env, text=True, capture_output=True, check=check)
+@@ -712,7 +734,7 @@ def test_delivery_does_not_hold_global_lock_during_prompt(setup):
+ def test_delivery_truncates_oversized_notice(setup, tmp_path):
+     _, fleet, log = setup
+     gh = tmp_path / 'fake-gh'
+-    gh.write_text('#!/usr/bin/env python3\nimport json\nprint(json.dumps([{"url": "x" * 125000}]))\n')
++    gh.write_text('#!/usr/bin/env python3\nimport json\nprint(json.dumps([{"number": 1, "url": "x" * 125000, "state": "OPEN"}]))\n')
+     gh.chmod(0o755)
+     fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
+     log.write_text('')
+@@ -1099,12 +1121,15 @@ def test_status_and_pr(setup, tmp_path):
+     git(path, 'add', 'file'); git(path, 'commit', '-m', 'example commit')
+     (path / 'untracked').write_text('x')
+     p = fleet('status', 'hello', FLEET_GH=str(tmp_path / 'missing'))
+-    assert all(s in p.stdout for s in ('uncommitted', 'example commit', 'file |', '?? untracked', 'agent output tail', 'PR: 未知'))
++    assert all(s in p.stdout for s in ('uncommitted', 'example commit', 'file |', '?? untracked', 'agent output tail', 'PR: 未知（查询失败：'))
++    missing = json.loads(fleet('status', 'hello', '--json', FLEET_GH=str(tmp_path / 'missing')).stdout)['repos']['web']
++    assert missing['pr'] is None and missing['pr_state'] == 'unknown' and missing['pr_error']
+     gh = tmp_path / 'gh'
+     gh.write_text('#!/bin/sh\nprintf \'[{"number":12,"url":"https://example.test/pr/12","state":"OPEN"}]\'\n')
+     gh.chmod(0o755)
+     row = json.loads(fleet('status', 'hello', '--json', FLEET_GH=str(gh)).stdout)
+     assert row['repos']['web']['pr']['url'] == 'https://example.test/pr/12'
++    assert row['repos']['web']['pr_state'] == 'found' and row['repos']['web']['pr_error'] is None
+     assert row['repos']['web']['files'] == ['?? untracked']
+     assert 'example commit' in row['repos']['web']['commits'][0]
+     assert row['repos']['web']['diff_stat'] and row['agent_output'] == 'agent output tail'
+@@ -1117,6 +1142,99 @@ def report_fixture(name):
+     return (FIXTURES / f'{name}.txt').read_text(), (FIXTURES / f'{name}.report.txt').read_text().rstrip('\n')
+ 
+ 
++@pytest.mark.parametrize('mode,state,error', [
++    ('fail', 'unknown', 'no GitHub host'),
++    ('bad-json', 'unknown', 'JSON'),
++    ('dict', 'unknown', '数组'),
++    ('missing-keys', 'unknown', '数组'),
++    ('empty', 'none', None),
++    ('found', 'found', None),
++])
++def test_status_pr_query_states(setup, tmp_path, mode, state, error):
++    root, fleet, _ = setup
++    gh = fake_gh(tmp_path)
++    fleet('new', 'hello', '-r', 'web', '--no-fetch')
++    env = {'FLEET_GH': str(gh), 'GH_MODE': mode}
++    row = json.loads(fleet('status', 'hello', '--json', '--lines', '0', **env).stdout)
++    repo = row['repos']['web']
++    assert repo['pr_state'] == state
++    if state == 'found':
++        assert repo['pr'] == {'number': 12, 'url': 'https://example.test/pr/12', 'state': 'OPEN'}
++    else:
++        assert repo['pr'] is None
++    if error:
++        assert error in repo['pr_error']
++    else:
++        assert repo['pr_error'] is None
++    text = fleet('status', 'hello', '--lines', '0', **env).stdout
++    if state == 'found':
++        assert 'PR: #12 OPEN https://example.test/pr/12' in text
++    elif state == 'none':
++        assert 'PR: 无' in text and '查询失败' not in text
++    else:
++        assert 'PR: 未知（查询失败：' in text and error in text
++
++
++def test_status_pr_query_timeout(setup, tmp_path):
++    root, fleet, _ = setup
++    gh = fake_gh(tmp_path)
++    fleet('new', 'hello', '-r', 'web', '--no-fetch')
++    row = json.loads(fleet('status', 'hello', '--json', '--lines', '0', FLEET_GH=str(gh), GH_MODE='sleep').stdout)
++    repo = row['repos']['web']
++    assert repo['pr_state'] == 'unknown' and repo['pr'] is None and '超时' in repo['pr_error']
++
++
++def test_status_pr_unknown_next_step(setup, tmp_path):
++    root, fleet, _ = setup
++    gh = fake_gh(tmp_path)
++    fleet('new', 'hello', '-r', 'web', '--no-fetch')
++    path = root / 'worktrees/hello/web'
++    (path / 'file').write_text('changed')
++    git(path, 'add', 'file'); git(path, 'commit', '-m', 'work')
++
++    def step(mode, **env):
++        row = json.loads(fleet('status', 'hello', '--json', '--lines', '0', FLEET_GH=str(gh), GH_MODE=mode, **env).stdout)
++        return row['phase'], row['next_step']
++
++    # Found or confirmed-absent PRs leave the suggestion unconditional.
++    for mode in ('found', 'empty'):
++        assert step(mode) == ('review', '核查 diff，让 agent 推送并提 PR')
++    # Unknown turns the review suggestion into a manual check first.
++    phase, next_step = step('fail')
++    assert phase == 'review' and '人工核查 PR 是否已存在' in next_step and 'PR 查询失败' in next_step
++    assert '提 PR' not in next_step.split('人工核查')[0]
++    # More urgent phases keep their advice and add the manual check.
++    phase, next_step = step('fail', AGENT_STATUS='blocked')
++    assert phase == 'blocked' and 'fleet peek 查看问题并交用户决策' in next_step and '人工核查 PR 是否已存在' in next_step
++
++
++def test_delivery_notice_marks_unknown_and_mixed_pr(setup, tmp_path):
++    _, fleet, log = setup
++    gh = fake_gh(tmp_path)
++    fleet('new', 'mixed', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
++    fleet('new', 'nope', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator', NEW_PANE='q')
++    fleet('event', '--pane', 'p', '--status', 'idle', GET_SEQ='12')
++    fleet('event', '--pane', 'q', '--status', 'idle', GET_SEQ='12', OTHER_SEQ='12')
++    log.write_text('')
++    # web's query fails, be's finds a PR: mixed keeps '?' alongside the link.
++    fleet('event', '--pane', 'coordinator', '--status', 'idle', COORD_STATUS='idle',
++          FLEET_GH=str(gh), GH_MODE='fail', GH_MODES='{"app-api": "found"}')
++    prompts = [c for line in log.read_text().splitlines() if (c := json.loads(line))[:2] == ['agent', 'prompt']]
++    assert len(prompts) == 1
++    mixed = next(line for line in prompts[0][3].splitlines() if line.startswith('mixed'))
++    nope = next(line for line in prompts[0][3].splitlines() if line.startswith('nope'))
++    assert mixed.endswith('https://example.test/pr/12,?')
++    assert nope.endswith(' ?')
++    # A confirmed-absent PR still reports '-', never '?'.
++    fleet('event', '--pane', 'q', '--status', 'working', OTHER_STATUS='working', OTHER_SEQ='13')
++    fleet('event', '--pane', 'q', '--status', 'idle', OTHER_STATUS='idle', OTHER_SEQ='14')
++    log.write_text('')
++    fleet('event', '--pane', 'coordinator', '--status', 'idle', COORD_STATUS='idle', FLEET_GH=str(gh), GH_MODE='empty')
++    prompts = [c for line in log.read_text().splitlines() if (c := json.loads(line))[:2] == ['agent', 'prompt']]
++    assert len(prompts) == 1
++    assert next(line for line in prompts[0][3].splitlines() if line.startswith('nope')).endswith(' -')
++
++
+ @pytest.mark.parametrize(('output', 'expected'), [
+     ('before\nFLEET-REPORT\n结果：完成\nEND FLEET-REPORT\nafter', 'FLEET-REPORT\n结果：完成\nEND FLEET-REPORT'),
+     ('FLEET-REPORT\nold\nEND FLEET-REPORT\nFLEET-REPORT\nnew\nEND FLEET-REPORT', 'FLEET-REPORT\nnew\nEND FLEET-REPORT'),
+-- 
+2.43.0
+
+
+From d234adb3fbb18abafe650b7635fc211f56c01aa1 Mon Sep 17 00:00:00 2001
+From: oms004 <ricekent@163.com>
+Date: Sat, 31 Oct 2026 08:53:01 +0800
+Subject: [PATCH 4/6] fix(herdr-fleet): validate PR field types in pr_info
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Key presence alone was not enough: an item like {"url": {}} passed as
+found, and a non-string url then crashed ','.join in notice_text during
+delivery. Validate the contract values too — number a positive int
+(bool excluded), url and state non-empty strings — so malformed items
+are unknown with a readable error instead of found. Empty arrays remain
+none.
+
+Generated with [Devin](https://devin.ai)
+
+Co-Authored-By: Devin <158243242+devin-ai-integration[bot]@users.noreply.github.com>
+---
+ skills/herdr-fleet/references/workflow.md |  2 +-
+ skills/herdr-fleet/scripts/fleet.py       | 11 ++++++-
+ tests/herdr-fleet/test_fleet.py           | 37 +++++++++++++++++++++++
+ 3 files changed, 48 insertions(+), 2 deletions(-)
+
+diff --git a/skills/herdr-fleet/references/workflow.md b/skills/herdr-fleet/references/workflow.md
+index 1d9ff00..7793317 100644
+--- a/skills/herdr-fleet/references/workflow.md
++++ b/skills/herdr-fleet/references/workflow.md
+@@ -94,7 +94,7 @@ END FLEET-REPORT
+ `status` 从所读取的最近输出中摘取最后一个完整回报块：开始标记是行首的 `FLEET-REPORT`（允许前导空白），结束标记是 `END FLEET-REPORT` 子串（可跟在字段内容同一行）。标记不得与字母、数字、`-`、`_` 直接相邻，因此 `FLEET-REPORT-EXAMPLE`、`APPEND FLEET-REPORT` 之类不算标记。摘取结果做 dedent：去掉各行公共前导空白，字段自身的缩进和已有换行保留。文本显示在「回报」一节，JSON 的 `report` 为原文或 `null`。只有开头没有结尾不算完整块，末尾未闭合的块不会盖掉前一个完整块；输出行数不足可能截断回报，可增大 `--lines`。`--lines 0` 不读取 agent 输出，也不摘取回报块。`send` 的补充说明不改变回报要求。
+ 
+ herdr 可执行文件依次取 `FLEET_HERDR`、`HERDR_BIN_PATH`，都没有时用 `herdr`。
+-PR 查询用 `FLEET_GH` 指定可执行文件，默认 `gh`。fleet 以 `pr list --head <分支> --state all --json number,url,state --limit 1` 调用它（工作目录为该仓库主 checkout），期望输出与 `gh pr list` 相同的 JSON 数组：空数组表示没有 PR；查询失败要以非零退出码结束并在 stderr 写明原因。对接其他代码托管时，`FLEET_GH` 可指向满足同一参数与输出契约的适配程序；该适配程序的失败同样只产生 unknown，不影响任务信息展示。
++PR 查询用 `FLEET_GH` 指定可执行文件，默认 `gh`。fleet 以 `pr list --head <分支> --state all --json number,url,state --limit 1` 调用它（工作目录为该仓库主 checkout），期望输出与 `gh pr list` 相同的 JSON 数组：空数组表示没有 PR；每项须是含 `number`（正整数）、`url`（非空字符串）、`state`（非空字符串，不限枚举）的对象；查询失败要以非零退出码结束并在 stderr 写明原因。对接其他代码托管时，`FLEET_GH` 可指向满足同一参数与输出契约的适配程序；该适配程序的失败同样只产生 unknown，不影响任务信息展示。
+ 查询结果分三态：`found`（查到 PR）、`none`（查询成功且返回空数组）、`unknown`（非零退出、无法执行、超时、非法 JSON 或结构不符）。`status` 文本依次显示 `PR: #12 …`、`PR: 无`、`PR: 未知（查询失败：…）`；`status --json` 的 `repos.<key>` 新增 `pr_state` 和 `pr_error`，`pr` 在 found 时为原 PR 对象、其余为 null。任一仓库为 unknown 时 `next_step` 会要求先人工核查 PR 是否已存在，不再无条件建议提 PR；自动通知里 unknown 以 `?` 标记（与已查到的链接并存时追加 `?`），`-` 只表示各仓库都确认无 PR。PR 查询失败不阻塞收尾。`ls --json` 保留原有键，新增 `agent_kind` 和 `phase`，出错时新增 `error`。
+ `ls` 表格包含 tab 列，tab 存在但没有 agent 时可与没有 tab 区分。`status` 的文本和 JSON 在仓库异常时显示 `phase=error` 和原因，尽力保留其他仓库的信息，返回码为 0（与 `ls` 一致）。
+ 
+diff --git a/skills/herdr-fleet/scripts/fleet.py b/skills/herdr-fleet/scripts/fleet.py
+index 1ca10f6..e088263 100755
+--- a/skills/herdr-fleet/scripts/fleet.py
++++ b/skills/herdr-fleet/scripts/fleet.py
+@@ -870,8 +870,17 @@ def pr_info(repo, branch):
+     except ValueError:
+         return {'state': 'unknown', 'pr': None, 'error': '输出不是合法 JSON'}
+     fields = {'number', 'url', 'state'}
+-    if not isinstance(result, list) or not all(isinstance(item, dict) and fields <= item.keys() for item in result):
++    expected = {'number': lambda v: type(v) is int and v > 0,
++                'url': lambda v: isinstance(v, str) and v != '',
++                'state': lambda v: isinstance(v, str) and v != ''}
++    if not isinstance(result, list):
+         return {'state': 'unknown', 'pr': None, 'error': '输出不是预期的 PR 数组'}
++    for i, item in enumerate(result):
++        if not isinstance(item, dict) or not fields <= item.keys():
++            return {'state': 'unknown', 'pr': None, 'error': '输出不是预期的 PR 数组'}
++        bad = next((name for name, ok in expected.items() if not ok(item[name])), None)
++        if bad:
++            return {'state': 'unknown', 'pr': None, 'error': f'第 {i + 1} 项 {bad} 值无效：{item[bad]!r}'[:200]}
+     if not result:
+         return {'state': 'none', 'pr': None, 'error': None}
+     return {'state': 'found', 'pr': result[0], 'error': None}
+diff --git a/tests/herdr-fleet/test_fleet.py b/tests/herdr-fleet/test_fleet.py
+index 75fcd99..3a6c6f2 100644
+--- a/tests/herdr-fleet/test_fleet.py
++++ b/tests/herdr-fleet/test_fleet.py
+@@ -98,6 +98,7 @@ elif mode == 'bad-json': print('oops'); sys.exit(0)
+ elif mode == 'dict': print(json.dumps({'prs': []})); sys.exit(0)
+ elif mode == 'missing-keys': print(json.dumps([{'number': 12}])); sys.exit(0)
+ elif mode == 'found': print(json.dumps([{'number': 12, 'url': 'https://example.test/pr/12', 'state': 'OPEN'}])); sys.exit(0)
++elif mode == 'raw': print(os.environ.get('GH_OUTPUT', '[]')); sys.exit(0)
+ print('[]')
+ '''
+ 
+@@ -1175,6 +1176,42 @@ def test_status_pr_query_states(setup, tmp_path, mode, state, error):
+         assert 'PR: 未知（查询失败：' in text and error in text
+ 
+ 
++@pytest.mark.parametrize('item,bad', [
++    ({'number': 12, 'url': {}, 'state': 'OPEN'}, 'url'),
++    ({'number': 12, 'url': ['https://example.test/pr/12'], 'state': 'OPEN'}, 'url'),
++    ({'number': 12, 'url': None, 'state': 'OPEN'}, 'url'),
++    ({'number': 12, 'url': '', 'state': 'OPEN'}, 'url'),
++    ({'number': True, 'url': 'https://example.test/pr/12', 'state': 'OPEN'}, 'number'),
++    ({'number': '12', 'url': 'https://example.test/pr/12', 'state': 'OPEN'}, 'number'),
++    ({'number': 0, 'url': 'https://example.test/pr/12', 'state': 'OPEN'}, 'number'),
++    ({'number': 12, 'url': 'https://example.test/pr/12', 'state': 12}, 'state'),
++    ({'number': 12, 'url': 'https://example.test/pr/12', 'state': ''}, 'state'),
++])
++def test_status_pr_field_types(setup, tmp_path, item, bad):
++    root, fleet, _ = setup
++    gh = fake_gh(tmp_path)
++    fleet('new', 'hello', '-r', 'web', '--no-fetch')
++    env = {'FLEET_GH': str(gh), 'GH_MODE': 'raw', 'GH_OUTPUT': json.dumps([item])}
++    repo = json.loads(fleet('status', 'hello', '--json', '--lines', '0', **env).stdout)['repos']['web']
++    assert repo['pr_state'] == 'unknown' and repo['pr'] is None and bad in repo['pr_error']
++    text = fleet('status', 'hello', '--lines', '0', **env).stdout
++    assert 'PR: 未知（查询失败：' in text
++
++
++def test_delivery_notice_bad_pr_fields_marks_unknown(setup, tmp_path):
++    _, fleet, log = setup
++    gh = fake_gh(tmp_path)
++    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
++    log.write_text('')
++    result = fleet('event', '--pane', 'p', '--status', 'idle', GET_SEQ='12', COORD_STATUS='idle',
++                   FLEET_GH=str(gh), GH_MODE='raw', GH_OUTPUT='[{"number":12,"url":{},"state":"OPEN"}]')
++    assert result.returncode == 0
++    prompts = [c for line in log.read_text().splitlines() if (c := json.loads(line))[:2] == ['agent', 'prompt']]
++    assert len(prompts) == 1
++    line = next(l for l in prompts[0][3].splitlines() if l.startswith('hello'))
++    assert line.endswith(' ?')
++
++
+ def test_status_pr_query_timeout(setup, tmp_path):
+     root, fleet, _ = setup
+     gh = fake_gh(tmp_path)
+-- 
+2.43.0
+
+
+From 210680a1228e1001fdd70e59d4456ddbed5da717 Mon Sep 17 00:00:00 2001
+From: oms004 <ricekent@163.com>
+Date: Sat, 31 Oct 2026 09:19:50 +0800
+Subject: [PATCH 5/6] fix(herdr-fleet): supersede stale-round done/idle notices
+ on new round
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A queued done/idle event could be delivered to the coordinator after a
+new working round had already started, presenting the old round's
+terminal as if the task had just finished (issue #38).
+
+Each inbox event now records the round baseline that produced it (same
+value the dedup_key has always embedded; older records are read through
+the key). When a new round is established — a confirmed send/new
+submission, or a manual working edge — pending done/idle events of
+older rounds for that task are marked superseded: kept in inbox --all,
+attempts untouched, never prompted. Failed submissions supersede
+nothing; blocked/exited events are never auto-superseded.
+
+Delivery builds the notice outside locks as before, then re-checks
+inside the delivery lock plus the involved task locks (acquired in
+slug order): pending membership and each done/idle event's baseline
+against the task's current TASK.md round. The re-check and the prompt
+run under the same task locks so a send cannot slip between them;
+the cross-task state lock is still never held during external calls.
+
+Stale blocked events are still delivered but annotated with the event
+round, the current round and the live agent status
+([round old -> new] 当前状态 working); the phase is derived from the
+live status rather than the recorded terminal. Every notice line now
+carries round information; rounds that cannot be determined show
+[round ?] instead of implying a fresh terminal.
+
+Fixes #38
+
+Generated with [Devin](https://devin.ai)
+
+Co-Authored-By: Devin <158243242+devin-ai-integration[bot]@users.noreply.github.com>
+---
+ CONTEXT.md                                |   2 +-
+ skills/herdr-fleet/SKILL.md               |   4 +-
+ skills/herdr-fleet/references/workflow.md |  14 +-
+ skills/herdr-fleet/scripts/fleet.py       | 180 ++++++++++++++++-----
+ tests/herdr-fleet/test_fleet.py           | 186 +++++++++++++++++++++-
+ 5 files changed, 334 insertions(+), 52 deletions(-)
+
+diff --git a/CONTEXT.md b/CONTEXT.md
+index 341ebe8..035f1b7 100644
+--- a/CONTEXT.md
++++ b/CONTEXT.md
+@@ -35,7 +35,7 @@
+ | state root / `--state-dir` | 状态根 / 状态目录 | `state.json` 所在目录，默认 `$XDG_STATE_HOME/herdr-pair/<cwd-hash>`；所有方必须给出同一个绝对 `--cwd` 与 `--state-dir`。 | `skills/herdr-pair/SKILL.md` §0；`skills/herdr-pair/scripts/pairctl.py`（`default_root`） |
+ | pane index | 窗格索引 | 记录"某个 pane 属于哪个 state 目录与角色"的每窗格文件 `$XDG_STATE_HOME/herdr-pair/panes/<pane_id>.json`，只服务插件续跑；`state.json` 仍是唯一事实来源。 | `skills/herdr-pair/scripts/pairctl.py`（`pane_index_path`、`record_pane`）；`skills/herdr-pair/herdr-plugin.toml` |
+ | quality kill-switch | 质量停手开关 | §7 质量门：出现"声称改了却无改动、数字无出处、同一指令漏两次、越 fence、解释两次站不住、要重写它大部分产出"时停手并报证据。 | `skills/herdr-pair/SKILL.md` §7；`skills/herdr-pair/references/verification.md#quality-gate` |
+-| fleet task (herdr-fleet) | 并行任务 | 主 agent 用 `fleet new` 开出的一个独立任务：`worktrees/<slug>/` 下每个仓库一个 git worktree（分支 `<type>/<slug>`）、一份 `TASK.md`、一个以 slug 命名并运行任务 agent 的 herdr tab；`coordinator_pane` 是主 agent 的 pane，收件箱保存待投递及已投递的任务事件；仓库布局由项目根的 `.herdr-fleet.toml` 声明。 | `skills/herdr-fleet/SKILL.md`；`skills/herdr-fleet/references/workflow.md` §命令 |
++| fleet task (herdr-fleet) | 并行任务 | 主 agent 用 `fleet new` 开出的一个独立任务：`worktrees/<slug>/` 下每个仓库一个 git worktree（分支 `<type>/<slug>`）、一份 `TASK.md`、一个以 slug 命名并运行任务 agent 的 herdr tab；`coordinator_pane` 是主 agent 的 pane，收件箱保存待投递、已投递与被新轮次取代（superseded）的任务事件，每条事件带产生它的轮次基线；仓库布局由项目根的 `.herdr-fleet.toml` 声明。 | `skills/herdr-fleet/SKILL.md`；`skills/herdr-fleet/references/workflow.md` §命令 |
+ | delivery package (customer-delivery) | 交付包 | 交给客户的目录产物：只含一个 Excel 工作簿、一个离线 HTML 报告和一个 `plot/` 目录，内部列名、路径、文件名、日志与流程细节必须剥离。 | `skills/customer-delivery/SKILL.md` §客户交付包生成 |
+ | report simplification layer (customer-report-simplify) | 报告精简层 | 在不改交付原件的前提下，另开一份围绕客户问题重排的内容层：正文只回答问题，其余进折叠附录。 | `skills/customer-report-simplify/SKILL.md` §第二步；`skills/customer-report-simplify/scripts/audit_report.py` |
+ | print contract (html-pdf-print) | 打印契约 | 打印前先定下的目标浏览器/打印引擎、纸张、缩放，以及页脚是每页重复还是仅末页底部；验收对象是实际生成的 PDF。 | `skills/html-pdf-print/SKILL.md` §先明确打印契约 |
+diff --git a/skills/herdr-fleet/SKILL.md b/skills/herdr-fleet/SKILL.md
+index 36fc10d..368044b 100644
+--- a/skills/herdr-fleet/SKILL.md
++++ b/skills/herdr-fleet/SKILL.md
+@@ -51,10 +51,10 @@ fleet new <slug> [-r <键>[,<键>]] [--fix] [--base <键>=<ref>] [--agent <种
+ - `fleet status <slug>`：查看下一步建议、提交、diff 统计、未提交文件、PR 和 agent 最近输出。仓库异常时显示 `phase=error` 和原因，并尽力显示其他仓库；`--lines` 不接受负数。PR 分三态：`PR: #12 …` / `PR: 无` / `PR: 未知（查询失败：…）`；查询失败时按提示人工核查 PR 是否已存在，通知里的 `?` 同样表示未知而非无 PR。
+ - `status` 的「回报」与 JSON `report` 摘取 agent 输出里最后一个完整 `FLEET-REPORT`…`END FLEET-REPORT` 块。启动提示要求任务 agent 把回报块放进 fenced text 代码块：普通 Markdown 段落会把单换行折叠成一段，解析器只按原样摘取、不还原被折叠的换行。`report` 为 null 时用 `--lines` 扩大读取或 `fleet peek` 人工查看，摘取规则见 `references/workflow.md`。
+ - `fleet wait <slug>... [--any|--all] [--timeout SEC]`：等待最近一次提交后的 idle/done/blocked；默认 `--all`，`--any` 等首个终态。返回码分别为 0/0/3；超时为 4，其他错误为 1。终态观察成功后仓库信息出错不改变返回码。
+-- 收到 herdr-fleet 自动通知后，先逐个执行 `fleet status <slug>` 核查，再向用户汇报；通知本身不是验收证据。
++- 收到 herdr-fleet 自动通知后，先逐个执行 `fleet status <slug>` 核查，再向用户汇报；通知本身不是验收证据。每行带 `[round <轮次>]`；旧轮次未投递的 blocked/exited 显示 `[round <旧> → <当前>]` 与实时状态，说明该阻塞/退出属于已被取代的旧轮次。旧轮次排队未投递的 done/idle 不会出现在通知里，会被标记 superseded。
+ - 插件订阅 `pane.exited`、`pane.closed` 和 `tab.closed`；旧任务索引缺少 tab_id 时，运行 `fleet bind` 或重新打开任务以登记 tab。关 tab 的通知路径已在真机验证。
+ - 是否上报 `blocked` 取决于 agent 集成：pi 集成只在收到 pi 事件 `herdr:blocked` 时上报，纯文字提问显示 done；blocked 通知已用探针扩展在真机验证（见 README 验证清单）。
+-- `fleet inbox`：查看待投递事件；通知不可用时用它辅助排查，不能代替同一轮内等待。
++- `fleet inbox`：查看待投递事件；`--all` 另含已投递和被新轮次取代（superseded）的历史。通知不可用时用它辅助排查，不能代替同一轮内等待。
+ - `fleet peek <slug> [--lines N]`：查看任务 agent 的最近输出。
+ - agent 状态为 `blocked`（等待确认或提问）时，先 peek 弄清它在问什么。属于用户的决策就转给用户，主 agent 不代为做决定。
+ - `fleet send <slug> '<补充说明>'`：转达用户的补充或修正。用户中途追加的、与现有任务无关的需求，应该另开一个任务，不要塞进正在进行的任务。
+diff --git a/skills/herdr-fleet/references/workflow.md b/skills/herdr-fleet/references/workflow.md
+index 7793317..91e253c 100644
+--- a/skills/herdr-fleet/references/workflow.md
++++ b/skills/herdr-fleet/references/workflow.md
+@@ -65,15 +65,23 @@ fleet gc [--apply]                       # 报告所有仓库的全部 worktree
+ 
+ `peek` 和 `send` 按 tab 找到任务 agent 所在的 pane，再对 pane 操作。`herdr agent list` 里的 `agent` 字段是种类（如 `pi`），多个任务同时用 pi 时不唯一。
+ 
+-`new` 和 `open` 在设置了 `HERDR_PANE_ID` 时将该主 agent pane 记为 `coordinator_pane`。`bind` 将当前项目所有任务改绑到当前 pane，待投递事件也改绑；已投递历史保留原目标。旧任务没有此字段时仍可使用。pane 索引和收件箱位于 `$XDG_STATE_HOME/herdr-fleet/`（默认 `~/.local/state/herdr-fleet/`），不占用任务目录；读写通过文件锁协调，`done` 清除对应记录，`--dry-run` 不清除。收件箱记录项目根、任务、目标 pane、终态、时间、去重键、投递状态、尝试次数和最近错误。`inbox` 不改变状态。
++`new` 和 `open` 在设置了 `HERDR_PANE_ID` 时将该主 agent pane 记为 `coordinator_pane`。`bind` 将当前项目所有任务改绑到当前 pane，待投递事件也改绑；已投递与被取代的历史保留原目标。旧任务没有此字段时仍可使用。pane 索引和收件箱位于 `$XDG_STATE_HOME/herdr-fleet/`（默认 `~/.local/state/herdr-fleet/`），不占用任务目录；读写通过文件锁协调，`done` 清除对应记录，`--dry-run` 不清除。收件箱记录项目根、任务、目标 pane、终态、时间、去重键、事件轮次基线（`baseline`）、投递状态、尝试次数和最近错误；`delivery` 为 `pending`/`delivered`/`superseded`。`inbox` 不改变状态，默认只列 `pending`，`--all` 含已投递与被取代的记录。
+ 
+-`event` 接受 `working`、`idle`、`done`、`blocked`、`exited`。任务每次成功提交以 `submit_seq` 为轮次基线；working 边沿也可开始手动输入的下一轮。只记录晚于基线且尚未通知的终态，重复和过期边沿不重复入箱。主 agent 为 idle/done 时尝试投递，否则保留待投递；主 agent 的 idle/done 边沿会合并投递待投递事件。投递须得到 `agent_prompted` 确认，失败时保留记录和错误；pane 不存在时显示一次 herdr 通知。通知只是触发器，须用 `fleet status` 核查。插件将 `pane.exited`、`pane.closed` 与 `tab.closed` 映射为任务 `exited` 事件；关 tab 时通过索引的 tab_id 查找任务 pane。旧索引可通过 `fleet bind` 或重新打开任务补登记。仅安装本命令不会自动订阅事件。
++`event` 接受 `working`、`idle`、`done`、`blocked`、`exited`。任务每次成功提交以 `submit_seq` 为轮次基线；working 边沿也可开始手动输入的下一轮。只记录晚于基线且尚未通知的终态，重复和过期边沿不重复入箱。每条事件保存产生它的轮次基线（与去重键第三项同值；字段加入前的旧记录按去重键解析，无法解析则轮次未知）。主 agent 为 idle/done 时尝试投递，否则保留待投递；主 agent 的 idle/done 边沿会合并投递待投递事件。投递须得到 `agent_prompted` 确认，失败时保留记录和错误；pane 不存在时显示一次 herdr 通知。通知只是触发器，须用 `fleet status` 核查。插件将 `pane.exited`、`pane.closed` 与 `tab.closed` 映射为任务 `exited` 事件；关 tab 时通过索引的 tab_id 查找任务 pane。旧索引可通过 `fleet bind` 或重新打开任务补登记。仅安装本命令不会自动订阅事件。
++
++新轮次建立后（`new`/`send` 提交确认，或开启下一轮的手动 working 边沿），同一任务更早轮次里仍待投递的 done/idle 事件被标记 `superseded`：记录保留在 `--all` 中、尝试次数不变、默认列表不再出现，也绝不会再投递给主 agent。提交失败不建立轮次，也就不取代任何事件。其他任务的事件、当前新轮次的事件不受影响；blocked 与 exited 不自动取代——blocked 承载用户决策，仍按下面的轮次标注投递。
++
++投递时消息在锁外构造，随后在投递锁与所涉任务锁（按 slug 排序，先取投递锁再取任务锁）内复核：待投递集合未变，且各 done/idle 事件的轮次基线不早于该任务 `TASK.md` 当前 `event_round.baseline`；复核不过的改标 `superseded` 并重建消息，绝不用构造时的旧快照投递。复核与 `agent prompt` 在同一组任务锁内完成，使 `send`/轮次边沿无法插入二者之间；跨任务全局状态锁只在读写内存数据时持有，调用 herdr/git 期间不持有。
++
++通知每行格式为 `<slug> <终态> [round <事件轮次>] <phase> <PR>`。事件轮次已被取代但仍需投递的事件（blocked、exited）显示 `[round <事件轮次> → <当前轮次>] 当前状态 <实时 agent 状态>`，phase 按实时状态而非旧终态计算；轮次无法确定时显示 `[round ?]`。
+ 
+ 开始确认只阻塞同一任务的事件处理，不持有跨任务的状态锁。herdr 状态钩子不带序号：处理 `working` 时若实时状态已是终态，则以实时序号推断快速结束的手动轮次；已有通知时实时序号必须晚于上次终态。单独的 `done` → `idle` 后续边沿不会再次通知。但若上一轮迟到的 `working` 恰好在同轮 `done` → `idle` 后才处理，它与快速完成的新轮次无法区分，可能额外通知一次；此取舍避免静默漏掉新轮次。
+ 
+ 手动新轮次的 `working` 钩子尚未处理时，若 agent 已退出且 `exited` 先到，而上一轮已通知或没有轮次记录，则该轮不会通知。钩子载荷没有序号，无法把它与同一轮 `done` 后退出区分，不能简单地对每次退出都发通知。
+ 
+-投递先构造消息，再查询主 agent 状态并发送，但查询和 `agent prompt` 之间仍有窗口；herdr 没有「仅空闲时接受」的原子条件。herdr 在提交时 agent 已为 `blocked` 会以 `agent_blocked` 拒绝，处于 `working` 时 prompt 是排队还是打断尚未真机验证。
++投递先构造消息，再在锁内复核轮次并查询主 agent 状态、发送；轮次复核与 prompt 之间无窗口（同一组任务锁），但主 agent 状态查询和 `agent prompt` 之间仍有窗口：herdr 没有「仅空闲时接受」的原子条件，主 agent 可能在检查后重新开始工作。herdr 在提交时 agent 已为 `blocked` 会以 `agent_blocked` 拒绝，处于 `working` 时 prompt 是排队还是打断尚未真机验证。
++
++钩子载荷没有序号：事件上的轮次基线是入箱时按当时 TASK.md 记下的值（与去重键第三项相同），不是事后从当前 TASK.md 反推的真实历史；字段加入前的旧记录按去重键还原同一记录值，去重键也无法解析时只能按轮次未知处理。
+ 
+ 仅在真机 herdr 0.9.1 上实测，`state_change_seq` 跨 pane 全局递增（多个 pane 间从 9185 到 9238），新 pane 不复用旧序号；因此该版本中 `open` 重建后保留旧 `submit_seq`/`event_round` 不会因序号复用而误去重。
+ 
+diff --git a/skills/herdr-fleet/scripts/fleet.py b/skills/herdr-fleet/scripts/fleet.py
+index e088263..480f4c3 100755
+--- a/skills/herdr-fleet/scripts/fleet.py
++++ b/skills/herdr-fleet/scripts/fleet.py
+@@ -43,7 +43,8 @@ class InboxEvent(TypedDict):
+     status: str
+     created: str
+     dedup_key: str
+-    delivery: Literal['pending', 'delivered']
++    baseline: int | None
++    delivery: Literal['pending', 'delivered', 'superseded']
+     attempts: int
+     last_error: str | None
+ 
+@@ -250,6 +251,42 @@ def task_index_matches(entry, slug):
+     return entry.get('root') == str(ROOT) and entry.get('slug') == slug and entry.get('role') == 'task'
+ 
+ 
++def event_baseline(item):
++    """Round baseline recorded when the event was created.
++
++    New records carry a `baseline` field holding the same value the dedup_key
++    has always embedded as its third element; older inbox records only have
++    the key, so it is parsed back. This reads what was recorded at enqueue
++    time — hooks carry no sequence, so a missing value stays unknown rather
++    than being reconstructed from the current TASK.md.
++    """
++    baseline = item.get('baseline')
++    if isinstance(baseline, int):
++        return baseline
++    try:
++        key = json.loads(item.get('dedup_key') or '')
++    except ValueError:
++        return None
++    return key[2] if isinstance(key, list) and len(key) == 3 and isinstance(key[2], int) else None
++
++
++def supersede_stale_events(inbox, slug, baseline):
++    """Mark this task's pending done/idle events from older rounds superseded.
++
++    Called once a new round exists (confirmed send/new submission, or a manual
++    working edge): those terminals describe a round the new one replaces, so
++    they must never reach the coordinator as a fresh completion. The record is
++    kept for `inbox --all` with attempts untouched; blocked/exited events are
++    never superseded automatically since blocked carries a user decision.
++    """
++    for item in inbox:
++        if (item.get('root') == str(ROOT) and item.get('slug') == slug and item.get('delivery') == 'pending'
++                and item.get('status') in ('done', 'idle')):
++            old = event_baseline(item)
++            if old is not None and old < baseline:
++                item['delivery'] = 'superseded'
++
++
+ def register_task(data, pane, tab_id):
+     coordinator = os.environ.get('HERDR_PANE_ID')
+     if not coordinator:
+@@ -411,6 +448,7 @@ def task_event(a):
+                     # Prefer an extra notice over silently losing that round.
+                     round_state = {'baseline': seq if status == 'working' else seq - 1,
+                                    'notified': False, 'last_terminal_seq': last}
++                    supersede_stale_events(inbox, data['slug'], round_state['baseline'])
+                 elif round_state['notified']:
+                     return
+                 if status == 'working':
+@@ -429,7 +467,8 @@ def task_event(a):
+         if not exists:
+             inbox.append({'root': str(ROOT), 'slug': data['slug'], 'coordinator_pane': coordinator,
+                           'status': a.status, 'created': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+-                          'dedup_key': key, 'delivery': 'pending', 'attempts': 0, 'last_error': None})
++                          'dedup_key': key, 'baseline': round_state['baseline'],
++                          'delivery': 'pending', 'attempts': 0, 'last_error': None})
+         data['event_round'] = round_state
+         save(data)
+         if not exists:
+@@ -451,11 +490,24 @@ def herdr_result(*args):
+ def notice_text(events):
+     header = 'herdr-fleet 自动通知（非用户消息）'
+     footer = '请逐个使用 fleet status <slug> 核查。'
++    tabs, agents = herdr_state()
+     lines = []
+     for item in events:
+         phase, prs, pr_failed = 'unknown', [], False
++        baseline, stale, now, current = event_baseline(item), False, None, None
+         try:
+             data = load(item['slug'])
++            now = (data.get('event_round') or {}).get('baseline')
++            stale = baseline is not None and isinstance(now, int) and baseline < now
++            status = item['status']
++            if stale:
++                # The round that produced this event was replaced: report the
++                # live agent status and derive the phase from it, not from the
++                # stale terminal recorded on the event.
++                tab = find_tab(item['slug'], tabs)
++                agent = next((entry for entry in agents if tab and entry.get('tab_id') == tab['tab_id']), None)
++                current = agent.get('agent_status') if agent else None
++                status = current or 'unknown'
+             repos = {}
+             for key, info in data['repos'].items():
+                 repo = REPOS[key]['path']
+@@ -465,11 +517,17 @@ def notice_text(events):
+                     prs.append(result['pr']['url'])
+                 elif result['state'] == 'unknown':
+                     pr_failed = True
+-            phase = task_phase(item['status'], repos)
++            phase = task_phase(status, repos)
+         except (RuntimeError, OSError, ValueError, KeyError):
+             pass
+         if pr_failed: prs.append('?')
+-        lines.append(f"{item['slug']} {item['status']} {phase} {','.join(prs) or '-'}".replace('\n', ' '))
++        if baseline is None:
++            marker = '[round ?]'
++        elif stale:
++            marker = f'[round {baseline} → {now}] 当前状态 {current or "unknown"}'
++        else:
++            marker = f'[round {baseline}]'
++        lines.append(f"{item['slug']} {item['status']} {marker} {phase} {','.join(prs) or '-'}".replace('\n', ' '))
+     shown = []
+     for line in lines:
+         remaining = len(lines) - len(shown) - 1
+@@ -492,6 +550,30 @@ def delivery_lock(coordinator):
+         yield
+ 
+ 
++def stale_event_keys(selected):
++    """dedup_keys of selected done/idle events whose round was since replaced.
++
++    Re-reads each task's current TASK.md round; callers hold the selected
++    tasks' locks so the check cannot race a new round being established
++    (send/new submission or a manual working edge). Events whose baseline is
++    unknown or cannot be compared stay deliverable.
++    """
++    stale = set()
++    for item in selected:
++        if item.get('status') not in ('done', 'idle'):
++            continue
++        baseline = event_baseline(item)
++        if baseline is None:
++            continue
++        try:
++            current = (load(item['slug']).get('event_round') or {}).get('baseline')
++        except RuntimeError:
++            continue
++        if isinstance(current, int) and baseline < current:
++            stale.add(item['dedup_key'])
++    return stale
++
++
+ def deliver(coordinator):
+     while True:
+         with fleet_state() as (_, inbox):
+@@ -500,43 +582,58 @@ def deliver(coordinator):
+             return
+         text = notice_text(selected)
+         keys = {item['dedup_key'] for item in selected}
++        slugs = sorted({item['slug'] for item in selected})
+         with delivery_lock(coordinator):
+-            with fleet_state() as (_, inbox):
+-                current = {item['dedup_key'] for item in inbox if item.get('root') == str(ROOT)
+-                           and item.get('coordinator_pane') == coordinator and item.get('delivery') == 'pending'}
+-            if not keys <= current:
+-                continue
+-            code, payload, error = herdr_result('agent', 'get', coordinator)
+-            result = payload.get('result', {})
+-            if code:
+-                error_code = payload.get('error', {}).get('code')
+-                missing = error_code == 'pane_not_found'
+-                if error_code == 'agent_not_found':
+-                    pane_code, pane_payload, _ = herdr_result('pane', 'get', coordinator)
+-                    missing = bool(pane_code and pane_payload.get('error', {}).get('code') == 'pane_not_found')
+-                if missing:
+-                    with fleet_state(write=True) as (panes, _):
+-                        entry = panes.get(coordinator, {})
+-                        warn = not entry.get('missing_notified')
+-                        if warn: entry['missing_notified'] = True
+-                    if warn:
+-                        herdr_result('notification', 'show', 'herdr-fleet 通知未送达', '--body', f'主 agent pane {coordinator} 不存在，请检查 fleet inbox')
+-                return
+-            status = result.get('agent', {}).get('agent_status')
+-            if status not in ('idle', 'done'):
+-                return
+-            code, payload, error = herdr_result('agent', 'prompt', coordinator, text)
+-            result = payload.get('result', payload)
+-            success = code == 0 and result.get('type') == 'agent_prompted'
+-            with fleet_state(write=True) as (_, inbox):
+-                for item in inbox:
+-                    if (item.get('root') == str(ROOT) and item.get('dedup_key') in keys
+-                            and item.get('coordinator_pane') == coordinator and item.get('delivery') == 'pending'):
+-                        item['attempts'] += 1
+-                        item['last_error'] = None if success else (error or 'agent_prompted 未确认')
+-                        if success: item['delivery'] = 'delivered'
+-            if not success:
+-                return
++            # Sorted per-task locks serialize the re-check and the prompt with
++            # submissions/round edges for the same tasks; the cross-task state
++            # lock is still never held while calling herdr.
++            with ExitStack() as stack:
++                for slug in slugs:
++                    stack.enter_context(task_lock(slug))
++                with fleet_state() as (_, inbox):
++                    current = {item['dedup_key'] for item in inbox if item.get('root') == str(ROOT)
++                               and item.get('coordinator_pane') == coordinator and item.get('delivery') == 'pending'}
++                if not keys <= current:
++                    continue
++                stale = stale_event_keys(selected)
++                if stale:
++                    with fleet_state(write=True) as (_, inbox):
++                        for item in inbox:
++                            if (item.get('root') == str(ROOT) and item.get('coordinator_pane') == coordinator
++                                    and item.get('delivery') == 'pending' and item.get('dedup_key') in stale):
++                                item['delivery'] = 'superseded'
++                    continue
++                code, payload, error = herdr_result('agent', 'get', coordinator)
++                result = payload.get('result', {})
++                if code:
++                    error_code = payload.get('error', {}).get('code')
++                    missing = error_code == 'pane_not_found'
++                    if error_code == 'agent_not_found':
++                        pane_code, pane_payload, _ = herdr_result('pane', 'get', coordinator)
++                        missing = bool(pane_code and pane_payload.get('error', {}).get('code') == 'pane_not_found')
++                    if missing:
++                        with fleet_state(write=True) as (panes, _):
++                            entry = panes.get(coordinator, {})
++                            warn = not entry.get('missing_notified')
++                            if warn: entry['missing_notified'] = True
++                        if warn:
++                            herdr_result('notification', 'show', 'herdr-fleet 通知未送达', '--body', f'主 agent pane {coordinator} 不存在，请检查 fleet inbox')
++                    return
++                status = result.get('agent', {}).get('agent_status')
++                if status not in ('idle', 'done'):
++                    return
++                code, payload, error = herdr_result('agent', 'prompt', coordinator, text)
++                result = payload.get('result', payload)
++                success = code == 0 and result.get('type') == 'agent_prompted'
++                with fleet_state(write=True) as (_, inbox):
++                    for item in inbox:
++                        if (item.get('root') == str(ROOT) and item.get('dedup_key') in keys
++                                and item.get('coordinator_pane') == coordinator and item.get('delivery') == 'pending'):
++                            item['attempts'] += 1
++                            item['last_error'] = None if success else (error or 'agent_prompted 未确认')
++                            if success: item['delivery'] = 'delivered'
++                if not success:
++                    return
+ 
+ 
+ def event(a):
+@@ -592,11 +689,12 @@ def submit(data, pane, text):
+                 if error == 'agent_blocked':
+                     raise RuntimeError(f"agent 已 blocked，请先 fleet peek {data['slug']}")
+                 raise RuntimeError(f'开始确认失败：{p.stderr or p.stdout}')
+-        with fleet_state():
++        with fleet_state(write=True) as (_, inbox):
+             data = load(data['slug'])
+             previous = data.get('event_round', {})
+             data['event_round'] = {'baseline': seq, 'notified': False, 'last_terminal_seq': previous.get('last_terminal_seq', -1)}
+             save(data)
++            supersede_stale_events(inbox, data['slug'], seq)
+ 
+ 
+ def tasks():
+diff --git a/tests/herdr-fleet/test_fleet.py b/tests/herdr-fleet/test_fleet.py
+index 3a6c6f2..0b93905 100644
+--- a/tests/herdr-fleet/test_fleet.py
++++ b/tests/herdr-fleet/test_fleet.py
+@@ -467,6 +467,9 @@ def test_event_fast_completion_stale_and_next_round(setup):
+     event('blocked', 14)
+     rows = json.loads(fleet('inbox', '--all', '--json').stdout)
+     assert [r['status'] for r in rows] == ['idle', 'blocked']
++    # The new working round superseded the queued idle; the blocked stays pending.
++    assert [r['delivery'] for r in rows] == ['superseded', 'pending']
++    assert [r['baseline'] for r in rows] == [10, 13]
+     assert len({r['dedup_key'] for r in rows}) == 2
+ 
+ 
+@@ -522,7 +525,10 @@ def test_manual_round_delayed_working_and_done_to_idle(setup):
+     fleet('event', '--pane', 'p', '--status', 'working', GET_STATUS='done', GET_SEQ='16')
+     fleet('event', '--pane', 'p', '--status', 'done', GET_STATUS='done', GET_SEQ='16')
+     fleet('event', '--pane', 'p', '--status', 'idle', GET_STATUS='idle', GET_SEQ='17')
+-    assert [e['status'] for e in json.loads(fleet('inbox', '--json').stdout)] == ['done', 'done']
++    # The ambiguous new round superseded the older queued done; history keeps it.
++    rows = json.loads(fleet('inbox', '--all', '--json').stdout)
++    assert [(e['status'], e['delivery']) for e in rows] == [('done', 'superseded'), ('done', 'pending')]
++    assert [e['status'] for e in json.loads(fleet('inbox', '--json').stdout)] == ['done']
+ 
+ 
+ def test_ambiguous_late_working_after_done_to_idle_prefers_notice(setup):
+@@ -531,7 +537,11 @@ def test_ambiguous_late_working_after_done_to_idle_prefers_notice(setup):
+     fleet('event', '--pane', 'p', '--status', 'done', GET_STATUS='done', GET_SEQ='12')
+     fleet('event', '--pane', 'p', '--status', 'idle', GET_STATUS='idle', GET_SEQ='13')
+     fleet('event', '--pane', 'p', '--status', 'working', GET_STATUS='idle', GET_SEQ='13')
+-    assert [e['status'] for e in json.loads(fleet('inbox', '--json').stdout)] == ['done', 'idle']
++    # Prefer an extra notice: the ambiguous round still produces a pending idle,
++    # while the older done is retained as superseded rather than dropped.
++    rows = json.loads(fleet('inbox', '--all', '--json').stdout)
++    assert [(e['status'], e['delivery']) for e in rows] == [('done', 'superseded'), ('idle', 'pending')]
++    assert [e['status'] for e in json.loads(fleet('inbox', '--json').stdout)] == ['idle']
+ 
+ 
+ def test_same_task_fast_event_waits_for_submission_confirmation(setup, tmp_path):
+@@ -570,7 +580,9 @@ def test_manual_round_not_blocked_by_other_task_submit(setup, tmp_path):
+         finally:
+             barrier.with_suffix('.release').touch()
+         submit.result(timeout=10)
+-    assert [e['status'] for e in json.loads(fleet('inbox', '--json').stdout)] == ['done', 'done']
++    # The manual new round superseded the queued done; the new done stays pending.
++    rows = json.loads(fleet('inbox', '--all', '--json').stdout)
++    assert [(e['status'], e['delivery']) for e in rows] == [('done', 'superseded'), ('done', 'pending')]
+ 
+ 
+ def test_event_failed_submission_does_not_start_round(setup):
+@@ -588,8 +600,12 @@ def test_event_send_starts_next_round_without_working_event(setup):
+     fleet('send', 'hello', 'again', GET_SEQ='12')
+     fleet('event', '--pane', 'p', '--status', 'idle', GET_SEQ='12')
+     fleet('event', '--pane', 'p', '--status', 'idle', GET_SEQ='14')
+-    rows = json.loads(fleet('inbox', '--json').stdout)
+-    assert len(rows) == 2 and rows[0]['dedup_key'] != rows[1]['dedup_key']
++    # The confirmed send superseded the older queued idle; the new round's own
++    # idle stays pending under a different dedup key.
++    rows = json.loads(fleet('inbox', '--all', '--json').stdout)
++    assert [(r['status'], r['delivery']) for r in rows] == [('idle', 'superseded'), ('idle', 'pending')]
++    assert rows[0]['dedup_key'] != rows[1]['dedup_key']
++    assert [r['status'] for r in json.loads(fleet('inbox', '--json').stdout)] == ['idle']
+ 
+ 
+ def test_event_exited_without_agent_get(setup):
+@@ -813,6 +829,166 @@ def test_delivery_status_rechecked_after_message_construction(setup, tmp_path):
+     assert len(json.loads(fleet('inbox', '--json').stdout)) == 1
+ 
+ 
++def coordinator_prompts(log):
++    return [c for line in log.read_text().splitlines()
++            if (c := json.loads(line))[:2] == ['agent', 'prompt'] and c[2] == 'coordinator']
++
++
++def test_send_supersedes_queued_done_and_idle_delivery_stays_silent(setup):
++    root, fleet, log = setup
++    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
++    # The task finishes round 10 while the coordinator is still working.
++    fleet('event', '--pane', 'p', '--status', 'done', GET_STATUS='done', GET_SEQ='12', COORD_STATUS='working')
++    events = json.loads(fleet('inbox', '--json').stdout)
++    assert len(events) == 1 and events[0]['status'] == 'done' and events[0]['baseline'] == 10
++    log.write_text('')
++    # A successful send establishes round 12 and supersedes the queued terminal.
++    fleet('send', 'hello', 'more work', GET_SEQ='12')
++    assert task_data(root, 'hello')['event_round']['baseline'] == 12
++    fleet('event', '--pane', 'coordinator', '--status', 'idle', COORD_STATUS='idle')
++    assert coordinator_prompts(log) == []
++    rows = json.loads(fleet('inbox', '--all', '--json').stdout)
++    assert [(r['status'], r['delivery'], r['attempts']) for r in rows] == [('done', 'superseded', 0)]
++    assert json.loads(fleet('inbox', '--json').stdout) == []
++
++
++def test_stale_terminal_enqueued_after_new_round_is_never_prompted(setup):
++    root, fleet, log = setup
++    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
++    fleet('send', 'hello', 'next', GET_SEQ='12')
++    # A done from round 10 lands in the inbox after round 12 exists (written by
++    # a hook/older fleet that did not supersede); delivery must supersede it.
++    key = json.dumps([str(root), 'hello', 10])
++    path = log.parent / 'state/herdr-fleet/inbox.json'
++    stale = {'root': str(root), 'slug': 'hello', 'coordinator_pane': 'coordinator', 'status': 'done',
++             'created': '2026-01-01', 'dedup_key': key, 'delivery': 'pending', 'attempts': 0, 'last_error': None}
++    legacy = dict(stale, dedup_key=key)  # pre-field record: baseline only inside dedup_key
++    unknown = dict(stale, status='idle', dedup_key='unparseable')  # no usable baseline anywhere
++    path.write_text(json.dumps([dict(stale, baseline=10), legacy, unknown]))
++    log.write_text('')
++    fleet('event', '--pane', 'coordinator', '--status', 'idle', COORD_STATUS='idle')
++    prompts = coordinator_prompts(log)
++    assert len(prompts) == 1
++    # The record with no usable baseline cannot be proven stale, so it is the
++    # only line delivered — marked as an unknown round rather than a fresh one.
++    assert 'hello idle [round ?]' in prompts[0][3] and 'round 10' not in prompts[0][3]
++    rows = json.loads(fleet('inbox', '--all', '--json').stdout)
++    assert [(r['delivery'], r['attempts']) for r in rows] == [('superseded', 0), ('superseded', 0), ('delivered', 1)]
++
++
++def test_stale_blocked_delivers_with_round_range_and_current_status(setup):
++    root, fleet, log = setup
++    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
++    fleet('event', '--pane', 'p', '--status', 'blocked', GET_STATUS='blocked', GET_SEQ='12', COORD_STATUS='working')
++    # blocked carries a user decision: a new round does not supersede it.
++    fleet('send', 'hello', 'answer: keep going', GET_SEQ='12')
++    log.write_text('')
++    fleet('event', '--pane', 'coordinator', '--status', 'idle', COORD_STATUS='idle', AGENT_STATUS='working')
++    prompts = coordinator_prompts(log)
++    assert len(prompts) == 1
++    line = next(l for l in prompts[0][3].splitlines() if l.startswith('hello'))
++    assert 'blocked [round 10 → 12] 当前状态 working' in line
++    rows = json.loads(fleet('inbox', '--all', '--json').stdout)
++    assert [(r['status'], r['delivery']) for r in rows] == [('blocked', 'delivered')]
++
++
++def test_new_round_terminal_delivers_with_current_round_tag(setup):
++    root, fleet, log = setup
++    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
++    fleet('send', 'hello', 'next', GET_SEQ='12')
++    log.write_text('')
++    fleet('event', '--pane', 'p', '--status', 'done', GET_STATUS='done', GET_SEQ='14', COORD_STATUS='idle')
++    prompts = coordinator_prompts(log)
++    assert len(prompts) == 1
++    line = next(l for l in prompts[0][3].splitlines() if l.startswith('hello'))
++    assert line.startswith('hello done [round 12] idle-empty')
++    rows = json.loads(fleet('inbox', '--all', '--json').stdout)
++    assert [(r['baseline'], r['delivery']) for r in rows] == [(12, 'delivered')]
++
++
++def test_send_supersedes_only_same_task_events(setup):
++    root, fleet, log = setup
++    for slug, pane in [('hello', 'p'), ('other', 'q')]:
++        fleet('new', slug, '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator', NEW_PANE=pane)
++    fleet('event', '--pane', 'p', '--status', 'done', GET_STATUS='done', GET_SEQ='12', COORD_STATUS='working')
++    fleet('event', '--pane', 'q', '--status', 'idle', OTHER_SEQ='12', OTHER_STATUS='idle', COORD_STATUS='working')
++    assert {r['slug'] for r in json.loads(fleet('inbox', '--json').stdout)} == {'hello', 'other'}
++    fleet('send', 'hello', 'more', GET_SEQ='12')
++    assert [r['slug'] for r in json.loads(fleet('inbox', '--json').stdout)] == ['other']
++    log.write_text('')
++    fleet('event', '--pane', 'coordinator', '--status', 'idle', COORD_STATUS='idle')
++    prompts = coordinator_prompts(log)
++    assert len(prompts) == 1 and 'other' in prompts[0][3] and 'hello' not in prompts[0][3]
++    rows = json.loads(fleet('inbox', '--all', '--json').stdout)
++    assert [(r['slug'], r['delivery']) for r in rows] == [('hello', 'superseded'), ('other', 'delivered')]
++
++
++def test_failed_send_does_not_supersede_queued_terminal(setup):
++    _, fleet, log = setup
++    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
++    fleet('event', '--pane', 'p', '--status', 'done', GET_STATUS='done', GET_SEQ='12', COORD_STATUS='working')
++    assert fleet('send', 'hello', 'again', PROMPT_FAIL='agent_blocked', GET_SEQ='12', check=False).returncode == 1
++    rows = json.loads(fleet('inbox', '--json').stdout)
++    assert [(r['status'], r['delivery']) for r in rows] == [('done', 'pending')]
++    log.write_text('')
++    # No new round was established, so the queued terminal still delivers — and
++    # is tagged with its own (still current) round, not an arrow range.
++    fleet('event', '--pane', 'coordinator', '--status', 'idle', COORD_STATUS='idle')
++    prompts = coordinator_prompts(log)
++    assert len(prompts) == 1
++    line = next(l for l in prompts[0][3].splitlines() if l.startswith('hello'))
++    assert line.startswith('hello done [round 10]') and '→' not in line
++
++
++def test_delivery_rechecks_round_after_send_during_message_construction(setup, tmp_path):
++    root, fleet, log = setup
++    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
++    fleet('event', '--pane', 'p', '--status', 'done', GET_STATUS='done', GET_SEQ='12', COORD_STATUS='working')
++    log.write_text('')
++    barrier, gh = tmp_path / 'delivery-barrier', blocking_gh(tmp_path)
++    with ThreadPoolExecutor(max_workers=1) as pool:
++        delivery = pool.submit(fleet, 'event', '--pane', 'coordinator', '--status', 'idle',
++                               COORD_STATUS='idle', FLEET_GH=str(gh), GH_BARRIER=str(barrier))
++        try:
++            wait_barrier(barrier)
++            # The notice text is already built from the stale snapshot; the send
++            # still wins because the locked re-check runs after construction.
++            fleet('send', 'hello', 'next round', GET_SEQ='12')
++        finally:
++            barrier.with_suffix('.release').touch()
++        delivery.result(timeout=10)
++    assert coordinator_prompts(log) == []
++    rows = json.loads(fleet('inbox', '--all', '--json').stdout)
++    assert [(r['status'], r['delivery'], r['attempts']) for r in rows] == [('done', 'superseded', 0)]
++
++
++def test_delivery_rechecks_baseline_for_late_pending_event(setup, tmp_path):
++    root, fleet, log = setup
++    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
++    fleet('event', '--pane', 'p', '--status', 'done', GET_STATUS='done', GET_SEQ='12', COORD_STATUS='working')
++    log.write_text('')
++    barrier, gh = tmp_path / 'delivery-barrier', blocking_gh(tmp_path)
++    with ThreadPoolExecutor(max_workers=1) as pool:
++        delivery = pool.submit(fleet, 'event', '--pane', 'coordinator', '--status', 'idle',
++                               COORD_STATUS='idle', FLEET_GH=str(gh), GH_BARRIER=str(barrier))
++        try:
++            wait_barrier(barrier)
++            # A round advanced by a writer that left the event pending (e.g. an
++            # older fleet): the pending check alone cannot catch it.
++            path = root / 'worktrees/hello/TASK.md'
++            data = task_data(root, 'hello')
++            data['event_round']['baseline'] = 12
++            before, rest = path.read_text().split('```json\n', 1)
++            _, after = rest.split('\n```', 1)
++            path.write_text(before + '```json\n' + json.dumps(data) + '\n```' + after)
++        finally:
++            barrier.with_suffix('.release').touch()
++        delivery.result(timeout=10)
++    assert coordinator_prompts(log) == []
++    rows = json.loads(fleet('inbox', '--all', '--json').stdout)
++    assert [(r['status'], r['delivery'], r['attempts']) for r in rows] == [('done', 'superseded', 0)]
++
++
+ def test_bind_waits_for_inflight_delivery_and_does_not_redeliver(setup, tmp_path):
+     _, fleet, log = setup
+     fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='old')
+-- 
+2.43.0
+
+
+From 85f585e75e005c8c88726191eac939980850d96b Mon Sep 17 00:00:00 2001
+From: oms004 <ricekent@163.com>
+Date: Sat, 31 Oct 2026 09:28:18 +0800
+Subject: [PATCH 6/6] fix(herdr-fleet): rebuild notice when round drifts during
+ construction
+
+The locked recheck only compared pending-set membership and done/idle
+baselines, so a still-pending blocked event kept its construction-time
+"[round N]" text even after a send established a newer round in the
+window. Re-verify the per-task round snapshot used to build the notice
+inside the delivery+task locks; on drift, rebuild the message outside
+the locks so blocked/exited lines carry "[round N -> M]" with the live
+agent status. Also scope the global-lock wording in workflow.md to the
+delivery path (task_event still calls agent get under the state lock).
+
+Generated with [Devin](https://devin.ai)
+
+Co-Authored-By: Devin <158243242+devin-ai-integration[bot]@users.noreply.github.com>
+---
+ skills/herdr-fleet/references/workflow.md |  4 ++--
+ skills/herdr-fleet/scripts/fleet.py       | 26 +++++++++++++++++++---
+ tests/herdr-fleet/test_fleet.py           | 27 +++++++++++++++++++++++
+ 3 files changed, 52 insertions(+), 5 deletions(-)
+
+diff --git a/skills/herdr-fleet/references/workflow.md b/skills/herdr-fleet/references/workflow.md
+index 91e253c..6b75a0a 100644
+--- a/skills/herdr-fleet/references/workflow.md
++++ b/skills/herdr-fleet/references/workflow.md
+@@ -71,7 +71,7 @@ fleet gc [--apply]                       # 报告所有仓库的全部 worktree
+ 
+ 新轮次建立后（`new`/`send` 提交确认，或开启下一轮的手动 working 边沿），同一任务更早轮次里仍待投递的 done/idle 事件被标记 `superseded`：记录保留在 `--all` 中、尝试次数不变、默认列表不再出现，也绝不会再投递给主 agent。提交失败不建立轮次，也就不取代任何事件。其他任务的事件、当前新轮次的事件不受影响；blocked 与 exited 不自动取代——blocked 承载用户决策，仍按下面的轮次标注投递。
+ 
+-投递时消息在锁外构造，随后在投递锁与所涉任务锁（按 slug 排序，先取投递锁再取任务锁）内复核：待投递集合未变，且各 done/idle 事件的轮次基线不早于该任务 `TASK.md` 当前 `event_round.baseline`；复核不过的改标 `superseded` 并重建消息，绝不用构造时的旧快照投递。复核与 `agent prompt` 在同一组任务锁内完成，使 `send`/轮次边沿无法插入二者之间；跨任务全局状态锁只在读写内存数据时持有，调用 herdr/git 期间不持有。
++投递时消息在锁外构造（git/gh 等昂贵调用不在锁内重复），随后在投递锁与所涉任务锁（按 slug 排序，先取投递锁再取任务锁）内复核：待投递集合未变、构造所用的各任务当前轮次快照未漂移（漂移则放回锁外重新构造，绝不投递旧快照文本），且各 done/idle 事件的轮次基线不早于该任务 `TASK.md` 当前 `event_round.baseline`；复核不过的 done/idle 改标 `superseded` 并重建消息，绝不投递。复核与 `agent prompt` 在同一组任务锁内完成，使 `send`/轮次边沿无法插入二者之间。此投递路径中跨任务全局状态锁只在读写内存数据时持有，调用 herdr/git 期间不持有；`task_event` 内既有在状态锁中调用 `agent get` 的旧模式不变。
+ 
+ 通知每行格式为 `<slug> <终态> [round <事件轮次>] <phase> <PR>`。事件轮次已被取代但仍需投递的事件（blocked、exited）显示 `[round <事件轮次> → <当前轮次>] 当前状态 <实时 agent 状态>`，phase 按实时状态而非旧终态计算；轮次无法确定时显示 `[round ?]`。
+ 
+@@ -79,7 +79,7 @@ fleet gc [--apply]                       # 报告所有仓库的全部 worktree
+ 
+ 手动新轮次的 `working` 钩子尚未处理时，若 agent 已退出且 `exited` 先到，而上一轮已通知或没有轮次记录，则该轮不会通知。钩子载荷没有序号，无法把它与同一轮 `done` 后退出区分，不能简单地对每次退出都发通知。
+ 
+-投递先构造消息，再在锁内复核轮次并查询主 agent 状态、发送；轮次复核与 prompt 之间无窗口（同一组任务锁），但主 agent 状态查询和 `agent prompt` 之间仍有窗口：herdr 没有「仅空闲时接受」的原子条件，主 agent 可能在检查后重新开始工作。herdr 在提交时 agent 已为 `blocked` 会以 `agent_blocked` 拒绝，处于 `working` 时 prompt 是排队还是打断尚未真机验证。
++投递先构造消息，再在锁内复核构造所用的轮次快照、待投递集合与 done/idle 基线，然后查询主 agent 状态、发送；轮次复核与 prompt 之间无窗口（同一组任务锁）。剩余窗口：主 agent 状态查询和 `agent prompt` 之间——herdr 没有「仅空闲时接受」的原子条件，主 agent 可能在检查后重新开始工作；通知行中 `当前状态` 取自构造时刻的实时查询，与投递时刻可能有秒级偏差。herdr 在提交时 agent 已为 `blocked` 会以 `agent_blocked` 拒绝，处于 `working` 时 prompt 是排队还是打断尚未真机验证。
+ 
+ 钩子载荷没有序号：事件上的轮次基线是入箱时按当时 TASK.md 记下的值（与去重键第三项相同），不是事后从当前 TASK.md 反推的真实历史；字段加入前的旧记录按去重键还原同一记录值，去重键也无法解析时只能按轮次未知处理。
+ 
+diff --git a/skills/herdr-fleet/scripts/fleet.py b/skills/herdr-fleet/scripts/fleet.py
+index 480f4c3..29b2450 100755
+--- a/skills/herdr-fleet/scripts/fleet.py
++++ b/skills/herdr-fleet/scripts/fleet.py
+@@ -550,6 +550,22 @@ def delivery_lock(coordinator):
+         yield
+ 
+ 
++def round_snapshot(slugs):
++    """Current event_round.baseline per task, for build-vs-recheck comparison.
++
++    The notice text annotates events against these values; anything that moves
++    a round forward (send/new submission or a manual working edge) makes a
++    previously built text stale even when every event stays pending.
++    """
++    snapshot = {}
++    for slug in slugs:
++        try:
++            snapshot[slug] = (load(slug).get('event_round') or {}).get('baseline')
++        except RuntimeError:
++            snapshot[slug] = None
++    return snapshot
++
++
+ def stale_event_keys(selected):
+     """dedup_keys of selected done/idle events whose round was since replaced.
+ 
+@@ -580,20 +596,24 @@ def deliver(coordinator):
+             selected = [item.copy() for item in inbox if item.get('root') == str(ROOT) and item.get('coordinator_pane') == coordinator and item.get('delivery') == 'pending']
+         if not selected:
+             return
++        slugs = sorted({item['slug'] for item in selected})
++        rounds = round_snapshot(slugs)
+         text = notice_text(selected)
+         keys = {item['dedup_key'] for item in selected}
+-        slugs = sorted({item['slug'] for item in selected})
+         with delivery_lock(coordinator):
+             # Sorted per-task locks serialize the re-check and the prompt with
+             # submissions/round edges for the same tasks; the cross-task state
+-            # lock is still never held while calling herdr.
++            # lock is still never held while calling herdr on this path.
+             with ExitStack() as stack:
+                 for slug in slugs:
+                     stack.enter_context(task_lock(slug))
+                 with fleet_state() as (_, inbox):
+                     current = {item['dedup_key'] for item in inbox if item.get('root') == str(ROOT)
+                                and item.get('coordinator_pane') == coordinator and item.get('delivery') == 'pending'}
+-                if not keys <= current:
++                # A moved pending set or a drifted round snapshot makes the
++                # built text stale: rebuild it outside the locks (git/gh cost)
++                # instead of delivering the old snapshot's wording.
++                if not keys <= current or round_snapshot(slugs) != rounds:
+                     continue
+                 stale = stale_event_keys(selected)
+                 if stale:
+diff --git a/tests/herdr-fleet/test_fleet.py b/tests/herdr-fleet/test_fleet.py
+index 0b93905..b324c4c 100644
+--- a/tests/herdr-fleet/test_fleet.py
++++ b/tests/herdr-fleet/test_fleet.py
+@@ -962,6 +962,33 @@ def test_delivery_rechecks_round_after_send_during_message_construction(setup, t
+     assert [(r['status'], r['delivery'], r['attempts']) for r in rows] == [('done', 'superseded', 0)]
+ 
+ 
++def test_delivery_rebuilds_blocked_notice_after_send_during_construction(setup, tmp_path):
++    root, fleet, log = setup
++    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
++    fleet('event', '--pane', 'p', '--status', 'blocked', GET_STATUS='blocked', GET_SEQ='12', COORD_STATUS='working')
++    log.write_text('')
++    barrier, gh = tmp_path / 'delivery-barrier', blocking_gh(tmp_path)
++    with ThreadPoolExecutor(max_workers=1) as pool:
++        delivery = pool.submit(fleet, 'event', '--pane', 'coordinator', '--status', 'idle',
++                               COORD_STATUS='idle', AGENT_STATUS='working',
++                               FLEET_GH=str(gh), GH_BARRIER=str(barrier))
++        try:
++            wait_barrier(barrier)
++            # blocked stays pending across rounds, so the pending-set check
++            # alone cannot catch the now-stale "[round 10]" notice text.
++            fleet('send', 'hello', 'next round', GET_SEQ='12')
++        finally:
++            barrier.with_suffix('.release').touch()
++        delivery.result(timeout=10)
++    prompts = coordinator_prompts(log)
++    assert len(prompts) == 1
++    line = next(l for l in prompts[0][3].splitlines() if l.startswith('hello'))
++    assert 'blocked [round 10 → 12] 当前状态 working' in line
++    assert 'blocked [round 10]' not in prompts[0][3]
++    rows = json.loads(fleet('inbox', '--all', '--json').stdout)
++    assert [(r['status'], r['delivery'], r['attempts']) for r in rows] == [('blocked', 'delivered', 1)]
++
++
+ def test_delivery_rechecks_baseline_for_late_pending_event(setup, tmp_path):
+     root, fleet, log = setup
+     fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
+-- 
+2.43.0
+

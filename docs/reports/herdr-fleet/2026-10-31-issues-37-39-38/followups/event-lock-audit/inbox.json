@@ -1,0 +1,26 @@
+[
+  {
+    "root": "/tmp/fleet-lock-audit-8ywg9x3i/root",
+    "slug": "task-a",
+    "coordinator_pane": "coordinator",
+    "status": "done",
+    "created": "2026-10-31T02:18:42.480404+00:00",
+    "dedup_key": "[\"/tmp/fleet-lock-audit-8ywg9x3i/root\", \"task-a\", 10]",
+    "baseline": 10,
+    "delivery": "pending",
+    "attempts": 0,
+    "last_error": null
+  },
+  {
+    "root": "/tmp/fleet-lock-audit-8ywg9x3i/root",
+    "slug": "task-b",
+    "coordinator_pane": "coordinator",
+    "status": "done",
+    "created": "2026-10-31T02:18:42.515906+00:00",
+    "dedup_key": "[\"/tmp/fleet-lock-audit-8ywg9x3i/root\", \"task-b\", 10]",
+    "baseline": 10,
+    "delivery": "pending",
+    "attempts": 0,
+    "last_error": null
+  }
+]

@@ -1,0 +1,5 @@
+herdr 版本: herdr 0.9.1
+插件 tc.herdr-fleet 已启用
+devin 集成: current (v2) (/home/glx/.config/devin/herdr-agent-state.sh)
+report-block-37: coordinator_pane wE:p1 存在
+待投递事件: 0

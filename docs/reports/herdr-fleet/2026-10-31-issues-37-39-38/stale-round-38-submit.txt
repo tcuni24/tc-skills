@@ -1,0 +1,6 @@
+prior session={'agent': 'devin', 'kind': 'id', 'source': 'herdr:devin', 'value': 'handy-venom'}
+prior seq=9385
+exit=0
+stdout:
+
+stderr:

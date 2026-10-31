@@ -1,0 +1,16 @@
+exit=1
+a6e55b276ea89958637eb93f64322b59a4d3d419
+100644 ba493002c139e4e14f8caf00974d01f6ad1ba0a4 1	skills/herdr-fleet/SKILL.md
+100644 8a8b5aed2d37836cb7da34e00fd466bad8d0525b 2	skills/herdr-fleet/SKILL.md
+100644 56d823f5390e211a7002cf9e8ba83553a83ea6b1 3	skills/herdr-fleet/SKILL.md
+100644 8911d867a95e36b37b89ae55673ba61d59f5157e 1	tests/herdr-fleet/test_fleet.py
+100644 11593155b686ada5f84a5e0bc97e1bc3aac1b47f 2	tests/herdr-fleet/test_fleet.py
+100644 383df97c84337ae2574fc5a9f5990a9e70c91996 3	tests/herdr-fleet/test_fleet.py
+
+Auto-merging skills/herdr-fleet/SKILL.md
+CONFLICT (content): Merge conflict in skills/herdr-fleet/SKILL.md
+Auto-merging skills/herdr-fleet/references/workflow.md
+Auto-merging skills/herdr-fleet/scripts/fleet.py
+Auto-merging tests/herdr-fleet/test_fleet.py
+CONFLICT (content): Merge conflict in tests/herdr-fleet/test_fleet.py
+

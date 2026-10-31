@@ -1,0 +1,20 @@
+# 任务
+
+```json
+{
+  "slug": "task-a",
+  "created": "2026-10-31T00:00:00+00:00",
+  "repos": {},
+  "agent": {
+    "kind": "none",
+    "args": []
+  },
+  "coordinator_pane": "coordinator",
+  "event_round": {
+    "baseline": 10,
+    "notified": true,
+    "last_terminal_seq": 12
+  },
+  "submit_seq": 9
+}
+```
