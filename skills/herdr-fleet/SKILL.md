@@ -67,15 +67,15 @@ fleet new <slug> [-r <键>[,<键>]] [--fix] [--base <键>=<ref>] [--agent <种�
 ## 4. 收尾
 
 - agent 完成后（wait 返回，或 ls 显示 review/uncommitted），用 `fleet status <slug>` 只读核查提交与 diff；必要时用 `fleet send` 让任务 agent 提交、推送并提 PR。主 agent 不替任务 agent 改代码。
-- PR 合并只是交付状态，不是收尾终点：协调者还要逐项核查并处理任务 tab、worktree 和本地分支。任务 agent"不要清理"约束的是它不碰共享与其他任务，不等于协调者可以永久停在保留现场。
+- PR 合并只是交付状态，不是收尾终点：协调者还要逐项核查并处理任务 tab、worktree 和本地分支。任务 agent 按约定不自行清理，收尾由协调者在授权范围内执行；不能把对任务 agent 的限制误当成永久保留现场的理由。
 - 已授权的合并及其常规收尾沿用会话授权执行，不逐条再请求确认；未获授权的合并、放弃、`--discard`、解锁和 `gc --apply` 仍须用户明确同意，本指引不构成这些授权。
-- 用户确认合并、`fleet ls` 显示 merged 且 agent 已停写后，按 `references/workflow.md` 的「任务收尾」逐项真实核查：逐仓库 `fleet status`/`fleet ls` → `fleet done <slug> --dry-run` → `fleet done <slug>` → 再核对 `fleet ls`、主 checkout 的 `git worktree list`/`git status` 和 tab。只处理本任务范围，不动共享主 checkout、其他任务和远端分支。PR 仍 OPEN 待审时，不为清理强行删 worktree。
+- 用户确认合并、`fleet ls` 显示 merged 且 agent 已停写后，按 [workflow.md「任务收尾」](references/workflow.md#任务收尾) 逐项真实核查：逐仓库 `fleet status`/`fleet ls` → `fleet done <slug> --dry-run` → `fleet done <slug>` → 再核对 `fleet ls`、主 checkout 的 `git worktree list`/`git status` 和 tab。只处理本任务范围，不动共享主 checkout、其他任务和远端分支。PR 仍 OPEN 待审时，不为清理强行删 worktree。
 - 用户确认放弃任务时，同样先预览再执行；`--force` 和 `--discard` 仍遵循以下规则。
 - `done` 拒绝时，不要随手加参数：
   - 报 dirty：先 peek 或询问任务 agent 这些改动是什么，确认可以丢弃后才加 `--discard`。
   - 报 unmerged：确认是放弃这个任务后才加 `--force`，分支会保留。
   - 报 locked：不会自动解锁，先确认锁定原因，再由用户决定是否解锁。
-  - 报任务目录有额外文件：按「任务收尾」先清点、备份、移出，再重跑预检；不加 `--force`/`--discard`，也不 `rm -rf`/`git clean`。
+  - 报任务目录有额外文件：按 [「任务目录含额外文件：先备份再移出」](references/workflow.md#任务目录含额外文件先备份再移出) 先清点、备份、移出，再重跑预检；不加 `--force`/`--discard`，也不 `rm -rf`/`git clean`。
 - `no-commits`/`idle-empty` 只说明相对 base 没有新提交，不等于已合并：确认没有仍需保留的工作再照常收尾。
 - 定期执行 `fleet gc` 查看遗留的 worktree，只出报告。`fleet gc --apply` 要在用户确认报告之后才能执行。
 - tab 被误关或 herdr 重启后，用 `fleet open <slug>` 重建 tab 和 agent，worktree 不受影响。
