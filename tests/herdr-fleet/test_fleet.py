@@ -145,9 +145,9 @@ def setup(tmp_path):
     env = {k: v for k, v in os.environ.items() if k not in ('HERDR_BIN_PATH', 'FLEET_ROOT', 'HERDR_PANE_ID')}
     env.update(FLEET_ROOT=str(root), FLEET_HERDR=str(fake), LOG=str(tmp_path / 'log'), HERDR_ENV='1', HERDR_WORKSPACE_ID='w', XDG_STATE_HOME=str(tmp_path / 'state'))
 
-    def fleet(*args, check=True, cwd=None, drop=(), **updates):
+    def fleet(*args, check=True, cwd=None, drop=(), script=SCRIPT, **updates):
         run_env = {k: v for k, v in {**env, **updates}.items() if k not in drop}
-        return cmd('python3', SCRIPT, *args, env=run_env, cwd=cwd, check=check)
+        return cmd('python3', script, *args, env=run_env, cwd=cwd, check=check)
     return root, fleet, tmp_path / 'log'
 
 
@@ -1271,8 +1271,23 @@ def test_config_discovery_bases_and_errors(setup, tmp_path):
     assert fleet('new', 'x', '-r', 'web,web', '--no-fetch', check=False).returncode
     lonely = tmp_path / 'elsewhere'
     lonely.mkdir()
-    p = fleet('ls', cwd=lonely, drop=('FLEET_ROOT',), check=False)
+    # find_root also walks up from the script's own directory, and a checkout can
+    # legitimately sit under a configured fleet root (task worktrees do). Run the
+    # no-config scenario on a copy in a config-free tree so both search starts —
+    # the working directory and the script path — stay independent of the layout.
+    isolated = tmp_path / 'skill-copy' / 'fleet.py'
+    isolated.parent.mkdir()
+    isolated.write_text(SCRIPT.read_text())
+    p = fleet('ls', cwd=lonely, drop=('FLEET_ROOT',), script=isolated, check=False)
     assert p.returncode and '.herdr-fleet.toml' in p.stderr
+    # Script-ancestor discovery itself stays valid: the same copy placed under a
+    # configured root is found from a config-free working directory, and resolves
+    # to that root rather than any other fleet root on the machine.
+    inside = root / 'skill-copy' / 'fleet.py'
+    inside.parent.mkdir()
+    inside.write_text(SCRIPT.read_text())
+    rows = json.loads(fleet('ls', '--json', cwd=lonely, drop=('FLEET_ROOT',), script=inside).stdout)
+    assert [row['slug'] for row in rows] == ['found']
     (root / '.herdr-fleet.toml').write_text('[repos.web]\npath = "app-web"\ndir = "TASK.md"\n')
     assert fleet('ls', check=False).returncode
 
