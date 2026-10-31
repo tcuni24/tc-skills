@@ -140,7 +140,7 @@ devin 任务 agent 在未曾信任过的目录（如 `fleet new` 刚建出的 `w
  ↑↓ select · ↵ confirm · esc cancel
 ```
 
-实测此页停留期间 `herdr agent get <pane>`（输出为 JSON）仍可能显示 `agent_status=idle`、`interactive_ready=true`，而 `agent_session` 字段缺失；同一版本上 `fleet new --prompt` 在该状态下开始确认超时（`开始确认失败：…timeout…`），worktree 和 tab 按「安全规则」保留。因此 `idle`、`interactive_ready`、`agent_session` 任何单项都不足以证明 agent 已到正式输入页，判定以 `fleet peek`（`herdr agent read`）看到的实际屏幕为准。
+实测此页停留期间 `herdr agent get <pane>`（输出为 JSON）仍可能显示 `agent_status=idle`、`interactive_ready=true`，而 `agent_session` 字段缺失：即该版本上信任选择页会被误报为就绪。同一版本上另记录过 `fleet new --prompt` 和 `fleet send` 开始确认超时（`开始确认失败：…timeout…`），失败后 worktree 和 tab 按「安全规则」保留；但超时的完整输入处理链未捕获，不能断定超时当刻正处于信任选择页，也不能断定 prompt 被其消耗。因此 `idle`、`interactive_ready`、`agent_session` 任何单项都不足以证明 agent 已到正式输入页，判定以 `fleet peek`（`herdr agent read`）看到的实际屏幕为准。
 
 任务 agent 为 devin 时，稳妥的开任务顺序：
 
@@ -155,15 +155,15 @@ devin 任务 agent 在未曾信任过的目录（如 `fleet new` 刚建出的 `w
 
 ### 开始确认失败后的投递不确定
 
-`fleet new --prompt` 或 `fleet send` 报 `开始确认失败`（如 `timeout`、`agent_prompt_stalled`）时，提交结果不确定：开始确认只等启动信号，不追踪整个回合，prompt 可能没送到，也可能已送达但尚未开始执行。失败后 worktree、tab 和 `TASK.md` 的 `submit_seq`（提交时记录的序号）都保留，供检查恢复。未核实前不得重发：重复提交会让同一任务执行两遍。
+`fleet new --prompt` 或 `fleet send` 报 `开始确认失败`（如 `timeout`、`agent_prompt_stalled`）时，提交结果不确定：开始确认只等启动信号，不追踪整个回合，prompt 可能没送到，也可能已送达或排队而尚未开始执行。失败后 worktree、tab 和 `TASK.md` 的 `submit_seq`（提交时记录的序号）都保留，供检查恢复。未核实前不得重发：重复提交会让同一任务执行两遍。
 
-按顺序核实：
+以下检查只帮助排查，不能自动推出"未投递"：
 
 1. `herdr agent get <pane>`：对比 `state_change_seq` 与 `TASK.md` 的 `submit_seq`；seq 已推进且状态为 idle/done/blocked，说明提交后发生过状态变化。
 2. `fleet peek <slug>`：终端是只有启动页/选择页、无任何任务执行输出，还是已出现对任务的处理痕迹。
 3. 看任务目录与各 worktree：`git status`、`git log` 和新增文件是否显示任务已开始执行。
 
-只有组合证据表明未投递（seq 未推进、终端无执行痕迹、无任务产物）后才恢复 `fleet send`；任何一项拿不准就向用户报告"提交结果不确定"及已核实的事实，不能仅凭 `idle` 或 seq 未变单项就盲目重发。
+即使 seq 未推进、终端无执行痕迹、无任务产物三项同时成立，也只说明未观察到执行开始——prompt 仍可能已被接收或排队，不构成"未投递"的确认。因此开始确认超时且没有明确的未送达证据时，持续把该提交标记为"投递不确定"并向用户报告已核实的事实，不得重发；只有取得"原请求未被接受或不会再执行"的明确证据后才恢复 `fleet send`。本轮"核对目录、处理信任选择页、再 send 成功"是已验证的一次成功恢复，不能据此外推成"缺失证据即未投递"的通用判定。
 
 本节是操作规避：绕开"信任选择页被判为就绪"的检测缺口，不代表 herdr 或 devin 的就绪检测已修复。超时 prompt 的去向不要臆测：未被证实被信任页消耗，也不要归因为额度。
 
