@@ -65,15 +65,23 @@ fleet gc [--apply]                       # 报告所有仓库的全部 worktree�
 
 `peek` 和 `send` 按 tab 找到任务 agent 所在的 pane，再对 pane 操作。`herdr agent list` 里的 `agent` 字段是种类（如 `pi`），多个任务同时用 pi 时不唯一。
 
-`new` 和 `open` 在设置了 `HERDR_PANE_ID` 时将该主 agent pane 记为 `coordinator_pane`。`bind` 将当前项目所有任务改绑到当前 pane，待投递事件也改绑；已投递历史保留原目标。旧任务没有此字段时仍可使用。pane 索引和收件箱位于 `$XDG_STATE_HOME/herdr-fleet/`（默认 `~/.local/state/herdr-fleet/`），不占用任务目录；读写通过文件锁协调，`done` 清除对应记录，`--dry-run` 不清除。收件箱记录项目根、任务、目标 pane、终态、时间、去重键、投递状态、尝试次数和最近错误。`inbox` 不改变状态。
+`new` 和 `open` 在设置了 `HERDR_PANE_ID` 时将该主 agent pane 记为 `coordinator_pane`。`bind` 将当前项目所有任务改绑到当前 pane，待投递事件也改绑；已投递与被取代的历史保留原目标。旧任务没有此字段时仍可使用。pane 索引和收件箱位于 `$XDG_STATE_HOME/herdr-fleet/`（默认 `~/.local/state/herdr-fleet/`），不占用任务目录；读写通过文件锁协调，`done` 清除对应记录，`--dry-run` 不清除。收件箱记录项目根、任务、目标 pane、终态、时间、去重键、事件轮次基线（`baseline`）、投递状态、尝试次数和最近错误；`delivery` 为 `pending`/`delivered`/`superseded`。`inbox` 不改变状态，默认只列 `pending`，`--all` 含已投递与被取代的记录。
 
-`event` 接受 `working`、`idle`、`done`、`blocked`、`exited`。任务每次成功提交以 `submit_seq` 为轮次基线；working 边沿也可开始手动输入的下一轮。只记录晚于基线且尚未通知的终态，重复和过期边沿不重复入箱。主 agent 为 idle/done 时尝试投递，否则保留待投递；主 agent 的 idle/done 边沿会合并投递待投递事件。投递须得到 `agent_prompted` 确认，失败时保留记录和错误；pane 不存在时显示一次 herdr 通知。通知只是触发器，须用 `fleet status` 核查。插件将 `pane.exited`、`pane.closed` 与 `tab.closed` 映射为任务 `exited` 事件；关 tab 时通过索引的 tab_id 查找任务 pane。旧索引可通过 `fleet bind` 或重新打开任务补登记。仅安装本命令不会自动订阅事件。
+`event` 接受 `working`、`idle`、`done`、`blocked`、`exited`。任务每次成功提交以 `submit_seq` 为轮次基线；working 边沿也可开始手动输入的下一轮。只记录晚于基线且尚未通知的终态，重复和过期边沿不重复入箱。每条事件保存产生它的轮次基线（与去重键第三项同值；字段加入前的旧记录按去重键解析，无法解析则轮次未知）。主 agent 为 idle/done 时尝试投递，否则保留待投递；主 agent 的 idle/done 边沿会合并投递待投递事件。投递须得到 `agent_prompted` 确认，失败时保留记录和错误；pane 不存在时显示一次 herdr 通知。通知只是触发器，须用 `fleet status` 核查。插件将 `pane.exited`、`pane.closed` 与 `tab.closed` 映射为任务 `exited` 事件；关 tab 时通过索引的 tab_id 查找任务 pane。旧索引可通过 `fleet bind` 或重新打开任务补登记。仅安装本命令不会自动订阅事件。
+
+新轮次建立后（`new`/`send` 提交确认，或开启下一轮的手动 working 边沿），同一任务更早轮次里仍待投递的 done/idle 事件被标记 `superseded`：记录保留在 `--all` 中、尝试次数不变、默认列表不再出现，也绝不会再投递给主 agent。提交失败不建立轮次，也就不取代任何事件。其他任务的事件、当前新轮次的事件不受影响；blocked 与 exited 不自动取代——blocked 承载用户决策，仍按下面的轮次标注投递。
+
+投递时消息在锁外构造，随后在投递锁与所涉任务锁（按 slug 排序，先取投递锁再取任务锁）内复核：待投递集合未变，且各 done/idle 事件的轮次基线不早于该任务 `TASK.md` 当前 `event_round.baseline`；复核不过的改标 `superseded` 并重建消息，绝不用构造时的旧快照投递。复核与 `agent prompt` 在同一组任务锁内完成，使 `send`/轮次边沿无法插入二者之间；跨任务全局状态锁只在读写内存数据时持有，调用 herdr/git 期间不持有。
+
+通知每行格式为 `<slug> <终态> [round <事件轮次>] <phase> <PR>`。事件轮次已被取代但仍需投递的事件（blocked、exited）显示 `[round <事件轮次> → <当前轮次>] 当前状态 <实时 agent 状态>`，phase 按实时状态而非旧终态计算；轮次无法确定时显示 `[round ?]`。
 
 开始确认只阻塞同一任务的事件处理，不持有跨任务的状态锁。herdr 状态钩子不带序号：处理 `working` 时若实时状态已是终态，则以实时序号推断快速结束的手动轮次；已有通知时实时序号必须晚于上次终态。单独的 `done` → `idle` 后续边沿不会再次通知。但若上一轮迟到的 `working` 恰好在同轮 `done` → `idle` 后才处理，它与快速完成的新轮次无法区分，可能额外通知一次；此取舍避免静默漏掉新轮次。
 
 手动新轮次的 `working` 钩子尚未处理时，若 agent 已退出且 `exited` 先到，而上一轮已通知或没有轮次记录，则该轮不会通知。钩子载荷没有序号，无法把它与同一轮 `done` 后退出区分，不能简单地对每次退出都发通知。
 
-投递先构造消息，再查询主 agent 状态并发送，但查询和 `agent prompt` 之间仍有窗口；herdr 没有「仅空闲时接受」的原子条件。herdr 在提交时 agent 已为 `blocked` 会以 `agent_blocked` 拒绝，处于 `working` 时 prompt 是排队还是打断尚未真机验证。
+投递先构造消息，再在锁内复核轮次并查询主 agent 状态、发送；轮次复核与 prompt 之间无窗口（同一组任务锁），但主 agent 状态查询和 `agent prompt` 之间仍有窗口：herdr 没有「仅空闲时接受」的原子条件，主 agent 可能在检查后重新开始工作。herdr 在提交时 agent 已为 `blocked` 会以 `agent_blocked` 拒绝，处于 `working` 时 prompt 是排队还是打断尚未真机验证。
+
+钩子载荷没有序号：事件上的轮次基线是入箱时按当时 TASK.md 记下的值（与去重键第三项相同），不是事后从当前 TASK.md 反推的真实历史；字段加入前的旧记录按去重键还原同一记录值，去重键也无法解析时只能按轮次未知处理。
 
 仅在真机 herdr 0.9.1 上实测，`state_change_seq` 跨 pane 全局递增（多个 pane 间从 9185 到 9238），新 pane 不复用旧序号；因此该版本中 `open` 重建后保留旧 `submit_seq`/`event_round` 不会因序号复用而误去重。
 

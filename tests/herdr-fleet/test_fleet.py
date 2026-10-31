@@ -443,6 +443,9 @@ def test_event_fast_completion_stale_and_next_round(setup):
     event('blocked', 14)
     rows = json.loads(fleet('inbox', '--all', '--json').stdout)
     assert [r['status'] for r in rows] == ['idle', 'blocked']
+    # The new working round superseded the queued idle; the blocked stays pending.
+    assert [r['delivery'] for r in rows] == ['superseded', 'pending']
+    assert [r['baseline'] for r in rows] == [10, 13]
     assert len({r['dedup_key'] for r in rows}) == 2
 
 
@@ -498,7 +501,10 @@ def test_manual_round_delayed_working_and_done_to_idle(setup):
     fleet('event', '--pane', 'p', '--status', 'working', GET_STATUS='done', GET_SEQ='16')
     fleet('event', '--pane', 'p', '--status', 'done', GET_STATUS='done', GET_SEQ='16')
     fleet('event', '--pane', 'p', '--status', 'idle', GET_STATUS='idle', GET_SEQ='17')
-    assert [e['status'] for e in json.loads(fleet('inbox', '--json').stdout)] == ['done', 'done']
+    # The ambiguous new round superseded the older queued done; history keeps it.
+    rows = json.loads(fleet('inbox', '--all', '--json').stdout)
+    assert [(e['status'], e['delivery']) for e in rows] == [('done', 'superseded'), ('done', 'pending')]
+    assert [e['status'] for e in json.loads(fleet('inbox', '--json').stdout)] == ['done']
 
 
 def test_ambiguous_late_working_after_done_to_idle_prefers_notice(setup):
@@ -507,7 +513,11 @@ def test_ambiguous_late_working_after_done_to_idle_prefers_notice(setup):
     fleet('event', '--pane', 'p', '--status', 'done', GET_STATUS='done', GET_SEQ='12')
     fleet('event', '--pane', 'p', '--status', 'idle', GET_STATUS='idle', GET_SEQ='13')
     fleet('event', '--pane', 'p', '--status', 'working', GET_STATUS='idle', GET_SEQ='13')
-    assert [e['status'] for e in json.loads(fleet('inbox', '--json').stdout)] == ['done', 'idle']
+    # Prefer an extra notice: the ambiguous round still produces a pending idle,
+    # while the older done is retained as superseded rather than dropped.
+    rows = json.loads(fleet('inbox', '--all', '--json').stdout)
+    assert [(e['status'], e['delivery']) for e in rows] == [('done', 'superseded'), ('idle', 'pending')]
+    assert [e['status'] for e in json.loads(fleet('inbox', '--json').stdout)] == ['idle']
 
 
 def test_same_task_fast_event_waits_for_submission_confirmation(setup, tmp_path):
@@ -546,7 +556,9 @@ def test_manual_round_not_blocked_by_other_task_submit(setup, tmp_path):
         finally:
             barrier.with_suffix('.release').touch()
         submit.result(timeout=10)
-    assert [e['status'] for e in json.loads(fleet('inbox', '--json').stdout)] == ['done', 'done']
+    # The manual new round superseded the queued done; the new done stays pending.
+    rows = json.loads(fleet('inbox', '--all', '--json').stdout)
+    assert [(e['status'], e['delivery']) for e in rows] == [('done', 'superseded'), ('done', 'pending')]
 
 
 def test_event_failed_submission_does_not_start_round(setup):
@@ -564,8 +576,12 @@ def test_event_send_starts_next_round_without_working_event(setup):
     fleet('send', 'hello', 'again', GET_SEQ='12')
     fleet('event', '--pane', 'p', '--status', 'idle', GET_SEQ='12')
     fleet('event', '--pane', 'p', '--status', 'idle', GET_SEQ='14')
-    rows = json.loads(fleet('inbox', '--json').stdout)
-    assert len(rows) == 2 and rows[0]['dedup_key'] != rows[1]['dedup_key']
+    # The confirmed send superseded the older queued idle; the new round's own
+    # idle stays pending under a different dedup key.
+    rows = json.loads(fleet('inbox', '--all', '--json').stdout)
+    assert [(r['status'], r['delivery']) for r in rows] == [('idle', 'superseded'), ('idle', 'pending')]
+    assert rows[0]['dedup_key'] != rows[1]['dedup_key']
+    assert [r['status'] for r in json.loads(fleet('inbox', '--json').stdout)] == ['idle']
 
 
 def test_event_exited_without_agent_get(setup):
@@ -787,6 +803,166 @@ def test_delivery_status_rechecked_after_message_construction(setup, tmp_path):
     prompts = [c for line in log.read_text().splitlines() if (c := json.loads(line))[:2] == ['agent', 'prompt']]
     assert prompts == []
     assert len(json.loads(fleet('inbox', '--json').stdout)) == 1
+
+
+def coordinator_prompts(log):
+    return [c for line in log.read_text().splitlines()
+            if (c := json.loads(line))[:2] == ['agent', 'prompt'] and c[2] == 'coordinator']
+
+
+def test_send_supersedes_queued_done_and_idle_delivery_stays_silent(setup):
+    root, fleet, log = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
+    # The task finishes round 10 while the coordinator is still working.
+    fleet('event', '--pane', 'p', '--status', 'done', GET_STATUS='done', GET_SEQ='12', COORD_STATUS='working')
+    events = json.loads(fleet('inbox', '--json').stdout)
+    assert len(events) == 1 and events[0]['status'] == 'done' and events[0]['baseline'] == 10
+    log.write_text('')
+    # A successful send establishes round 12 and supersedes the queued terminal.
+    fleet('send', 'hello', 'more work', GET_SEQ='12')
+    assert task_data(root, 'hello')['event_round']['baseline'] == 12
+    fleet('event', '--pane', 'coordinator', '--status', 'idle', COORD_STATUS='idle')
+    assert coordinator_prompts(log) == []
+    rows = json.loads(fleet('inbox', '--all', '--json').stdout)
+    assert [(r['status'], r['delivery'], r['attempts']) for r in rows] == [('done', 'superseded', 0)]
+    assert json.loads(fleet('inbox', '--json').stdout) == []
+
+
+def test_stale_terminal_enqueued_after_new_round_is_never_prompted(setup):
+    root, fleet, log = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
+    fleet('send', 'hello', 'next', GET_SEQ='12')
+    # A done from round 10 lands in the inbox after round 12 exists (written by
+    # a hook/older fleet that did not supersede); delivery must supersede it.
+    key = json.dumps([str(root), 'hello', 10])
+    path = log.parent / 'state/herdr-fleet/inbox.json'
+    stale = {'root': str(root), 'slug': 'hello', 'coordinator_pane': 'coordinator', 'status': 'done',
+             'created': '2026-01-01', 'dedup_key': key, 'delivery': 'pending', 'attempts': 0, 'last_error': None}
+    legacy = dict(stale, dedup_key=key)  # pre-field record: baseline only inside dedup_key
+    unknown = dict(stale, status='idle', dedup_key='unparseable')  # no usable baseline anywhere
+    path.write_text(json.dumps([dict(stale, baseline=10), legacy, unknown]))
+    log.write_text('')
+    fleet('event', '--pane', 'coordinator', '--status', 'idle', COORD_STATUS='idle')
+    prompts = coordinator_prompts(log)
+    assert len(prompts) == 1
+    # The record with no usable baseline cannot be proven stale, so it is the
+    # only line delivered — marked as an unknown round rather than a fresh one.
+    assert 'hello idle [round ?]' in prompts[0][3] and 'round 10' not in prompts[0][3]
+    rows = json.loads(fleet('inbox', '--all', '--json').stdout)
+    assert [(r['delivery'], r['attempts']) for r in rows] == [('superseded', 0), ('superseded', 0), ('delivered', 1)]
+
+
+def test_stale_blocked_delivers_with_round_range_and_current_status(setup):
+    root, fleet, log = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
+    fleet('event', '--pane', 'p', '--status', 'blocked', GET_STATUS='blocked', GET_SEQ='12', COORD_STATUS='working')
+    # blocked carries a user decision: a new round does not supersede it.
+    fleet('send', 'hello', 'answer: keep going', GET_SEQ='12')
+    log.write_text('')
+    fleet('event', '--pane', 'coordinator', '--status', 'idle', COORD_STATUS='idle', AGENT_STATUS='working')
+    prompts = coordinator_prompts(log)
+    assert len(prompts) == 1
+    line = next(l for l in prompts[0][3].splitlines() if l.startswith('hello'))
+    assert 'blocked [round 10 → 12] 当前状态 working' in line
+    rows = json.loads(fleet('inbox', '--all', '--json').stdout)
+    assert [(r['status'], r['delivery']) for r in rows] == [('blocked', 'delivered')]
+
+
+def test_new_round_terminal_delivers_with_current_round_tag(setup):
+    root, fleet, log = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
+    fleet('send', 'hello', 'next', GET_SEQ='12')
+    log.write_text('')
+    fleet('event', '--pane', 'p', '--status', 'done', GET_STATUS='done', GET_SEQ='14', COORD_STATUS='idle')
+    prompts = coordinator_prompts(log)
+    assert len(prompts) == 1
+    line = next(l for l in prompts[0][3].splitlines() if l.startswith('hello'))
+    assert line.startswith('hello done [round 12] idle-empty')
+    rows = json.loads(fleet('inbox', '--all', '--json').stdout)
+    assert [(r['baseline'], r['delivery']) for r in rows] == [(12, 'delivered')]
+
+
+def test_send_supersedes_only_same_task_events(setup):
+    root, fleet, log = setup
+    for slug, pane in [('hello', 'p'), ('other', 'q')]:
+        fleet('new', slug, '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator', NEW_PANE=pane)
+    fleet('event', '--pane', 'p', '--status', 'done', GET_STATUS='done', GET_SEQ='12', COORD_STATUS='working')
+    fleet('event', '--pane', 'q', '--status', 'idle', OTHER_SEQ='12', OTHER_STATUS='idle', COORD_STATUS='working')
+    assert {r['slug'] for r in json.loads(fleet('inbox', '--json').stdout)} == {'hello', 'other'}
+    fleet('send', 'hello', 'more', GET_SEQ='12')
+    assert [r['slug'] for r in json.loads(fleet('inbox', '--json').stdout)] == ['other']
+    log.write_text('')
+    fleet('event', '--pane', 'coordinator', '--status', 'idle', COORD_STATUS='idle')
+    prompts = coordinator_prompts(log)
+    assert len(prompts) == 1 and 'other' in prompts[0][3] and 'hello' not in prompts[0][3]
+    rows = json.loads(fleet('inbox', '--all', '--json').stdout)
+    assert [(r['slug'], r['delivery']) for r in rows] == [('hello', 'superseded'), ('other', 'delivered')]
+
+
+def test_failed_send_does_not_supersede_queued_terminal(setup):
+    _, fleet, log = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
+    fleet('event', '--pane', 'p', '--status', 'done', GET_STATUS='done', GET_SEQ='12', COORD_STATUS='working')
+    assert fleet('send', 'hello', 'again', PROMPT_FAIL='agent_blocked', GET_SEQ='12', check=False).returncode == 1
+    rows = json.loads(fleet('inbox', '--json').stdout)
+    assert [(r['status'], r['delivery']) for r in rows] == [('done', 'pending')]
+    log.write_text('')
+    # No new round was established, so the queued terminal still delivers — and
+    # is tagged with its own (still current) round, not an arrow range.
+    fleet('event', '--pane', 'coordinator', '--status', 'idle', COORD_STATUS='idle')
+    prompts = coordinator_prompts(log)
+    assert len(prompts) == 1
+    line = next(l for l in prompts[0][3].splitlines() if l.startswith('hello'))
+    assert line.startswith('hello done [round 10]') and '→' not in line
+
+
+def test_delivery_rechecks_round_after_send_during_message_construction(setup, tmp_path):
+    root, fleet, log = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
+    fleet('event', '--pane', 'p', '--status', 'done', GET_STATUS='done', GET_SEQ='12', COORD_STATUS='working')
+    log.write_text('')
+    barrier, gh = tmp_path / 'delivery-barrier', blocking_gh(tmp_path)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        delivery = pool.submit(fleet, 'event', '--pane', 'coordinator', '--status', 'idle',
+                               COORD_STATUS='idle', FLEET_GH=str(gh), GH_BARRIER=str(barrier))
+        try:
+            wait_barrier(barrier)
+            # The notice text is already built from the stale snapshot; the send
+            # still wins because the locked re-check runs after construction.
+            fleet('send', 'hello', 'next round', GET_SEQ='12')
+        finally:
+            barrier.with_suffix('.release').touch()
+        delivery.result(timeout=10)
+    assert coordinator_prompts(log) == []
+    rows = json.loads(fleet('inbox', '--all', '--json').stdout)
+    assert [(r['status'], r['delivery'], r['attempts']) for r in rows] == [('done', 'superseded', 0)]
+
+
+def test_delivery_rechecks_baseline_for_late_pending_event(setup, tmp_path):
+    root, fleet, log = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
+    fleet('event', '--pane', 'p', '--status', 'done', GET_STATUS='done', GET_SEQ='12', COORD_STATUS='working')
+    log.write_text('')
+    barrier, gh = tmp_path / 'delivery-barrier', blocking_gh(tmp_path)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        delivery = pool.submit(fleet, 'event', '--pane', 'coordinator', '--status', 'idle',
+                               COORD_STATUS='idle', FLEET_GH=str(gh), GH_BARRIER=str(barrier))
+        try:
+            wait_barrier(barrier)
+            # A round advanced by a writer that left the event pending (e.g. an
+            # older fleet): the pending check alone cannot catch it.
+            path = root / 'worktrees/hello/TASK.md'
+            data = task_data(root, 'hello')
+            data['event_round']['baseline'] = 12
+            before, rest = path.read_text().split('```json\n', 1)
+            _, after = rest.split('\n```', 1)
+            path.write_text(before + '```json\n' + json.dumps(data) + '\n```' + after)
+        finally:
+            barrier.with_suffix('.release').touch()
+        delivery.result(timeout=10)
+    assert coordinator_prompts(log) == []
+    rows = json.loads(fleet('inbox', '--all', '--json').stdout)
+    assert [(r['status'], r['delivery'], r['attempts']) for r in rows] == [('done', 'superseded', 0)]
 
 
 def test_bind_waits_for_inflight_delivery_and_does_not_redeliver(setup, tmp_path):
