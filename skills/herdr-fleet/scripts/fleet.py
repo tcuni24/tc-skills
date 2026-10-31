@@ -43,7 +43,8 @@ class InboxEvent(TypedDict):
     status: str
     created: str
     dedup_key: str
-    delivery: Literal['pending', 'delivered']
+    baseline: int | None
+    delivery: Literal['pending', 'delivered', 'superseded']
     attempts: int
     last_error: str | None
 
@@ -250,6 +251,42 @@ def task_index_matches(entry, slug):
     return entry.get('root') == str(ROOT) and entry.get('slug') == slug and entry.get('role') == 'task'
 
 
+def event_baseline(item):
+    """Round baseline recorded when the event was created.
+
+    New records carry a `baseline` field holding the same value the dedup_key
+    has always embedded as its third element; older inbox records only have
+    the key, so it is parsed back. This reads what was recorded at enqueue
+    time — hooks carry no sequence, so a missing value stays unknown rather
+    than being reconstructed from the current TASK.md.
+    """
+    baseline = item.get('baseline')
+    if isinstance(baseline, int):
+        return baseline
+    try:
+        key = json.loads(item.get('dedup_key') or '')
+    except ValueError:
+        return None
+    return key[2] if isinstance(key, list) and len(key) == 3 and isinstance(key[2], int) else None
+
+
+def supersede_stale_events(inbox, slug, baseline):
+    """Mark this task's pending done/idle events from older rounds superseded.
+
+    Called once a new round exists (confirmed send/new submission, or a manual
+    working edge): those terminals describe a round the new one replaces, so
+    they must never reach the coordinator as a fresh completion. The record is
+    kept for `inbox --all` with attempts untouched; blocked/exited events are
+    never superseded automatically since blocked carries a user decision.
+    """
+    for item in inbox:
+        if (item.get('root') == str(ROOT) and item.get('slug') == slug and item.get('delivery') == 'pending'
+                and item.get('status') in ('done', 'idle')):
+            old = event_baseline(item)
+            if old is not None and old < baseline:
+                item['delivery'] = 'superseded'
+
+
 def register_task(data, pane, tab_id):
     coordinator = os.environ.get('HERDR_PANE_ID')
     if not coordinator:
@@ -411,6 +448,7 @@ def task_event(a):
                     # Prefer an extra notice over silently losing that round.
                     round_state = {'baseline': seq if status == 'working' else seq - 1,
                                    'notified': False, 'last_terminal_seq': last}
+                    supersede_stale_events(inbox, data['slug'], round_state['baseline'])
                 elif round_state['notified']:
                     return
                 if status == 'working':
@@ -429,7 +467,8 @@ def task_event(a):
         if not exists:
             inbox.append({'root': str(ROOT), 'slug': data['slug'], 'coordinator_pane': coordinator,
                           'status': a.status, 'created': datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                          'dedup_key': key, 'delivery': 'pending', 'attempts': 0, 'last_error': None})
+                          'dedup_key': key, 'baseline': round_state['baseline'],
+                          'delivery': 'pending', 'attempts': 0, 'last_error': None})
         data['event_round'] = round_state
         save(data)
         if not exists:
@@ -451,11 +490,24 @@ def herdr_result(*args):
 def notice_text(events):
     header = 'herdr-fleet 自动通知（非用户消息）'
     footer = '请逐个使用 fleet status <slug> 核查。'
+    tabs, agents = herdr_state()
     lines = []
     for item in events:
         phase, prs, pr_failed = 'unknown', [], False
+        baseline, stale, now, current = event_baseline(item), False, None, None
         try:
             data = load(item['slug'])
+            now = (data.get('event_round') or {}).get('baseline')
+            stale = baseline is not None and isinstance(now, int) and baseline < now
+            status = item['status']
+            if stale:
+                # The round that produced this event was replaced: report the
+                # live agent status and derive the phase from it, not from the
+                # stale terminal recorded on the event.
+                tab = find_tab(item['slug'], tabs)
+                agent = next((entry for entry in agents if tab and entry.get('tab_id') == tab['tab_id']), None)
+                current = agent.get('agent_status') if agent else None
+                status = current or 'unknown'
             repos = {}
             for key, info in data['repos'].items():
                 repo = REPOS[key]['path']
@@ -465,11 +517,17 @@ def notice_text(events):
                     prs.append(result['pr']['url'])
                 elif result['state'] == 'unknown':
                     pr_failed = True
-            phase = task_phase(item['status'], repos)
+            phase = task_phase(status, repos)
         except (RuntimeError, OSError, ValueError, KeyError):
             pass
         if pr_failed: prs.append('?')
-        lines.append(f"{item['slug']} {item['status']} {phase} {','.join(prs) or '-'}".replace('\n', ' '))
+        if baseline is None:
+            marker = '[round ?]'
+        elif stale:
+            marker = f'[round {baseline} → {now}] 当前状态 {current or "unknown"}'
+        else:
+            marker = f'[round {baseline}]'
+        lines.append(f"{item['slug']} {item['status']} {marker} {phase} {','.join(prs) or '-'}".replace('\n', ' '))
     shown = []
     for line in lines:
         remaining = len(lines) - len(shown) - 1
@@ -492,51 +550,110 @@ def delivery_lock(coordinator):
         yield
 
 
+def round_snapshot(slugs):
+    """Current event_round.baseline per task, for build-vs-recheck comparison.
+
+    The notice text annotates events against these values; anything that moves
+    a round forward (send/new submission or a manual working edge) makes a
+    previously built text stale even when every event stays pending.
+    """
+    snapshot = {}
+    for slug in slugs:
+        try:
+            snapshot[slug] = (load(slug).get('event_round') or {}).get('baseline')
+        except RuntimeError:
+            snapshot[slug] = None
+    return snapshot
+
+
+def stale_event_keys(selected):
+    """dedup_keys of selected done/idle events whose round was since replaced.
+
+    Re-reads each task's current TASK.md round; callers hold the selected
+    tasks' locks so the check cannot race a new round being established
+    (send/new submission or a manual working edge). Events whose baseline is
+    unknown or cannot be compared stay deliverable.
+    """
+    stale = set()
+    for item in selected:
+        if item.get('status') not in ('done', 'idle'):
+            continue
+        baseline = event_baseline(item)
+        if baseline is None:
+            continue
+        try:
+            current = (load(item['slug']).get('event_round') or {}).get('baseline')
+        except RuntimeError:
+            continue
+        if isinstance(current, int) and baseline < current:
+            stale.add(item['dedup_key'])
+    return stale
+
+
 def deliver(coordinator):
     while True:
         with fleet_state() as (_, inbox):
             selected = [item.copy() for item in inbox if item.get('root') == str(ROOT) and item.get('coordinator_pane') == coordinator and item.get('delivery') == 'pending']
         if not selected:
             return
+        slugs = sorted({item['slug'] for item in selected})
+        rounds = round_snapshot(slugs)
         text = notice_text(selected)
         keys = {item['dedup_key'] for item in selected}
         with delivery_lock(coordinator):
-            with fleet_state() as (_, inbox):
-                current = {item['dedup_key'] for item in inbox if item.get('root') == str(ROOT)
-                           and item.get('coordinator_pane') == coordinator and item.get('delivery') == 'pending'}
-            if not keys <= current:
-                continue
-            code, payload, error = herdr_result('agent', 'get', coordinator)
-            result = payload.get('result', {})
-            if code:
-                error_code = payload.get('error', {}).get('code')
-                missing = error_code == 'pane_not_found'
-                if error_code == 'agent_not_found':
-                    pane_code, pane_payload, _ = herdr_result('pane', 'get', coordinator)
-                    missing = bool(pane_code and pane_payload.get('error', {}).get('code') == 'pane_not_found')
-                if missing:
-                    with fleet_state(write=True) as (panes, _):
-                        entry = panes.get(coordinator, {})
-                        warn = not entry.get('missing_notified')
-                        if warn: entry['missing_notified'] = True
-                    if warn:
-                        herdr_result('notification', 'show', 'herdr-fleet 通知未送达', '--body', f'主 agent pane {coordinator} 不存在，请检查 fleet inbox')
-                return
-            status = result.get('agent', {}).get('agent_status')
-            if status not in ('idle', 'done'):
-                return
-            code, payload, error = herdr_result('agent', 'prompt', coordinator, text)
-            result = payload.get('result', payload)
-            success = code == 0 and result.get('type') == 'agent_prompted'
-            with fleet_state(write=True) as (_, inbox):
-                for item in inbox:
-                    if (item.get('root') == str(ROOT) and item.get('dedup_key') in keys
-                            and item.get('coordinator_pane') == coordinator and item.get('delivery') == 'pending'):
-                        item['attempts'] += 1
-                        item['last_error'] = None if success else (error or 'agent_prompted 未确认')
-                        if success: item['delivery'] = 'delivered'
-            if not success:
-                return
+            # Sorted per-task locks serialize the re-check and the prompt with
+            # submissions/round edges for the same tasks; the cross-task state
+            # lock is still never held while calling herdr on this path.
+            with ExitStack() as stack:
+                for slug in slugs:
+                    stack.enter_context(task_lock(slug))
+                with fleet_state() as (_, inbox):
+                    current = {item['dedup_key'] for item in inbox if item.get('root') == str(ROOT)
+                               and item.get('coordinator_pane') == coordinator and item.get('delivery') == 'pending'}
+                # A moved pending set or a drifted round snapshot makes the
+                # built text stale: rebuild it outside the locks (git/gh cost)
+                # instead of delivering the old snapshot's wording.
+                if not keys <= current or round_snapshot(slugs) != rounds:
+                    continue
+                stale = stale_event_keys(selected)
+                if stale:
+                    with fleet_state(write=True) as (_, inbox):
+                        for item in inbox:
+                            if (item.get('root') == str(ROOT) and item.get('coordinator_pane') == coordinator
+                                    and item.get('delivery') == 'pending' and item.get('dedup_key') in stale):
+                                item['delivery'] = 'superseded'
+                    continue
+                code, payload, error = herdr_result('agent', 'get', coordinator)
+                result = payload.get('result', {})
+                if code:
+                    error_code = payload.get('error', {}).get('code')
+                    missing = error_code == 'pane_not_found'
+                    if error_code == 'agent_not_found':
+                        pane_code, pane_payload, _ = herdr_result('pane', 'get', coordinator)
+                        missing = bool(pane_code and pane_payload.get('error', {}).get('code') == 'pane_not_found')
+                    if missing:
+                        with fleet_state(write=True) as (panes, _):
+                            entry = panes.get(coordinator, {})
+                            warn = not entry.get('missing_notified')
+                            if warn: entry['missing_notified'] = True
+                        if warn:
+                            herdr_result('notification', 'show', 'herdr-fleet 通知未送达', '--body', f'主 agent pane {coordinator} 不存在，请检查 fleet inbox')
+                    return
+                status = result.get('agent', {}).get('agent_status')
+                if status not in ('idle', 'done'):
+                    return
+                code, payload, error = herdr_result('agent', 'prompt', coordinator, text)
+                result = payload.get('result', payload)
+                success = code == 0 and result.get('type') == 'agent_prompted'
+                with fleet_state(write=True) as (_, inbox):
+                    for item in inbox:
+                        if (item.get('root') == str(ROOT) and item.get('dedup_key') in keys
+                                and item.get('coordinator_pane') == coordinator and item.get('delivery') == 'pending'):
+                            item['attempts'] += 1
+                            item['last_error'] = None if success else (error or 'agent_prompted 未确认')
+                            if success: item['delivery'] = 'delivered'
+                if not success:
+                    return
 
 
 def event(a):
@@ -592,11 +709,12 @@ def submit(data, pane, text):
                 if error == 'agent_blocked':
                     raise RuntimeError(f"agent 已 blocked，请先 fleet peek {data['slug']}")
                 raise RuntimeError(f'开始确认失败：{p.stderr or p.stdout}')
-        with fleet_state():
+        with fleet_state(write=True) as (_, inbox):
             data = load(data['slug'])
             previous = data.get('event_round', {})
             data['event_round'] = {'baseline': seq, 'notified': False, 'last_terminal_seq': previous.get('last_terminal_seq', -1)}
             save(data)
+            supersede_stale_events(inbox, data['slug'], seq)
 
 
 def tasks():
