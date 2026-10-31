@@ -938,6 +938,33 @@ def test_delivery_rechecks_round_after_send_during_message_construction(setup, t
     assert [(r['status'], r['delivery'], r['attempts']) for r in rows] == [('done', 'superseded', 0)]
 
 
+def test_delivery_rebuilds_blocked_notice_after_send_during_construction(setup, tmp_path):
+    root, fleet, log = setup
+    fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')
+    fleet('event', '--pane', 'p', '--status', 'blocked', GET_STATUS='blocked', GET_SEQ='12', COORD_STATUS='working')
+    log.write_text('')
+    barrier, gh = tmp_path / 'delivery-barrier', blocking_gh(tmp_path)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        delivery = pool.submit(fleet, 'event', '--pane', 'coordinator', '--status', 'idle',
+                               COORD_STATUS='idle', AGENT_STATUS='working',
+                               FLEET_GH=str(gh), GH_BARRIER=str(barrier))
+        try:
+            wait_barrier(barrier)
+            # blocked stays pending across rounds, so the pending-set check
+            # alone cannot catch the now-stale "[round 10]" notice text.
+            fleet('send', 'hello', 'next round', GET_SEQ='12')
+        finally:
+            barrier.with_suffix('.release').touch()
+        delivery.result(timeout=10)
+    prompts = coordinator_prompts(log)
+    assert len(prompts) == 1
+    line = next(l for l in prompts[0][3].splitlines() if l.startswith('hello'))
+    assert 'blocked [round 10 → 12] 当前状态 working' in line
+    assert 'blocked [round 10]' not in prompts[0][3]
+    rows = json.loads(fleet('inbox', '--all', '--json').stdout)
+    assert [(r['status'], r['delivery'], r['attempts']) for r in rows] == [('blocked', 'delivered', 1)]
+
+
 def test_delivery_rechecks_baseline_for_late_pending_event(setup, tmp_path):
     root, fleet, log = setup
     fleet('new', 'hello', '-r', 'web', '--no-fetch', '--prompt', 'go', HERDR_PANE_ID='coordinator')

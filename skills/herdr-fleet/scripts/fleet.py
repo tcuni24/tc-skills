@@ -545,6 +545,22 @@ def delivery_lock(coordinator):
         yield
 
 
+def round_snapshot(slugs):
+    """Current event_round.baseline per task, for build-vs-recheck comparison.
+
+    The notice text annotates events against these values; anything that moves
+    a round forward (send/new submission or a manual working edge) makes a
+    previously built text stale even when every event stays pending.
+    """
+    snapshot = {}
+    for slug in slugs:
+        try:
+            snapshot[slug] = (load(slug).get('event_round') or {}).get('baseline')
+        except RuntimeError:
+            snapshot[slug] = None
+    return snapshot
+
+
 def stale_event_keys(selected):
     """dedup_keys of selected done/idle events whose round was since replaced.
 
@@ -575,20 +591,24 @@ def deliver(coordinator):
             selected = [item.copy() for item in inbox if item.get('root') == str(ROOT) and item.get('coordinator_pane') == coordinator and item.get('delivery') == 'pending']
         if not selected:
             return
+        slugs = sorted({item['slug'] for item in selected})
+        rounds = round_snapshot(slugs)
         text = notice_text(selected)
         keys = {item['dedup_key'] for item in selected}
-        slugs = sorted({item['slug'] for item in selected})
         with delivery_lock(coordinator):
             # Sorted per-task locks serialize the re-check and the prompt with
             # submissions/round edges for the same tasks; the cross-task state
-            # lock is still never held while calling herdr.
+            # lock is still never held while calling herdr on this path.
             with ExitStack() as stack:
                 for slug in slugs:
                     stack.enter_context(task_lock(slug))
                 with fleet_state() as (_, inbox):
                     current = {item['dedup_key'] for item in inbox if item.get('root') == str(ROOT)
                                and item.get('coordinator_pane') == coordinator and item.get('delivery') == 'pending'}
-                if not keys <= current:
+                # A moved pending set or a drifted round snapshot makes the
+                # built text stale: rebuild it outside the locks (git/gh cost)
+                # instead of delivering the old snapshot's wording.
+                if not keys <= current or round_snapshot(slugs) != rounds:
                     continue
                 stale = stale_event_keys(selected)
                 if stale:
