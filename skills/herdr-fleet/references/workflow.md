@@ -122,6 +122,51 @@ phase 按以下顺序判断（仓库异常时为 `error`）：
 
 `wait` 默认等待全部任务，`--any` 等首个终态；只认最近一次提交之后的终态。返回码：idle/done 为 0，blocked 为 3，超时为 4，无 agent 或其他错误为 1。观察到终态后，仓库信息读取失败仅报告错误，不改变终态返回码。开任务后运行 `fleet doctor`：通过时可以结束本轮并告知用户会自动通知；不通过时不得声称会自动通知，必须在同一轮内 `fleet wait` 到任务结束或阻塞，不能只说明不会自动通知就结束本轮。`done --dry-run` 预检通过返回 0，拒绝返回 1，且不删除或关闭 tab。
 
+## 任务 agent 启动与提交恢复
+
+以下行为只在 herdr 0.9.1、devin 集成 v2（Devin CLI v3000.11.234）上实测确认；其他版本或其他 agent 种类未验证，只能当排查线索，不能当既定事实。
+
+### Devin 新目录的信任选择页
+
+devin 任务 agent 在未曾信任过的目录（如 `fleet new` 刚建出的 `worktrees/<slug>/`）启动时，可能停在目录信任选择页，而不是任务输入页：
+
+```text
+✱ Do you trust the authors of this directory?
+ ~/…/worktrees/<slug>
+
+ ❭ 1 Yes, trust
+   2 No, exit
+
+ ↑↓ select · ↵ confirm · esc cancel
+```
+
+实测此页停留期间 `herdr agent get <pane>`（输出为 JSON）仍可能显示 `agent_status=idle`、`interactive_ready=true`，而 `agent_session` 字段缺失：即该版本上信任选择页会被误报为就绪。同一版本上另记录过 `fleet new --prompt` 和 `fleet send` 开始确认超时（`开始确认失败：…timeout…`），失败后 worktree 和 tab 按「安全规则」保留；但超时的完整输入处理链未捕获，不能断定超时当刻正处于信任选择页，也不能断定 prompt 被其消耗。因此 `idle`、`interactive_ready`、`agent_session` 任何单项都不足以证明 agent 已到正式输入页，判定以 `fleet peek`（`herdr agent read`）看到的实际屏幕为准。
+
+任务 agent 为 devin 时，稳妥的开任务顺序：
+
+1. `fleet new <slug> …` 不带 `--prompt`，先让 agent 在新目录里起好。
+2. `fleet peek <slug>` 配合 `herdr agent get <pane>` 看实际屏幕：
+   - 显示目录信任选择页：先核对页面上的目录确为本任务刚建的 `worktrees/<slug>/`（即用户授权的任务目录），不匹配或来历不明时绝不答 "Yes, trust"；核对无误后按页面提示作答该选择（`herdr agent send-keys <pane> <键>`，按键以页面选项提示为准；按键无法确定时停下，由用户在任务 tab 中人工确认）。
+   - 已是正式输入页：直接进入下一步。
+   - 其他未知页面：停止，`peek`/`agent get` 留证并向用户报告，不要猜测性发送按键或 prompt。
+3. 再次 `herdr agent get` 确认 `agent_session` 已出现，且 `fleet peek` 显示正式输入页后，用 `fleet send <slug> '<任务说明>'` 提交。
+
+`fleet send` 不自动附带 `new --prompt` 的 worktree 上下文与 FLEET-REPORT 回报块要求；用它补交任务说明时，主 agent 须把任务目录、各仓库分支与 base、"不要改主 checkout"和回报块格式写进发送文本。该选择页是 devin 集成的行为；其他 agent 种类没有相同证据，不要给它们套用额外的启动门槛或等待。`fleet doctor` 只验证环境（插件、coordinator_pane、待投递事件），通过不代表 prompt 已被执行。
+
+### 开始确认失败后的投递不确定
+
+`fleet new --prompt` 或 `fleet send` 报 `开始确认失败`（如 `timeout`、`agent_prompt_stalled`）时，提交结果不确定：开始确认只等启动信号，不追踪整个回合，prompt 可能没送到，也可能已送达或排队而尚未开始执行。失败后 worktree、tab 和 `TASK.md` 的 `submit_seq`（提交时记录的序号）都保留，供检查恢复。未核实前不得重发：重复提交会让同一任务执行两遍。
+
+以下检查只帮助排查，不能自动推出"未投递"：
+
+1. `herdr agent get <pane>`：对比 `state_change_seq` 与 `TASK.md` 的 `submit_seq`；seq 已推进且状态为 idle/done/blocked，说明提交后发生过状态变化。
+2. `fleet peek <slug>`：终端是只有启动页/选择页、无任何任务执行输出，还是已出现对任务的处理痕迹。
+3. 看任务目录与各 worktree：`git status`、`git log` 和新增文件是否显示任务已开始执行。
+
+即使 seq 未推进、终端无执行痕迹、无任务产物三项同时成立，也只说明未观察到执行开始——prompt 仍可能已被接收或排队，不构成"未投递"的确认。因此开始确认超时且没有明确的未送达证据时，持续把该提交标记为"投递不确定"并向用户报告已核实的事实，不得重发；只有取得"原请求未被接受或不会再执行"的明确证据后才恢复 `fleet send`。本轮"核对目录、处理信任选择页、再 send 成功"是已验证的一次成功恢复，不能据此外推成"缺失证据即未投递"的通用判定。
+
+本节是操作规避：绕开"信任选择页被判为就绪"的检测缺口，不代表 herdr 或 devin 的就绪检测已修复。超时 prompt 的去向不要臆测：未被证实被信任页消耗，也不要归因为额度。
+
 ## 安全规则
 
 - `new` 创建 worktree、tab、agent 或 pane 失败时，回滚已建的 worktree、新建的分支和 tab；提交 prompt 后开始确认失败则保留 worktree 和 tab，供检查和恢复。

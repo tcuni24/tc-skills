@@ -43,6 +43,8 @@ fleet new <slug> [-r <键>[,<键>]] [--fix] [--base <键>=<ref>] [--agent <种�
 
 `fleet` 会在 prompt 前自动加上 worktree 路径、分支、base 和"不要改主 checkout"，不必重复。开完后执行 `fleet ls`，确认 tab 和 agent 都在。
 
+任务 agent 为 devin 时，新目录可能先停在目录信任选择页而非任务输入页（herdr 0.9.1 + devin v2 实测）；此时 `idle`/`interactive_ready` 单项不足为凭，宜 `fleet new` 不带 `--prompt`，用 `fleet peek` 与 `herdr agent get` 核实屏幕、确认是用户授权的任务目录后再 `fleet send` 提交。启动检查和开始确认失败后的恢复步骤见 `references/workflow.md` 的「任务 agent 启动与提交恢复」。
+
 随后执行 `fleet doctor`。通过时可以结束本轮，告诉用户任务完成或阻塞后会自动通知；不通过时不得声称会自动通知，必须在同一轮内执行 `fleet wait <slug>...` 直到任务结束或阻塞。
 
 ## 3. 看情况
