@@ -114,7 +114,7 @@ Devin 随后在独立 clone `/project/tmp/fleet-37-39-38-combined` 中，按 #40
 
 - 三个来源 PR 最终 HEAD 的 Python 3.11 / 3.13 CI 均已 SUCCESS 后合并。
 - 合并元数据：`followups/devin-startup-guide/pr-43-merged.json`、`followups/config-test-isolation/pr-44-merged.json`、`followups/event-query-lock/pr-45-merged.json`；各目录早期 `pr-43.json`、`pr-44.json`、`pr-45-code.json`、`pr-45-final.json` 中的 OPEN 为合并前历史状态，按原样保留。
-- #45 合并提交 `12783ac1` 即本次归档任务的 base（origin/main）。
+- #45 合并提交 `12783ac1` 即本次归档任务的 base（归档任务启动时的 origin/main）。
 
 ## 使用中发现的 skill / 集成问题
 
@@ -138,7 +138,7 @@ Devin 随后在独立 clone `/project/tmp/fleet-37-39-38-combined` 中，按 #40
 - Root 已读取实际失败堆栈。Devin 报告在 base957b910 也能复现，但初次 base 运行的完整原始输出未保存，不将该归因当作 Root 独立复核结论。
 - 各精确 HEAD 快照在没有真实 fleet 配置祖先的目录中完整通过，组合仓库同样通过。
 - 已交付修复 [PR #44](https://github.com/tcuni24/tc-skills/pull/44)，HEAD `dc5d61ba6bd2d720dbda1c02b1ed28b8da363d04`，已 MERGED（合并提交 `c927ac4028c6ca0aa22bd05bb7f373022ed8f165`）。仅改测试：无配置场景把脚本副本放进无配置目录，同时隔离 cwd 与脚本祖先；新增断言保留合法的脚本祖先配置发现，确认只列出合成根目录的任务。原失败断言保留，无 skip。
-- 在当前 main `468b1a8` 的真实 fleet worktree 重新保存了目标失败日志，不依赖早期未保存的 base 运行。修复后相同 worktree 完整 **133 passed / EXIT=0**，精确 HEAD 的无配置祖先快照同样 **133 passed / EXIT=0**。
+- 在当时的 main `468b1a8` 的真实 fleet worktree 重新保存了目标失败日志，不依赖早期未保存的 base 运行。修复后相同 worktree 完整 **133 passed / EXIT=0**，精确 HEAD 的无配置祖先快照同样 **133 passed / EXIT=0**。
 - Root 已检查完整 diff、两份完整通过日志及新鲜失败日志，比对快照全部 155 个 tracked 文件与提交一致，diff --check 通过。Python 3.11 / 3.13 CI 均 SUCCESS。
 - 合并后真实 fleet worktree 中的测试不再受脚本路径祖先的真实 fleet 配置影响，main 基线上的复核结果见「合并后 main 组合验收」。
 - 合并元数据 `followups/config-test-isolation/pr-44-merged.json`；同目录 `pr-44.json` 的 OPEN 为合并前历史状态，原样保留。
@@ -176,13 +176,13 @@ Root 据此将修复限定为：仅把 `agent get` 移到全局锁外，保留�
 | --- | --- | --- | --- | --- |
 | A 启动与投递恢复 | [#43](https://github.com/tcuni24/tc-skills/pull/43) | `7c180c4535d4f524e3516016c9ed17431e63ce66` | 纯文档复核、双版本 CI SUCCESS | MERGED `16f3ac78`；检测缺口未修，提供操作指引 |
 | B 测试隔离 | [#44](https://github.com/tcuni24/tc-skills/pull/44) | `dc5d61ba6bd2d720dbda1c02b1ed28b8da363d04` | worktree/快照各 133 passed、双版本 CI SUCCESS | MERGED `c927ac40` |
-| C 事件查询锁 | [#45](https://github.com/tcuni24/tc-skills/pull/45) | `d803c9dbd8d56500266fb8ef013120a6cf2cceba` | 代码阶段快照 139 passed；最终仅改文档，双版本 CI SUCCESS | MERGED `12783ac1`（当前 origin/main） |
+| C 事件查询锁 | [#45](https://github.com/tcuni24/tc-skills/pull/45) | `d803c9dbd8d56500266fb8ef013120a6cf2cceba` | 代码阶段快照 139 passed；最终仅改文档，双版本 CI SUCCESS | MERGED `12783ac1`（功能验收基线） |
 
 ## 合并后 main 组合验收
 
 本轮归档任务在合并后的 main 基线上对两测试文件做了一次完整组合运行：
 
-- tested base：`12783ac14b4e23ce65dd5ac890acee4b894097b2`（origin/main = #45 合并提交）
+- tested base：`12783ac14b4e23ce65dd5ac890acee4b894097b2`（功能验收基线，测试启动时的 origin/main = #45 合并提交）
 - 执行者：归档任务 agent（Devin），在真实 fleet worktree `/home/glx/scripts/tc-skills-fleet/worktrees/fleet-closeout-report/tc-skills`（祖先含真实 `.herdr-fleet.toml`）中运行；非 Root 亲自执行。
 - 命令：`/home/glx/scripts/tc-skills-fleet/worktrees/report-block-37/.venv/bin/python -m pytest tests/herdr-fleet/test_fleet.py tests/herdr-fleet/test_event_lock.py -q`
 - 结果：**139 passed in 157.78s，EXIT=0**。B 修复已生效，未再出现祖先配置导致的 `test_config_discovery_bases_and_errors` 失败。

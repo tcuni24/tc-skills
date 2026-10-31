@@ -1,6 +1,6 @@
 # 合并后 main 组合验收证据
 
-tested base: `12783ac14b4e23ce65dd5ac890acee4b894097b2`（= 归档任务分支 base = origin/main，即 #45 合并提交）
+tested base: `12783ac14b4e23ce65dd5ac890acee4b894097b2`（= 归档任务分支 base = 归档任务启动时的 origin/main，即 #45 合并提交）
 
 执行者：归档任务 agent（Devin，--permission-mode dangerous）；非 Root 亲自运行。
 
@@ -8,7 +8,7 @@ tested base: `12783ac14b4e23ce65dd5ac890acee4b894097b2`（= 归档任务分支 b
 
 - 工作目录：`/home/glx/scripts/tc-skills-fleet/worktrees/fleet-closeout-report/tc-skills`（真实 fleet worktree，祖先含 `/home/glx/scripts/tc-skills-fleet/.herdr-fleet.toml`）
 - Python：`/home/glx/scripts/tc-skills-fleet/worktrees/report-block-37/.venv/bin/python`（pytest 9.2.0）
-- 运行前 `git status` 干净，HEAD == tested base
+- 运行前 HEAD == tested base，代码与测试相对 base 无改动；操作顺序为先复制报告并建立 `merged/final-main/`，后运行测试，故运行时工作树中已有本轮归档的 untracked 报告目录，并非全工作树干净
 
 ## 命令与退出码
 
