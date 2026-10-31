@@ -1,0 +1,18 @@
+[
+  {
+    "slug": "report-block-37",
+    "tab": "wE:tK",
+    "agent": "idle",
+    "repos": {
+      "tcskills": {
+        "branch": "fix/report-block-37",
+        "dirty": 0,
+        "ahead": 0,
+        "behind": 0,
+        "merge": "no-commits"
+      }
+    },
+    "agent_kind": "devin",
+    "phase": "idle-empty"
+  }
+]

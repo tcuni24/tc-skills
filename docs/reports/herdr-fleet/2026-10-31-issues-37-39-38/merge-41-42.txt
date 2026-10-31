@@ -1,0 +1,12 @@
+exit=1
+e7adeb8e49c240bceb7d5456ea2fea65b8a732f8
+100755 3d251ea495e177065e2d8ce4b45a8072bdfa40e9 1	skills/herdr-fleet/scripts/fleet.py
+100755 b156a385a7514941f4e240d34b991c096419e3f5 2	skills/herdr-fleet/scripts/fleet.py
+100755 dec3cd0e7e70ed790c5ac2df07b0aba3fae6d64d 3	skills/herdr-fleet/scripts/fleet.py
+
+Auto-merging skills/herdr-fleet/SKILL.md
+Auto-merging skills/herdr-fleet/references/workflow.md
+Auto-merging skills/herdr-fleet/scripts/fleet.py
+CONFLICT (content): Merge conflict in skills/herdr-fleet/scripts/fleet.py
+Auto-merging tests/herdr-fleet/test_fleet.py
+

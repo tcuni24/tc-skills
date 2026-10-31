@@ -1,0 +1,40 @@
+workdir: /tmp/fleet-lock-audit-rh6odx5k
+[PASS] A parked inside agent get — pid=786798
+[PASS] A holds global fleet_state lock during agent get — inode=38424636 holders=[{'pending': False, 'pid': 786798, 'mode': 'WRITE', 'raw': '45: FLOCK  ADVISORY  WRITE 786798 103:02:38424636 0 EOF'}]
+--- /proc/locks rows on state lock inode (barrier held) ---
+  45: FLOCK  ADVISORY  WRITE 786798 103:02:38424636 0 EOF    <- A:event pa
+  45: -> FLOCK  ADVISORY  WRITE 786802 103:02:38424636 0 EOF    <- B:event pb
+  45:  -> FLOCK  ADVISORY  WRITE 786803 103:02:38424636 0 EOF    <- C:event pz
+  45:   -> FLOCK  ADVISORY  WRITE 786804 103:02:38424636 0 EOF    <- I:inbox
+[PASS] B/C/I queued on the same global lock
+  B wchan=locks_lock_inode_wait
+  C wchan=locks_lock_inode_wait
+  I wchan=locks_lock_inode_wait
+[PASS] B still running behind barrier
+[PASS] C still running behind barrier
+[PASS] I still running behind barrier
+[PASS] A issued agent get pa
+[PASS] B has NOT reached its own agent get pb — log shows B never passed the fleet_state gate while barrier held
+[PASS] no agent prompt attempted
+--- A exit=0 stdout='' stderr=''
+--- B exit=0 stdout='' stderr=''
+--- C exit=0 stdout='' stderr=''
+--- I exit=0 stdout='[\n  {\n    "root": "/tmp/fleet-lock-audit-rh6odx5k/root",\n    "slug": "task-a",\n    "coordinator_pane": "coordinator",\n    "status": "done",\n    "created": "2026-10-31T02:19:39.057366+00:00",\n    "dedup_key": "[\\"/tmp/fleet-lock-audit-rh6odx5k/root\\", \\"task-a\\", 10]",\n    "baseline": 10,\n    "delivery": "pending",\n    "attempts": 0,\n    "last_error": null\n  }\n]' stderr=''
+[PASS] all four processes exit 0
+[PASS] B reached agent get pb after release
+--- fake-herdr call log ---
+  ["agent", "get", "pa"]
+  ["tab", "list", "--workspace", "w"]
+  ["agent", "get", "pb"]
+  ["agent", "list"]
+  ["tab", "list", "--workspace", "w"]
+  ["agent", "get", "coordinator"]
+  ["agent", "list"]
+  ["agent", "get", "coordinator"]
+[PASS] inbox has both done events pending — [["task-a", "done", "pending"], ["task-b", "done", "pending"]]
+[PASS] I observed A's already-appended event — I saw 1 pending event(s)
+[PASS] task-a event_round notified — {"baseline": 10, "notified": true, "last_terminal_seq": 12}
+[PASS] task-b event_round notified — {"baseline": 10, "notified": true, "last_terminal_seq": 12}
+
+=== SUMMARY ===
+15/15 checks passed; workdir kept at /tmp/fleet-lock-audit-rh6odx5k

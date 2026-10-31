@@ -1,0 +1,29 @@
+........................................................................ [ 54%]
+.......F.....................................................            [100%]
+=================================== FAILURES ===================================
+____________________ test_config_discovery_bases_and_errors ____________________
+
+setup = (PosixPath('/tmp/pytest-of-glx/pytest-2097/test_config_discovery_bases_an0/root'), <function setup.<locals>.fleet at 0x7893981a6a20>, PosixPath('/tmp/pytest-of-glx/pytest-2097/test_config_discovery_bases_an0/log'))
+tmp_path = PosixPath('/tmp/pytest-of-glx/pytest-2097/test_config_discovery_bases_an0')
+
+    def test_config_discovery_bases_and_errors(setup, tmp_path):
+        root, fleet, _ = setup
+        sub = root / 'app-api' / 'nested'
+        sub.mkdir()
+        # Without FLEET_ROOT the config is found by walking up from the working directory.
+        fleet('new', 'found', '-r', 'be', '--no-fetch', '--agent', 'none', '--base', 'be=master', cwd=sub, drop=('FLEET_ROOT',))
+        data = (root / 'worktrees/found/TASK.md').read_text()
+        assert '"base": "master"' in data and '"web"' not in data
+        assert fleet('new', 'x', '--base', 'nope=main', '--no-fetch', check=False).returncode
+        assert fleet('new', 'x', '-r', 'web,web', '--no-fetch', check=False).returncode
+        lonely = tmp_path / 'elsewhere'
+        lonely.mkdir()
+        p = fleet('ls', cwd=lonely, drop=('FLEET_ROOT',), check=False)
+>       assert p.returncode and '.herdr-fleet.toml' in p.stderr
+E       AssertionError: assert (0)
+E        +  where 0 = CompletedProcess(args=['python3', '/home/glx/scripts/tc-skills-fleet/worktrees/stale-round-38/tc-skills/skills/herdr-f...b  tcskills +0/-5 dirty0 merged  \nstale-round-38   -    devin -  no-tab  tcskills +3/-0 dirty0 unmerged\n', stderr='').returncode
+
+tests/herdr-fleet/test_fleet.py:1275: AssertionError
+=========================== short test summary info ============================
+FAILED tests/herdr-fleet/test_fleet.py::test_config_discovery_bases_and_errors
+1 failed, 132 passed in 158.20s (0:02:38)

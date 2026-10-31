@@ -1,0 +1,26 @@
+{
+  "slug": "report-block-37",
+  "tab": "wE:tK",
+  "agent": "idle",
+  "repos": {
+    "tcskills": {
+      "branch": "fix/report-block-37",
+      "dirty": 0,
+      "ahead": 0,
+      "behind": 0,
+      "merge": "no-commits",
+      "base": "origin/main",
+      "files": [],
+      "files_omitted": 0,
+      "commits": [],
+      "diff_stat": [],
+      "diff_stat_omitted": 0,
+      "pr": null
+    }
+  },
+  "agent_kind": "devin",
+  "phase": "idle-empty",
+  "next_step": "使用 fleet peek 确认是否卡住",
+  "agent_output": "✓ Trust ~/scripts/tc-skills-fleet/worktrees/report-block-37?\n\n⠀⣴⣾⣶⡄⠀⠀⠀⠀\n⠀⠛⠿⠟⠻⣶⣾⣶⡄  Devin CLI\n⠀⣤⣶⣦⣴⠿⢿⠿⠃  v3000.11.234\n⠀⠻⢿⠿⠃⠀⠀⠀⠀\n\n Pro · 0% remaining (resets in 1d 7h)\n\n ⏺ ~/scripts/tc-skills-fleet/worktrees/report-block-37\n──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n❭ Ask Devin to build features, fix bugs, or work on your code\n──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\nSWE-2 Max · bypass                                                                       Press alt+↑/alt+↓ to rate a response (thumbs up/down)",
+  "report": null
+}

@@ -1,0 +1,18 @@
+{
+  "pa": {
+    "root": "/tmp/fleet-lock-audit-8ywg9x3i/root",
+    "slug": "task-a",
+    "role": "task",
+    "tab_id": "ta"
+  },
+  "pb": {
+    "root": "/tmp/fleet-lock-audit-8ywg9x3i/root",
+    "slug": "task-b",
+    "role": "task",
+    "tab_id": "tb"
+  },
+  "coordinator": {
+    "root": "/tmp/fleet-lock-audit-8ywg9x3i/root",
+    "role": "coordinator"
+  }
+}

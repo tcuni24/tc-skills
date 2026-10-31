@@ -1,0 +1,166 @@
+FFFFF.                                                                   [100%]
+=================================== FAILURES ===================================
+______________ test_event_get_does_not_block_other_tasks_or_inbox ______________
+
+setup = (PosixPath('/tmp/pytest-of-glx/pytest-2115/test_event_get_does_not_block_0/root'), <test_event_lock.setup.<locals>.Fle..._does_not_block_0/log'), PosixPath('/tmp/pytest-of-glx/pytest-2115/test_event_get_does_not_block_0/state/herdr-fleet'))
+tmp_path = PosixPath('/tmp/pytest-of-glx/pytest-2115/test_event_get_does_not_block_0')
+
+    def test_event_get_does_not_block_other_tasks_or_inbox(setup, tmp_path):
+        root, fleet, log, state = setup
+        make_task(root, state, 'task-a', 'pa')
+        make_task(root, state, 'task-b', 'pb')
+        barrier = tmp_path / 'barrier'
+        proc_a = fleet.spawn('event', '--pane', 'pa', '--status', 'done', GET_STATUS='done', GET_SEQ='12',
+                             BARRIER=str(barrier), BARRIER_CALL='agent get')
+        procs = []
+        try:
+            wait_for('task-a parked inside agent get', barrier.exists)
+            assert proc_a.poll() is None
+            # While task-a's query is parked, a second task's event, an
+            # unregistered-pane event and a read-only inbox must all complete:
+            # only task-a's own task lock is held, never the cross-task state lock.
+            procs = [fleet.spawn('event', '--pane', 'pb', '--status', 'done', OTHER_STATUS='done', OTHER_SEQ='12'),
+                     fleet.spawn('event', '--pane', 'pz', '--status', 'done'),
+                     fleet.spawn('inbox', '--json')]
+            for proc in procs:
+                finish(proc)
+>           assert proc_a.poll() is None  # task-a is still parked, yet everyone finished
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           AssertionError: assert 1 is None
+E            +  where 1 = poll()
+E            +    where poll = <Popen: returncode: 1 args: ['/home/glx/scripts/tc-skills-fleet/worktrees/re...>.poll
+
+tests/herdr-fleet/test_event_lock.py:168: AssertionError
+_____ test_event_result_dropped_when_pane_rebound_during_query[other-task] _____
+
+setup = (PosixPath('/tmp/pytest-of-glx/pytest-2115/test_event_result_dropped_when0/root'), <test_event_lock.setup.<locals>.Fle...ult_dropped_when0/log'), PosixPath('/tmp/pytest-of-glx/pytest-2115/test_event_result_dropped_when0/state/herdr-fleet'))
+tmp_path = PosixPath('/tmp/pytest-of-glx/pytest-2115/test_event_result_dropped_when0')
+rebind = 'other-task'
+
+    @pytest.mark.parametrize('rebind', ['other-task', 'removed'])
+    def test_event_result_dropped_when_pane_rebound_during_query(setup, tmp_path, rebind):
+        root, fleet, log, state = setup
+        make_task(root, state, 'task-a', 'pa')
+        make_task(root, state, 'task-b', 'pb')
+        barrier = tmp_path / 'barrier'
+        proc_a = fleet.spawn('event', '--pane', 'pa', '--status', 'done', GET_STATUS='done', GET_SEQ='12',
+                             BARRIER=str(barrier), BARRIER_CALL='agent get')
+        try:
+            wait_for('task-a parked inside agent get', barrier.exists)
+            # The pane is re-bound (open/register_task/done style writers) while
+            # the query is in flight; the stale result must not reach a new task.
+            panes_path = state / 'panes.json'
+            panes = json.loads(panes_path.read_text())
+            if rebind == 'other-task':
+                panes['pa'] = {'root': str(root), 'slug': 'task-b', 'role': 'task', 'tab_id': 'tb'}
+            else:
+                del panes['pa']
+            temp = panes_path.with_suffix('.tmp')
+            temp.write_text(json.dumps(panes))
+            os.replace(temp, panes_path)
+            barrier.with_suffix('.release').touch()
+            finish(proc_a)
+        finally:
+            release(barrier, [proc_a])
+>       assert json.loads(fleet.run('inbox', '--all', '--json').stdout) == []
+E       AssertionError: assert [{'root': '/t... 'done', ...}] == []
+E         
+E         Left contains one more item: {'root': '/tmp/pytest-of-glx/pytest-2115/test_event_result_dropped_when0/root', 'slug': 'task-a', 'coordinator_pane': 'coordinator', 'status': 'done', ...}
+E         Use -v to get more diff
+
+tests/herdr-fleet/test_event_lock.py:205: AssertionError
+______ test_event_result_dropped_when_pane_rebound_during_query[removed] _______
+
+setup = (PosixPath('/tmp/pytest-of-glx/pytest-2115/test_event_result_dropped_when1/root'), <test_event_lock.setup.<locals>.Fle...ult_dropped_when1/log'), PosixPath('/tmp/pytest-of-glx/pytest-2115/test_event_result_dropped_when1/state/herdr-fleet'))
+tmp_path = PosixPath('/tmp/pytest-of-glx/pytest-2115/test_event_result_dropped_when1')
+rebind = 'removed'
+
+    @pytest.mark.parametrize('rebind', ['other-task', 'removed'])
+    def test_event_result_dropped_when_pane_rebound_during_query(setup, tmp_path, rebind):
+        root, fleet, log, state = setup
+        make_task(root, state, 'task-a', 'pa')
+        make_task(root, state, 'task-b', 'pb')
+        barrier = tmp_path / 'barrier'
+        proc_a = fleet.spawn('event', '--pane', 'pa', '--status', 'done', GET_STATUS='done', GET_SEQ='12',
+                             BARRIER=str(barrier), BARRIER_CALL='agent get')
+        try:
+            wait_for('task-a parked inside agent get', barrier.exists)
+            # The pane is re-bound (open/register_task/done style writers) while
+            # the query is in flight; the stale result must not reach a new task.
+            panes_path = state / 'panes.json'
+            panes = json.loads(panes_path.read_text())
+            if rebind == 'other-task':
+                panes['pa'] = {'root': str(root), 'slug': 'task-b', 'role': 'task', 'tab_id': 'tb'}
+            else:
+                del panes['pa']
+            temp = panes_path.with_suffix('.tmp')
+            temp.write_text(json.dumps(panes))
+            os.replace(temp, panes_path)
+            barrier.with_suffix('.release').touch()
+            finish(proc_a)
+        finally:
+            release(barrier, [proc_a])
+>       assert json.loads(fleet.run('inbox', '--all', '--json').stdout) == []
+E       AssertionError: assert [{'root': '/t... 'done', ...}] == []
+E         
+E         Left contains one more item: {'root': '/tmp/pytest-of-glx/pytest-2115/test_event_result_dropped_when1/root', 'slug': 'task-a', 'coordinator_pane': 'coordinator', 'status': 'done', ...}
+E         Use -v to get more diff
+
+tests/herdr-fleet/test_event_lock.py:205: AssertionError
+____________ test_same_task_event_waits_on_task_lock_not_state_lock ____________
+
+setup = (PosixPath('/tmp/pytest-of-glx/pytest-2115/test_same_task_event_waits_on_0/root'), <test_event_lock.setup.<locals>.Fle..._event_waits_on_0/log'), PosixPath('/tmp/pytest-of-glx/pytest-2115/test_same_task_event_waits_on_0/state/herdr-fleet'))
+tmp_path = PosixPath('/tmp/pytest-of-glx/pytest-2115/test_same_task_event_waits_on_0')
+
+    def test_same_task_event_waits_on_task_lock_not_state_lock(setup, tmp_path):
+        root, fleet, log, state = setup
+        make_task(root, state, 'task-a', 'pa')
+        make_task(root, state, 'task-b', 'pb')
+        barrier = tmp_path / 'barrier'
+        proc_a = fleet.spawn('event', '--pane', 'pa', '--status', 'done', GET_STATUS='done', GET_SEQ='12',
+                             BARRIER=str(barrier), BARRIER_CALL='agent get')
+        proc_b = proc_a2 = None
+        try:
+            wait_for('task-a parked inside agent get', barrier.exists)
+            proc_a2 = fleet.spawn('event', '--pane', 'pa', '--status', 'done', GET_STATUS='done', GET_SEQ='12')
+            proc_b = fleet.spawn('event', '--pane', 'pb', '--status', 'done', OTHER_STATUS='done', OTHER_SEQ='12')
+            finish(proc_b)  # proves the global state lock is free while task-a is parked
+            assert proc_a2.poll() is None  # the same-task event still waits on task_lock(task-a)
+>           assert sum(call == ['agent', 'get', 'pa'] for call in calls(log)) == 1
+E           assert 2 == 1
+E            +  where 2 = sum(<generator object test_same_task_event_waits_on_task_lock_not_state_lock.<locals>.<genexpr> at 0x7dda50862c20>)
+
+tests/herdr-fleet/test_event_lock.py:224: AssertionError
+______________ test_send_waits_for_inflight_event_then_supersedes ______________
+
+setup = (PosixPath('/tmp/pytest-of-glx/pytest-2115/test_send_waits_for_inflight_e0/root'), <test_event_lock.setup.<locals>.Fle...s_for_inflight_e0/log'), PosixPath('/tmp/pytest-of-glx/pytest-2115/test_send_waits_for_inflight_e0/state/herdr-fleet'))
+tmp_path = PosixPath('/tmp/pytest-of-glx/pytest-2115/test_send_waits_for_inflight_e0')
+
+    def test_send_waits_for_inflight_event_then_supersedes(setup, tmp_path):
+        root, fleet, log, state = setup
+        make_task(root, state, 'task-a', 'pa')
+        make_task(root, state, 'task-b', 'pb')
+        barrier = tmp_path / 'barrier'
+        proc_a = fleet.spawn('event', '--pane', 'pa', '--status', 'done', GET_STATUS='done', GET_SEQ='12',
+                             BARRIER=str(barrier), BARRIER_CALL='agent get')
+        proc_send = proc_b = None
+        try:
+            wait_for('task-a parked inside agent get', barrier.exists)
+            proc_send = fleet.spawn('send', 'task-a', 'next round', GET_STATUS='working', GET_SEQ='12')
+            proc_b = fleet.spawn('event', '--pane', 'pb', '--status', 'done', OTHER_STATUS='done', OTHER_SEQ='12')
+            finish(proc_b)  # global state lock is free
+            # send already passed its unlocked tab/agent lookup but cannot enter
+            # task_lock(task-a): no `agent get`/`agent prompt` of its own yet.
+>           assert proc_send.poll() is None
+E           AssertionError: assert 0 is None
+E            +  where 0 = poll()
+E            +    where poll = <Popen: returncode: 0 args: ['/home/glx/scripts/tc-skills-fleet/worktrees/re...>.poll
+
+tests/herdr-fleet/test_event_lock.py:251: AssertionError
+=========================== short test summary info ============================
+FAILED tests/herdr-fleet/test_event_lock.py::test_event_get_does_not_block_other_tasks_or_inbox
+FAILED tests/herdr-fleet/test_event_lock.py::test_event_result_dropped_when_pane_rebound_during_query[other-task]
+FAILED tests/herdr-fleet/test_event_lock.py::test_event_result_dropped_when_pane_rebound_during_query[removed]
+FAILED tests/herdr-fleet/test_event_lock.py::test_same_task_event_waits_on_task_lock_not_state_lock
+FAILED tests/herdr-fleet/test_event_lock.py::test_send_waits_for_inflight_event_then_supersedes
+5 failed, 1 passed in 33.09s
