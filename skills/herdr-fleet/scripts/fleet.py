@@ -1031,15 +1031,58 @@ def agent_output(pane, lines):
     return p.stdout.rstrip()
 
 
+def echo_lines(output):
+    """Flag lines attributable to a user-input echo, not to the agent.
+
+    recent-unwrapped carries no role/source field, so attribution can only
+    use what the TUI renders. Devin replays a submitted prompt behind a `❭ `
+    glyph at column 0 and gives every rendered line of that echo a hanging
+    indent of at least two cells — deeper when the input text itself was
+    indented — so the echo run continues through any `  `+ or blank line
+    and ends at the first non-blank line with less indentation. Agent
+    output (text, tool lines, fenced report blocks) observed in real
+    panes sits at other indents, which is why a `❭` run is only ever
+    closed by a shallower line. Blank lines stay inside a run: an echoed
+    empty input line and the blank the TUI draws after input look
+    identical. A capture that opens with `  `+/blank lines may start
+    mid-echo — the `❭` scrolled off — so that leading run is treated as
+    unattributed as well.
+    """
+    echo, in_echo = [], True
+    for line in output.split('\n'):
+        lead = len(line) - len(line.lstrip())
+        if line.startswith('❭ '):
+            in_echo = True
+        elif lead < 2 and line.strip():
+            in_echo = False
+        echo.append(in_echo)
+    return echo
+
+
 def last_report(output):
-    marks = [(m.start(), m.end(), True) for m in REPORT_START.finditer(output)]
-    marks += [(m.start(), m.end(), False) for m in REPORT_END.finditer(output)]
-    start = report = None
-    for begin, end, is_start in sorted(marks):
+    # Markers inside an echo run are the coordinator's own submitted text,
+    # not an agent report, and an echo run is a hard pairing boundary: a
+    # START before it can never close with an END after it. Report slices
+    # therefore always come from one contiguous trusted run of the
+    # original output — nothing is deleted or spliced mid-block.
+    marks, start, report = [], None, None
+    pos = sec = 0
+    prev = True
+    for line, echo in zip(output.split('\n'), echo_lines(output)):
+        if echo != prev:
+            sec += 1
+        prev = echo
+        if not echo:
+            for m in REPORT_START.finditer(line):
+                marks.append((pos + m.start(), pos + m.end(), True, sec))
+            for m in REPORT_END.finditer(line):
+                marks.append((pos + m.start(), pos + m.end(), False, sec))
+        pos += len(line) + 1
+    for begin, end, is_start, mark_sec in sorted(marks):
         if is_start:
-            start = begin
-        elif start is not None:
-            report = output[start:end]
+            start = (begin, mark_sec)
+        elif start is not None and start[1] == mark_sec:
+            report = output[start[0]:end]
             start = None
     return textwrap.dedent(report).rstrip('\r\n') if report is not None else None
 

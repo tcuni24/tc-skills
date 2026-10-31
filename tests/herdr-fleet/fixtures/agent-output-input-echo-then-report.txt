@@ -1,0 +1,31 @@
+# 最小化自真实完成现场（perf-lazy-export pane，结构原样、内容匿名化）：同一轮内输入回显模板在前，
+# agent 工作后输出真实 fenced 回报（3 空格缩进）并回到空输入提示；期望摘取真实回报而非模板。
+❭ 任务 cwd=/project/.../worktrees/<slug>；实际修改仓库=<repo>/；分支=feat/<slug>；base=origin/
+  develop@<sha>。任务说明……
+  最终给出改动/测试/覆盖边界/证据路径，并把以下完整块放进 fenced text 代码块中，所有字段独立成行：
+  FLEET-REPORT
+  结果：完成 / 部分完成 / 阻塞
+  PR：链接或无
+  测试：每条命令及退出码
+  证据边界：哪些已真实验证，哪些为fixture/mock或未覆盖
+  需要决策：用户需要决定的事项或无
+  END FLEET-REPORT
+
+ 我先读取任务要求。
+
+ ✓ Read ./TASK.md
+
+ 任务完成。汇总如下。
+
+   FLEET-REPORT
+   结果：完成
+   PR：https://example.test/pr/2
+   测试：pytest -q → 0
+   证据边界：真实验证
+   需要决策：无
+   END FLEET-REPORT
+
+──────────────────────────────────────────────────────────────────────────────────────
+❭ Ask Devin to build features, fix bugs, or work on your code
+──────────────────────────────────────────────────────────────────────────────────────
+SWE-2 Max · bypass

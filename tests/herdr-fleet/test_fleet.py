@@ -1485,9 +1485,14 @@ def test_delivery_notice_marks_unknown_and_mixed_pr(setup, tmp_path):
     assert next(line for line in prompts[0][3].splitlines() if line.startswith('nope')).endswith(' -')
 
 
+def fixture_text(name):
+    # 真实 agent_output 裁剪件，来源见各文件首行
+    return (FIXTURES / f'{name}.txt').read_text()
+
+
 def report_fixture(name):
     # 真实 agent_output 裁剪件与其对应的期望回报块（*.report.txt），来源见各文件首行
-    return (FIXTURES / f'{name}.txt').read_text(), (FIXTURES / f'{name}.report.txt').read_text().rstrip('\n')
+    return fixture_text(name), (FIXTURES / f'{name}.report.txt').read_text().rstrip('\n')
 
 
 @pytest.mark.parametrize(('output', 'expected'), [
@@ -1497,8 +1502,10 @@ def report_fixture(name):
     ('FLEET-REPORT\nold\nEND FLEET-REPORT\nFLEET-REPORT\nincomplete', 'FLEET-REPORT\nold\nEND FLEET-REPORT'),
     ('nothing', None),
     ('前文\n   FLEET-REPORT\n   结果：完成\n     - 细节\n   END FLEET-REPORT', 'FLEET-REPORT\n结果：完成\n  - 细节\nEND FLEET-REPORT'),
-    ('   FLEET-REPORT\n   结果：完成\n     - 细节\n   END FLEET-REPORT', 'FLEET-REPORT\n结果：完成\n  - 细节\nEND FLEET-REPORT'),
-    ('   FLEET-REPORT 结果：完\n   成 END FLEET-REPORT', 'FLEET-REPORT 结果：完\n成 END FLEET-REPORT'),
+    # 捕获顶部直接以深缩进块开头：无法证明不是滚出窗口的回显尾部（输入行自带缩进会渲染得更深），
+    # recent-unwrapped 无来源信息，保守不报
+    ('   FLEET-REPORT\n   结果：完成\n     - 细节\n   END FLEET-REPORT', None),
+    ('   FLEET-REPORT 结果：完\n   成 END FLEET-REPORT', None),
     ('前文\n\tFLEET-REPORT\n\t结果：完成\n\tEND FLEET-REPORT', 'FLEET-REPORT\n结果：完成\nEND FLEET-REPORT'),
     ('前文\nFLEET-REPORT 结果：完成 PR：无 END FLEET-REPORT', 'FLEET-REPORT 结果：完成 PR：无 END FLEET-REPORT'),
     ('前文\n FLEET-REPORT 结果：完\n 成 END FLEET-REPORT', 'FLEET-REPORT 结果：完\n成 END FLEET-REPORT'),
@@ -1510,6 +1517,47 @@ def report_fixture(name):
     ('FLEET-REPORT\n结果：弃\nFLEET-REPORT\n结果：新\nEND FLEET-REPORT', 'FLEET-REPORT\n结果：新\nEND FLEET-REPORT'),
     report_fixture('agent-output-markdown-folded'),
     report_fixture('agent-output-fenced-indented'),
+    # issue #48：用户输入回显里的占位模板不是 agent 回报。回显以 `❭ ` 起始，其后所有 ≥2 缩进/空行
+    # 续行均属回显（输入自带缩进会渲染得更深），首个 <2 缩进非空行才结束；回显/不可信区段同时是
+    # 标记配对边界，START 不能跨区与后方的 END 合成原文不存在的块
+    ('❭ 任务\n  FLEET-REPORT\n  结果：完成 / 部分完成 / 阻塞\n  PR：链接或无\n  测试：每条命令及退出码\n  证据边界：\n  需要决策：\n  END FLEET-REPORT\n\n 我先了解', None),
+    # 回显延伸到输出末尾：agent 尚无输出
+    ('❭ 任务\n  FLEET-REPORT\n  结果：完成\n  END FLEET-REPORT', None),
+    # 非固定占位文案同样按回显位置判定，不是对中文模板字符串的黑名单
+    ('❭ task\n  FLEET-REPORT\n  result: done\n  END FLEET-REPORT\n\n agent line', None),
+    # 回显中未闭合的块同样不算回报
+    ('❭ 任务\n  FLEET-REPORT\n  结果：完成\n\n 我先了解', None),
+    # `❭` 区内更深缩进的输入行（发送文本自带前导空白）仍是回显，不是 agent 回报
+    ('❭ task\n      FLEET-REPORT\n      result: done\n      END FLEET-REPORT\n\n agent line', None),
+    # `❭` 区内混合 2 空格/更深缩进/制表符续行，直到首个 <2 缩进非空行才结束
+    ('❭ task\n    indented input\n      "k": 1\n  \tFLEET-REPORT\n  \tresult\n  \tEND FLEET-REPORT\n\n agent', None),
+    # 顶部截断落在更深缩进的回显尾部（`❭` 已滚出）：不能因为缩进 ≠2 就判可信
+    ('      FLEET-REPORT\n      结果：完成\n      END FLEET-REPORT\n\n 我先了解', None),
+    ('      "k": 1\n    FLEET-REPORT\n    结果：完成\n    END FLEET-REPORT\n\n 我先了解', None),
+    # 底部输入框提示行 `❭` 之后不产生块；真实回报在已证 agent 行之后正常摘取
+    (' agent\n   FLEET-REPORT\n   结果：完成\n   END FLEET-REPORT\n\n❭ Guide Devin while it works\n────────────\nSWE-2 Max · bypass', 'FLEET-REPORT\n结果：完成\nEND FLEET-REPORT'),
+    # 顶部截断到回显中段：窗口内只有 2 空格续行、看不到 `❭` 起点，块来源不可证，保守不报
+    ('  FLEET-REPORT\n  结果：完成\n  END FLEET-REPORT\n\n 我先了解', None),
+    # 回显模板在前、真实 fenced 回报在后：取真实回报
+    ('❭ 任务\n  FLEET-REPORT\n  结果：完成 / 部分完成 / 阻塞\n  END FLEET-REPORT\n\n 我先了解\n   FLEET-REPORT\n   结果：完成\n   END FLEET-REPORT', 'FLEET-REPORT\n结果：完成\nEND FLEET-REPORT'),
+    # 深缩进回显结束后（出现 <2 缩进非空行），其后真实 fenced 回报仍可读
+    ('❭ task\n      FLEET-REPORT\n      result\n      END FLEET-REPORT\n\n agent\n   FLEET-REPORT\n   结果：完成\n   END FLEET-REPORT', 'FLEET-REPORT\n结果：完成\nEND FLEET-REPORT'),
+    # 真实回报后有新一轮输入回显模板且 agent 正在工作：旧真实完整回报仍可用
+    (' agent\n   FLEET-REPORT\n   结果：完成\n   END FLEET-REPORT\n\n❭ 下一轮\n  FLEET-REPORT\n  结果：完成 / 部分完成 / 阻塞\n  END FLEET-REPORT\n\n 我先核对', 'FLEET-REPORT\n结果：完成\nEND FLEET-REPORT'),
+    # 真实未闭合回报在前、回显模板在后：未闭合不算数，回显模板也不算数
+    (' agent\n   FLEET-REPORT\n   结果：完成\n\n❭ 下一轮\n  FLEET-REPORT\n  结果：完成 / 部分完成 / 阻塞\n  END FLEET-REPORT\n\n 我先核对', None),
+    # 未闭合块的 START 不能跨过输入回显区与后面的孤立 END 配对（合成原文不存在的块）
+    (' agent\n   FLEET-REPORT\n   结果：草稿\n\n❭ 下一轮\n  FLEET-REPORT\n  x\n  END FLEET-REPORT\n\nEND FLEET-REPORT\n 我先核对', None),
+    # 旧完整报告 + 新未闭合块 + 输入区段 + 孤立 END：旧完整块保留
+    (' agent\n   FLEET-REPORT\n   结果：完成\n   END FLEET-REPORT\n   FLEET-REPORT\n   结果：草稿\n\n❭ 下一轮\n  FLEET-REPORT\n  x\n  END FLEET-REPORT\n\nEND FLEET-REPORT\n 我先核对', 'FLEET-REPORT\n结果：完成\nEND FLEET-REPORT'),
+    # 残留边界：`❭` 回显紧贴同为 ≥2 缩进的 agent 输出、中间无 <2 缩进非空行时无法切分，整块按回显
+    # 处理——方向是漏判（null）而非误报
+    ('❭ x\n  t\n\n   FLEET-REPORT\n   a\n   END FLEET-REPORT\n agent', None),
+    (fixture_text('agent-output-input-echo'), None),
+    (fixture_text('agent-output-input-echo-truncated'), None),
+    report_fixture('agent-output-report-then-input-echo'),
+    report_fixture('agent-output-input-echo-then-report'),
+    report_fixture('agent-output-input-echo-deep-indent'),
 ])
 def test_status_report_blocks(setup, output, expected):
     _, fleet, _ = setup
