@@ -93,6 +93,31 @@ pointer, never a wall of text that may not exec.
 > in the shell. It recovered correctly (wrote `logs/09DR12_completion_report.md`, sent a short summary
 > naming the path), but the round-trip was lost. Nothing in this skill had warned it.
 
+### Goal anchors (R1, R3, R4)
+
+Two lines are mandatory and linted. Missing lines (`goal_anchor_missing`,
+`round_deliverable_missing`) or placeholder values (`goal_anchor_placeholder`,
+`round_deliverable_placeholder`: `<...>`, `TBD`, `待定`, `无`, `N/A`, empty) refuse dispatch before
+any round or pending record:
+
+```text
+[总目标锚点] <plan path>#<Goal section or deliverable id>
+[本轮服务的交付物/缺口] 交付物 2/5：<name>；本轮后 2/5
+```
+
+R1 — the anchor points into the plan or the user's own words, never at a summary you wrote from
+memory. Fill both before dispatch; if you cannot, ask the user rather than sending.
+
+R3 — changing business wording or widening the surface starts with a one-page change note to the
+user: trigger, files or modules beyond the plan, the cheapest alternative, and its cost. Wait for an
+explicit choice. An answer about business wording is not approval to widen scope, and an old broad
+authorization does not cover a new expansion.
+
+R4 — classify every finding as blocking the original contract, blocking correctness, or deferrable.
+Only the first two justify extra rounds. Allow at most one review plus one re-review of the same
+artifact. Two consecutive BLOCKs on the same sub-problem: offer the user continue / switch to a
+cheaper path / return to the mainline, with cost estimates, instead of dispatching a third round.
+
 ### Report contract
 
 Demand **evidence, not adjectives**. Require:

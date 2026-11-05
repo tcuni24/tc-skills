@@ -28,7 +28,7 @@ from .context import (
     read_context_usage,
     write_checkpoint,
 )
-from .handoff import handoff_lint, parse_report_path, snapshot_round
+from .handoff import handoff_lint, parse_report_path, parse_round_meta, snapshot_round
 from .herdr import freshen_executor, herdr_bin, herdr_error_code, is_agent_prompted
 from .notice import validate_new_session_id
 from .state import (
@@ -145,6 +145,9 @@ def commit_round(
     snapshot: dict[str, Any] | None = None,
     skip_lint: str = "",
     report: str = "",
+    goal: str = "",
+    goal_anchor: str = "",
+    deliverable: str = "",
 ) -> None:
     expected = allocate_round_id(data)
     if round_id != expected:
@@ -179,6 +182,9 @@ def commit_round(
         "snapshot": snapshot,
         "skip_lint": skip_lint,
         "fresh": fresh,
+        "goal": goal,
+        "goal_anchor": goal_anchor,
+        "deliverable": deliverable,
     })
     if data["phase_round_count"] >= 5:
         data["rollover_required"] = True
@@ -264,6 +270,7 @@ def cmd_start_round(args: argparse.Namespace) -> int:
             snapshot=snapshot,
             skip_lint=args.skip_lint or "",
             report=parse_report_path(source_text, cwd),
+            **parse_round_meta(source_text),
         )
         after_round_checkpoint(pp, data)
         persist(pp, data)
@@ -444,6 +451,7 @@ def cmd_send_round(args: argparse.Namespace) -> int:
             snapshot=snapshot,
             skip_lint=args.skip_lint or "",
             report=parse_report_path(text, cwd),
+            **parse_round_meta(text),
         )
         # The planner dispatched a new round itself: the armed resume is obsolete.
         cancel_resume_record(data, "send_round")

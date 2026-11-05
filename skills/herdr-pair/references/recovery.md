@@ -120,6 +120,28 @@ state.json and compare agent status with the visible screen. The timing knobs ar
 PAIRCTL_CONTINUE_MIN_DELAY_S, PAIRCTL_CONTINUE_IDLE_S, PAIRCTL_CONTINUE_POLL_S and
 PAIRCTL_CONTINUE_TIMEOUT_S. Inspect before retrying; do not create competing watchers.
 
+## Project goal and drift guards
+
+`init --goal` writes `project_goal`, the read-only overall goal. A later `init --goal <other>`
+exits 2 with `reason=project_goal_locked`; the same value is accepted, so re-running init is safe.
+To change it deliberately run `set-goal --goal <text> --reason <text>`: it appends
+`{old, new, reason, created_at}` to `goal_history`, updates `goal` (used by status and the popup
+board) and rewrites the checkpoint. Old states without the field adopt their existing `goal` on load.
+
+The checkpoint header starts with `- Project goal: ...` (truncated to 300 characters) before
+`## Current phase rounds`; each round row carries that round's `goal` and `deliverable`; the compact
+instructions and the resume prompt repeat the project goal, and the compact instructions also carry
+`Round goal` from the active round's `[目标]` line (`round_id: goal` joined by `; ` when several
+rounds are active, `none` when there is no parsed round goal).
+
+Anchor lint rules: `goal_anchor_missing`, `round_deliverable_missing`, `goal_anchor_placeholder`,
+`round_deliverable_placeholder` (exit 2, `reason=handoff_lint`, no round consumed and no pending
+record; `--skip-lint <reason>` skips all of them and the round stores empty values).
+
+R6 — one active plan: a plan for a sub-problem names its parent task_id and parent Goal; when the
+new plan takes effect the old one records `superseded-by: <task-id>`; entry files show only the
+current state, so a resumed session cannot follow a stale pointer.
+
 ## Fresh executor
 
 Historical markers verified here: Pi /new -> “New session started”; Claude /clear -> “Claude Code v”;

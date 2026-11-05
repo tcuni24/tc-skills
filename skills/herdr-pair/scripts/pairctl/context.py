@@ -161,9 +161,12 @@ def write_checkpoint(path: Path, data: dict[str, Any], reason: str) -> None:
     active_jobs = [j for j in data["jobs"] if j["state"] not in TERMINAL_JOBS]
     usage = data.get("last_context_usage") or {}
     tokens = usage.get("context_tokens")
+    # The header is injected verbatim into a fresh context; keep it bounded.
+    project_goal = str(data.get("project_goal") or data.get("goal") or "unspecified")[:300]
     lines = [
         "# Herdr Pair Checkpoint",
         "",
+        f"- Project goal: `{project_goal}`",
         f"- Generated: `{now()}`",
         f"- Reason: `{reason}`",
         f"- Working directory: `{data['cwd']}`",
@@ -177,22 +180,22 @@ def write_checkpoint(path: Path, data: dict[str, Any], reason: str) -> None:
         "",
         "## Current phase rounds",
         "",
-        "| Round | Revision | Executor | Status | Contract | Report | Snapshot | Scope | Acceptance | Artifacts | Notes |",
-        "|---|---|---|---|---|---|---|---|---|---|---|",
+        "| Round | Revision | Goal | Deliverable | Executor | Status | Contract | Report | Snapshot | Scope | Acceptance | Artifacts | Notes |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for item in current:
         lines.append(
-            "| {round_id} | {current_revision} | {executor} | {status} | {contract} | {report} | {snapshot} | {scope} | {acceptance} | {artifacts} | {notes} |".format(
+            "| {round_id} | {current_revision} | {goal} | {deliverable} | {executor} | {status} | {contract} | {report} | {snapshot} | {scope} | {acceptance} | {artifacts} | {notes} |".format(
                 **{key: table_cell(item.get(key)) for key in (
-                    "round_id", "current_revision", "executor", "status", "scope", "acceptance",
-                    "artifacts", "notes", "report",
+                    "round_id", "current_revision", "goal", "deliverable", "executor", "status",
+                    "scope", "acceptance", "artifacts", "notes", "report",
                 )},
                 contract=table_cell(((item.get("revisions") or {}).get(str(item.get("current_revision", 1))) or {}).get("contract_path")),
                 snapshot=table_cell((item.get("snapshot") or {}).get("manifest")),
             )
         )
     if not current:
-        lines.append("| none |  |  |  |  |  |  |  |  |  |  |")
+        lines.append("| none |  |  |  |  |  |  |  |  |  |  |  |  |")
     lines += ["", "## Decisions", ""]
     notes = data.get("notes") or []
     if notes:
@@ -252,6 +255,19 @@ def compact_instructions(pp: dict[str, Path], data: dict[str, Any], kind: str) -
         else f"then run python3 {PAIRCTL_SCRIPT} rollover --reason compact --new-session-id <your session id>"
     )
     active = [r for r in data.get("rounds", []) if r.get("status") == "active"]
+    # The round goal is the [目标] text of the active round, not data["goal"] (which
+    # holds the project goal written by init/set-goal).
+    round_goals = [
+        (str(item.get("round_id") or ""), str(item.get("goal") or "").strip())
+        for item in active
+    ]
+    round_goals = [(round_id, goal) for round_id, goal in round_goals if goal]
+    if not round_goals:
+        round_goal = "none"
+    elif len(round_goals) == 1:
+        round_goal = round_goals[0][1]
+    else:
+        round_goal = "; ".join(f"{round_id}: {goal}" for round_id, goal in round_goals)
     if active:
         item = active[0]
         revision = item.get("current_revision", 1)
@@ -264,7 +280,8 @@ def compact_instructions(pp: dict[str, Path], data: dict[str, Any], kind: str) -
         focus = " No active round."
     return (
         "herdr-pair context checkpoint. Keep verbatim: checkpoint file "
-        f"{pp['checkpoint']}. Goal: {data.get('goal') or 'unspecified'}. Preserve "
+        f"{pp['checkpoint']}. Project goal (do not drift from it): "
+        f"{data.get('project_goal') or 'unspecified'}. Round goal: {round_goal}. Preserve "
         f"planner pane {data.get('planner_pane') or 'unknown'}, working "
         f"directory {data['cwd']}.{focus} Keep every round_id with status, all nonterminal "
         "background jobs, open blockers, and the user's original task statement. The executor "

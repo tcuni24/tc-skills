@@ -78,6 +78,7 @@ def compact_continue_prompt(pp: dict[str, Path], data: dict[str, Any]) -> str:
     return (
         "herdr-pair auto-continue after compaction. Do not wait for the user to say 继续.\n"
         f"Working directory: {data['cwd']}\n"
+        f"Project goal: {data.get('project_goal') or 'unspecified'}\n"
         f"Checkpoint: {pp['checkpoint']}\n"
         f"PAIRCTL={shlex.quote(PAIRCTL_SCRIPT)}\n"
         f"1. python3 \"$PAIRCTL\" status {selection}\n"

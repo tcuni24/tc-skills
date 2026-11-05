@@ -13,6 +13,49 @@ from typing import Any
 from .constants import DIR_MODE, FENCE_RE, SNAPSHOT_COPY_LIMIT, TMP_PATH_RE
 from .state import atomic_text, chmod_private, file_sha256
 
+# R1 drift guards: every handoff names the overall goal anchor and the deliverable
+# this round serves. Kept out of FENCE_RE because these are single values, not
+# path lists, and parse_handoff_fences must keep returning exactly its five keys.
+ANCHOR_RE = re.compile(
+    r"^[ \t]*\[(总目标锚点|本轮服务的交付物/缺口)\][ \t]*(.*?)[ \t]*\r?$", re.MULTILINE
+)
+ANCHOR_RULES = {
+    "总目标锚点": ("goal_anchor_missing", "goal_anchor_placeholder"),
+    "本轮服务的交付物/缺口": ("round_deliverable_missing", "round_deliverable_placeholder"),
+}
+ANCHOR_PLACEHOLDERS = {"TBD", "待定", "无", "N/A", "NONE"}
+GOAL_RE = re.compile(r"^[ \t]*\[目标\][ \t]*(.*?)[ \t]*\r?$", re.MULTILINE)
+
+
+def parse_anchor_fields(text: str) -> dict[str, str | None]:
+    """R1 anchor values; None means the line is absent (distinct from empty)."""
+    result: dict[str, str | None] = {label: None for label in ANCHOR_RULES}
+    for match in ANCHOR_RE.finditer(text):
+        result[match.group(1)] = match.group(2).strip().strip("`").rstrip("；;").strip()
+    return result
+
+
+def anchor_is_placeholder(value: str) -> bool:
+    text = value.strip()
+    if not text:
+        return True
+    if (text.startswith("<") and text.endswith(">")) or (
+        text.startswith("＜") and text.endswith("＞")
+    ):
+        return True
+    return text.upper() in ANCHOR_PLACEHOLDERS
+
+
+def parse_round_meta(text: str) -> dict[str, str]:
+    """Values stored on the round record for the checkpoint and the drift check."""
+    anchors = parse_anchor_fields(text)
+    goal = GOAL_RE.search(text)
+    return {
+        "goal": goal.group(1).strip() if goal else "",
+        "goal_anchor": anchors["总目标锚点"] or "",
+        "deliverable": anchors["本轮服务的交付物/缺口"] or "",
+    }
+
 
 def parse_handoff_fences(text: str) -> dict[str, list[str]]:
     result = {key: [] for key in ("可以改", "只读输入", "可以新建", "不许动", "环境")}
@@ -64,6 +107,13 @@ def handoff_lint(cwd: str, text: str) -> list[dict[str, Any]]:
         findings.append({"rule": "tmp_path"})
     if not fences["环境"]:
         findings.append({"rule": "env_block_missing"})
+    anchors = parse_anchor_fields(text)
+    for label, (missing_rule, placeholder_rule) in ANCHOR_RULES.items():
+        value = anchors[label]
+        if value is None:
+            findings.append({"rule": missing_rule, "field": label})
+        elif anchor_is_placeholder(value):
+            findings.append({"rule": placeholder_rule, "field": label, "value": value})
     forbidden_text = " ".join(fences["不许动"]).lower()
     if "未跟踪" in forbidden_text or "untracked" in forbidden_text:
         try:
