@@ -120,6 +120,42 @@ rex-pair（本仓库 `skills/rex-pair`）有两个具体问题：
 - **不照搬子 agent 架构**：Anthropic 的子 agent 适用于隔离大量搜索上下文；rex-pair 已经是 Planner/Executor 两个 pane，再拆角色会增加交接成本，本轮不引入第三角色（<https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents>）。
 - **不做自动 compaction**：压缩由各 harness 自行决定，rex-pair 无法控制；可做的是压缩前后读写 `plan.md`、STATUS 和 report，把恢复成本降到最低（<https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents>、<https://docs.openhands.dev/sdk/guides/context-condenser>）。
 
+## 同目录多任务：隔离与识别
+
+### 各来源要点
+
+- **Spec Kit Quickstart**：active feature 由 `.specify/feature.json` 记录，可用 `SPECIFY_FEATURE_DIRECTORY` 环境变量覆盖；命令据此解析 feature，而不是看 Git 分支（<https://github.github.com/spec-kit/quickstart.html>）。
+- **Spec Kit git 扩展**：feature 分支有两种编号方式，顺序编号 `001-feature-name` 或时间戳编号 `20260319-143022-feature-name`（<https://github.com/github/spec-kit/blob/main/extensions/git/README.md>）。
+- **Spec Kit 讨论 #497**：团队多人从同一基线分支各自创建 spec 时，递增序号（001、002……）会自然冲突（<https://github.com/github/spec-kit/discussions/497>）。
+- **Kiro**：spec 存放在项目仓库中，与代码一起做版本控制；每个 feature 一个子目录（如 `.kiro/specs/<feature>/`）（<https://kiro.dev/docs/specs/best-practices/>）。
+- **Taskmaster**：用 tag 把任务分成多个上下文（不同分支、环境或阶段），当前 tag 存放在 `.taskmaster/state.json`，未指定时回落到 `master`；任务 ID 只在所属 tag 内唯一（<https://github.com/eyaltoledano/claude-task-master/blob/main/docs/task-structure.md>）。
+- **Claude Code Agent Teams**：领取任务时用文件锁防止竞争；两个队友编辑同一个文件会互相覆盖，所以应拆分任务，让每人负责不同的文件（<https://code.claude.com/docs/en/agent-teams>）。
+- **Claude Code worktrees**：并行会话使用 git worktree，每个 worktree 是独立的 checkout 和分支，避免编辑冲突（<https://code.claude.com/docs/en/common-workflows>）。
+- **MCP Agent Mail**：对文件或 glob 声明咨询式的文件预留（lease），带 TTL，可设为 exclusive；pre-commit 守卫会拦截与他人 exclusive 预留冲突的提交；冲突时调整范围、等待过期或改用非独占预留（<https://github.com/Dicklesworthstone/mcp_agent_mail>）。
+
+### 共性模式
+
+- **每个任务有稳定的身份键**：Spec Kit 的 feature 目录、Kiro 的 feature 子目录、Taskmaster 的 tag 都先给任务一个唯一键，后续命令和恢复都靠这个键，而不是“最近改过的那个”。
+- **单指针在并行时会互相覆盖**：`.specify/feature.json` 和 `.taskmaster/state.json` 都只保存一个“当前”值，适合单人顺序工作，多个执行者并存时就需要额外协调。
+- **写入面必须隔离**：worktree 隔离 checkout，Agent Teams 拆分文件所有权，Agent Mail 用带 TTL 的独占 lease，Spec Kit/Kiro/Taskmaster 按 feature 分目录。
+- **冲突要显式处理**：Agent Mail 在冲突时要求调整范围、等待过期或降级为非独占；Agent Teams 与 worktree 直接把并行工作放到不同文件或分支。
+
+### 对 rex-pair 的取舍
+
+采纳：
+
+- **每个任务一个 `<task-id>` 目录**（D1）：对应 Kiro 的 per-feature 子目录和 Taskmaster 的 tag 隔离，让同一 cwd 下的多个 plan 各有稳定路径。
+- **不设全局“当前任务”指针**（D2）：Spec Kit 的 `.specify/feature.json` 和 Taskmaster 的 `.taskmaster/state.json` 都只有一个当前值，多个 Planner 并存时会互相覆盖；rex-pair 改为扫描各 plan.md 的状态字段。
+- **task-id 用时间戳**（D1）：Spec Kit 讨论 #497 显示团队从同一基线创建 spec 时顺序编号会冲突，git 扩展也支持时间戳编号。`YYYYMMDD-HHMM-<slug>` 让不同 pane 同时建目录时天然不相撞，建目录前仍需确认不存在。
+- **plan 的 Scope 相当于没有 TTL 的人工预留**（D7）：MCP Agent Mail 的 lease 是服务端自动过期的咨询式预留；rex-pair 没有服务端，只能在派发前由 Planner 对照同一 cwd 下所有 active plan 的 Scope，重叠就排队或隔离。
+- **Git 用 worktree，非 Git 用输出分目录 + 共享文件串行 + 副本比对哈希**（D7）：worktree 对应 Claude Code 的并行会话方案；非 Git 场景没有分支可隔离，只能靠“每个任务只写自己的输出目录”、共享文件声明占用并排队、必须并行修改的小文件复制后比对 SHA256 再回写，大数据文件不复制。
+
+不采纳：
+
+- **不引入 `.specify/feature.json` / `.taskmaster/state.json` 这类单指针文件**：它们解决的是工具链自己找 feature 的问题，但 rex-pair 由多个 Planner 并行，单指针会互相覆盖。
+- **不引入服务端 lease 与 pre-commit 守卫**：rex-pair 是人工协议，没有常驻服务；TTL、自动过期和提交拦截都需要额外基础设施。
+- **不自动按 Git 分支或最近修改时间识别任务**（D6）：Spec Kit 明确命令不依赖 Git 分支；rex-pair 同样要求用 pane ID 匹配 Owner 并结合 task_id 找回 plan，不按 mtime 选择。
+
 ## 参考链接
 
 1. Anthropic, Effective harnesses for long-running agents — <https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents>
@@ -130,3 +166,11 @@ rex-pair（本仓库 `skills/rex-pair`）有两个具体问题：
 6. Kiro, Specs — <https://kiro.dev/docs/specs/>（另见 <https://kiro.dev/docs/specs/feature-specs/>、<https://kiro.dev/docs/specs/best-practices/>）
 7. GitHub Spec Kit — <https://github.com/github/spec-kit>
 8. Cline, Memory Bank — <https://docs.cline.bot/best-practices/memory-bank>
+9. Spec Kit, Quickstart — <https://github.github.com/spec-kit/quickstart.html>
+10. Spec Kit, Git Branching Workflow Extension — <https://github.com/github/spec-kit/blob/main/extensions/git/README.md>
+11. Spec Kit, Discussion #497 "What's the best way to use spec-kit in a team?" — <https://github.com/github/spec-kit/discussions/497>
+12. Kiro, Specs Best practices — <https://kiro.dev/docs/specs/best-practices/>
+13. Taskmaster, Task Structure — <https://github.com/eyaltoledano/claude-task-master/blob/main/docs/task-structure.md>
+14. Claude Code, Agent Teams — <https://code.claude.com/docs/en/agent-teams>
+15. Claude Code, Common workflows（worktrees）— <https://code.claude.com/docs/en/common-workflows>
+16. MCP Agent Mail — <https://github.com/Dicklesworthstone/mcp_agent_mail>

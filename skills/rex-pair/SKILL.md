@@ -19,19 +19,20 @@ description: Use only when the user explicitly requests two agents in Rex to col
 
 ### 方案文件 plan.md
 
-- 每个任务一份，路径为 `<handoff 根>/plan.md`，各轮工单写 `<handoff 根>/<轮次>/contract.md`；只有 Planner 可写，Executor 只读。文件头写方案版本。
-- 必含 Goal（用户原始诉求，附日期）、Non-goals、Decided（每条带时间和来源，如“用户回答”）、Acceptance（任务级）、Rounds（轮次 / 目标 / 状态 / 证据路径）、Open questions、Next step。
-- Goal 和 Decided 只能由用户的决定修改，改动时保留“旧 → 新”记录并递增方案版本；Planner 在每次用户决策后、每轮验收后更新 Rounds 和 Next step。
-- 每份 contract 写明 plan.md 路径和方案版本。Executor 开工前对照 plan.md，发现工单与 Goal、Non-goals 或 Decided 冲突时停下，在 report 里报告冲突，不自行取舍。
-- 压缩或换会话前 Planner 先更新 Next step；压缩或新会话后，先重读 plan.md 和最新一轮的 STATUS、report，再采取任何行动。以 plan.md 和落盘产物为准，不以对话摘要为准。
+- 每个任务一个目录：`<handoff 根>/<task-id>/plan.md`，task-id 为 `YYYYMMDD-HHMM-<slug>`，各轮放 `<task-id>/<轮次>/contract.md`，建目录前确认不存在。不设全局“当前任务”指针或共享索引；列出进行中任务时扫描各 plan.md 的状态字段。
+- 文件头写 task_id、Owner（Planner 完整 session/pane ID）、cwd 与分支（或“非 Git”）、状态（active/done/abandoned）、方案版本、Scope（声明占用的 edit/create 路径）；目录名必须等于 task_id。必含 Goal（用户原始诉求，附日期）、Non-goals、Decided（每条带时间和来源，如“用户回答”）、Acceptance（任务级）、Rounds（轮次 / 目标 / 状态 / 证据路径）、Open questions、Next step。
+- 只有 Owner 能写；换 Owner 须经用户同意并记录“旧 → 新”。写入前比对哈希等于自己上次记录的值，不等就停下；写入先写临时文件再 mv。Goal 和 Decided 只能由用户的决定修改，保留“旧 → 新”记录并递增方案版本；Planner 在每次用户决策后、每轮验收后更新 Rounds 和 Next step。
+- 每份 contract 写明 task_id、plan 绝对路径、方案版本和 plan SHA256；Executor 逐项核对，任一项不符就把 STATUS 写成 blocked 并报告。开工前对照 plan.md，发现工单与 Goal、Non-goals 或 Decided 冲突时停下，在 report 里报告，不自行取舍。
+- 压缩或换会话前 Planner 先更新 Next step；压缩或新会话后，用自己的 pane ID 匹配 Owner 并结合 task_id 找回 plan，不按最近修改时间选，找到多份或一份都没有时问用户。先重读 plan.md 和最新一轮的 STATUS、report，再采取任何行动；以 plan.md 和落盘产物为准，不以对话摘要为准。
 
 Planner 在项目明确允许的目录写每轮独立的绝对路径 `contract.md`；先确认工单、报告、状态、日志和暂存路径均获授权。若无法落盘而不越界，停止并询问。清楚区分可以修改、可以新建、只读和禁止路径，包含目录前缀在内互不交叉；未授权路径不得写。每轮给 Executor 足够上下文，不依赖其继承本会话。
 
 紧凑模板（替换全部占位符）：
 
 ```text
-轮次/版本：<id/revision>；Planner 返回 pane：<完整 ID>；Executor：<完整 ID>
-方案：<plan.md 绝对路径>；方案版本：<vN>
+task_id：<task-id>；轮次/版本：<id/revision>；Planner 返回 pane：<完整 ID>；Executor：<完整 ID>
+方案：<plan.md 绝对路径>；方案版本：<vN>；plan SHA256：<值或文件>
+核对：开工前核对目录名、plan 文件头 task_id 与本行 task_id 三处一致；方案版本与 plan SHA256 也须一致，任一项不符写 blocked。
 Goal：<单一可衡量目标>
 cwd：<绝对路径>；输入身份：<路径、版本或摘要>
 Scope：edit=<路径>；create=<路径，含ACK/报告/状态/日志/暂存>；readonly=<路径>；forbidden=<路径>；readonly 基线=<派发前记录的 SHA256 文件路径>
@@ -61,10 +62,12 @@ rex send -s "$SID" -b "$TARGET" '请阅读并按 /project/example/.handoff/round
 
 发送成功只表示输入送达，不代表 agent 接受或开始。工单要求 Executor 核对身份、版本、范围后落盘 ACK，并在 STATUS 标记 `assigned`、`running`、`ready` 或 `blocked`，随时记录证据；Planner 独立确认后才记 `accepted`。`ready` 不等于 `accepted`。用 capture 和落盘 ACK/STATUS 一起确认，无法确认时先 inspect/capture，不重复发送。`Out of credits` 等 banner 仅是线索，须以实际响应和产物判断，不能直接断言离线或完成。
 
-忙 pane 的新增消息可能排队、污染上下文；不自动 new/clear，也不在 Planner 忙碌时发通知。通知只按工单的 `notify=<on|off>`（默认 on）执行。notify=on：前提是 Planner 派发后处于空闲等待；Executor 落盘 report 和 STATUS（`ready` 或 `blocked`）后，向工单里的 Planner 返回 pane 发一条短通知，每轮每个终态只发一次，内容只有轮次/版本、状态和 report 路径，例如 `rex send -s "$SID" -b "$PLANNER" 'r001/1 ready，见 <report 路径>' && rex send-key -s "$SID" -b "$PLANNER" enter`；若 Planner 预计派发后还会忙别的事，就写 notify=off。notify=off：Planner 派发后启动后台等待作业，每 30–60 秒检查一次 STATUS，变成 ready 或 blocked 即退出，并设总超时，依靠 harness 在作业结束时唤醒自己（如 Droid Execute 的 fireAndForget），不在前台 busy poll；notify=on 时也可挂该作业作兜底。通知只是唤醒信号，不是证据，仍须按 §4 独立验收。超时后有限次检查进度，不 busy poll 或长期空等；确认问题后收窄下一轮或询问用户，不盲目续派。
+忙 pane 的新增消息可能排队、污染上下文；不自动 new/clear，也不在 Planner 忙碌时发通知。通知只按工单的 `notify=<on|off>`（默认 on）执行。notify=on：前提是 Planner 派发后处于空闲等待；Executor 落盘 report 和 STATUS（`ready` 或 `blocked`）后，向工单里的 Planner 返回 pane 发一条短通知，每轮每个终态只发一次，内容只有 task-id/轮次/版本、状态和 report 路径，例如 `rex send -s "$SID" -b "$PLANNER" '<task-id>/r001/1 ready，见 <report 路径>' && rex send-key -s "$SID" -b "$PLANNER" enter`；若 Planner 预计派发后还会忙别的事，就写 notify=off。notify=off：Planner 派发后启动后台等待作业，每 30–60 秒检查一次 STATUS，变成 ready 或 blocked 即退出，并设总超时，依靠 harness 在作业结束时唤醒自己（如 Droid Execute 的 fireAndForget），不在前台 busy poll；notify=on 时也可挂该作业作兜底。通知只是唤醒信号，不是证据，仍须按 §4 独立验收。超时后有限次检查进度，不 busy poll 或长期空等；确认问题后收窄下一轮或询问用户，不盲目续派。
 
 ## 4. 冻结、独立验收、交接
 
 每个 cwd 同时只有一个写入者。交接前双方明确 ownership，并确认前一写入者及其后台作业已停止写入；未确认停止不得切换或评审。并行写入必须使用独立 cwd/worktree，核对基线和文件所有权，不能共享写入目录。
+
+派发前 Planner 对照同一 cwd 下所有 active plan 的 Scope，有重叠就排队或隔离。Git 项目：并行任务使用独立 worktree。非 Git 项目（如数据分析）遵守三条规则：(1) 每个任务只写自己的输出目录 `<输出区>/<task-id>/`，原始数据、参考数据和其他任务的产出一律只读；(2) 多个任务都要改的共享文件（汇总表、共享配置、交付目录）在 plan.md 的 Scope 中声明占用，同一时间只有一个 active 任务持有，其他任务排队，前一个任务 accepted 后再重建基线；(3) 必须并行修改的小文件，在本任务目录下复制一份修改并记录原文件 SHA256，验收后回写共享路径前比对当前哈希是否等于记录值，相等才回写，不等就停下手工合并；大数据文件不复制，只读，只新增输出。
 
 Executor 声明停止写入后 Planner 冻结评审状态：Git 记录 HEAD、status 和 staged/unstaged diff，连同未跟踪文件对比轮前基线；非 Git 对比文件清单和摘要。独立阅读产物及报告、核对 scope、重跑实际验收命令并复算关键统计，审查原始红绿灯证据索引；验收期间发生漂移则重新冻结和验收。报告应列出每项通过、失败或未运行，不把状态或通知当作证据。声称修改却无差异、越界、数据无出处等质量问题要停手并给证据。只有 Planner 完成独立验收才标记 `accepted` 并向用户交付。
