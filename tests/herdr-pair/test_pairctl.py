@@ -1195,7 +1195,7 @@ class PairctlTest(support.PairctlCase):
         self.assertEqual(payload["contract_path"], started["contract_path"])
         self.assertEqual(
             payload["contract_text"],
-            f"[轮次] round_id={started['round_id']}\n" + body + "[环境] local lightweight test only\n",
+            f"[轮次] round_id={started['round_id']}\n" + contract.read_text(encoding="utf-8"),
         )
 
         query_only = self.invoke(
@@ -1600,6 +1600,11 @@ class PairctlTest(support.PairctlCase):
             "tmp_path": "# bad /tmp/cache\n[环境] local\n",
             "fence_overlap": "[可以改] tests\n[可以新建] tests/x.py\n[环境] local\n",
             "untracked_conflict": "[可以改] 子 目录\n[不许动] 任何未跟踪文件\n[环境] local\n",
+            "goal_anchor_missing": "[本轮服务的交付物/缺口] 交付物 1/1：fixture\n[环境] local\n",
+            "round_deliverable_missing": "[总目标锚点] plan.md#goal\n[环境] local\n",
+            "goal_anchor_placeholder": (
+                "[总目标锚点] TBD\n[本轮服务的交付物/缺口] 交付物 1/1：fixture\n[环境] local\n"
+            ),
         }
         for index, (rule, body) in enumerate(cases.items()):
             path = self.cwd / f"lint-{index}.md"
@@ -1613,7 +1618,11 @@ class PairctlTest(support.PairctlCase):
             self.assertEqual(self.read_state()["phase_round_count"], 0)
             self.assertIsNone(self.read_state()["pending_dispatch"])
         valid = self.cwd / "valid.md"
-        valid.write_text("[可以改] tracked.txt\n[可以新建] output.txt\n[不许动] docs\n[环境] local\n", encoding="utf-8")
+        valid.write_text(
+            "[可以改] tracked.txt\n[可以新建] output.txt\n[不许动] docs\n[环境] local\n"
+            "[总目标锚点] plan.md#goal\n[本轮服务的交付物/缺口] 交付物 1/1：valid fixture\n",
+            encoding="utf-8",
+        )
         passed = self.invoke_ok(
             "start-round", "--file", str(valid), "--executor", "w1:p2",
             "--scope", "tracked.txt", "--acceptance", "y",

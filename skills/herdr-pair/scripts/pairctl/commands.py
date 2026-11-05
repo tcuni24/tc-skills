@@ -35,14 +35,25 @@ def cmd_init(args: argparse.Namespace) -> int:
         if pp["state"].exists():
             data = load_ready(pp, cwd)
             # Existing rounds and jobs are never discarded. There is no --reset.
+            if args.goal:
+                project_goal = str(data.get("project_goal") or "")
+                if project_goal and args.goal != project_goal:
+                    output({
+                        "status": "rejected",
+                        "reason": "project_goal_locked",
+                        "project_goal": project_goal,
+                        "guidance": "the project goal is fixed at init; change it deliberately "
+                                    "with `set-goal --goal <text> --reason <text>`",
+                    })
+                    return 2
+                data["goal"] = args.goal
+                data["project_goal"] = args.goal
             if args.planner_pane:
                 data["planner_pane"] = args.planner_pane
             if args.session_id:
                 data["session_id"] = args.session_id
             if args.no_auto_compact:
                 data["auto_compact"] = False
-            if args.goal:
-                data["goal"] = args.goal
             if args.context_budget is not None:
                 data["context_budget"] = args.context_budget
         else:
@@ -53,6 +64,8 @@ def cmd_init(args: argparse.Namespace) -> int:
                 "session_id": args.session_id or "",
                 "auto_compact": not args.no_auto_compact,
                 "goal": args.goal or "",
+                "project_goal": args.goal or "",
+                "goal_history": [],
                 "context_budget": args.context_budget or budget_for(args),
                 "last_context_usage": None,
                 "notes": [],
@@ -94,6 +107,34 @@ def cmd_init(args: argparse.Namespace) -> int:
     if planner_compact:
         payload.update({"planner_compact": planner_compact, "checkpoint": str(pp["checkpoint"]), "continue_after_compact": continue_after})
     output(payload)
+    return 0
+
+
+def cmd_set_goal(args: argparse.Namespace) -> int:
+    """Deliberately replace the project goal; the old value stays in goal_history."""
+    if not args.goal.strip():
+        raise ValueError("--goal must not be empty")
+    pp = paths(args)
+    cwd = canonical_cwd(args.cwd)
+    with locked(pp["root"], pp["lock"]):
+        data = load_ready(pp, cwd)
+        old = str(data.get("project_goal") or data.get("goal") or "")
+        data.setdefault("goal_history", []).append({
+            "old": old,
+            "new": args.goal,
+            "reason": args.reason,
+            "created_at": now(),
+        })
+        data["project_goal"] = args.goal
+        data["goal"] = args.goal
+        write_checkpoint(pp["checkpoint"], data, "project goal changed")
+        persist(pp, data)
+    output({
+        "status": "goal_set",
+        "project_goal": args.goal,
+        "goal_history": data["goal_history"],
+        "checkpoint": str(pp["checkpoint"]),
+    })
     return 0
 
 

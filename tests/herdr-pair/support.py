@@ -316,8 +316,13 @@ class PairctlCase(unittest.TestCase):
         (self.root / "fake-herdr.screen").write_text(text, encoding="utf-8")
     def write_handoff(self, name: str, body: str) -> Path:
         path = self.cwd / name
-        if body.strip() and "[环境]" not in body:
-            body = body.rstrip("\n") + "\n[环境] local lightweight test only\n"
+        if body.strip():
+            if "[环境]" not in body:
+                body = body.rstrip("\n") + "\n[环境] local lightweight test only\n"
+            if "[总目标锚点]" not in body:
+                body = body.rstrip("\n") + "\n[总目标锚点] plan.md#goal\n"
+            if "[本轮服务的交付物/缺口]" not in body:
+                body = body.rstrip("\n") + "\n[本轮服务的交付物/缺口] 交付物 1/1：本轮交付物\n"
         path.write_text(body, encoding="utf-8")
         return path
     def start_finish(

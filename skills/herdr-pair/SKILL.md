@@ -39,6 +39,7 @@ as argv without shell expansion. State defaults to
 
 ```bash
 python3 "$PAIRCTL" init --planner-pane "$HERDR_PANE_ID" --goal '<one-sentence goal>'
+python3 "$PAIRCTL" set-goal --goal '<new goal>' --reason '<why it changed>'
 python3 "$PAIRCTL" context-usage
 python3 "$PAIRCTL" note --text '<user decision, clarification or scope revision>'
 python3 "$PAIRCTL" send-round --target <pane> --file /abs/handoff.md --scope '<fence>' --acceptance '<command>'
@@ -118,7 +119,8 @@ Use exact data expressions and measurement provenance where relevant. Name stagi
 input checksums for generated deliverables; name queue/log/completion/owner for background jobs.
 
 The lint is fail-closed: overlapping edit/create/forbidden paths (including directory prefixes),
-any `/tmp` literal, untracked writes forbidden by the contract, or a missing `[环境]` line
+any `/tmp` literal, untracked writes forbidden by the contract, a missing `[环境]` line, or a
+missing/placeholder `[总目标锚点]` / `[本轮服务的交付物/缺口]` line
 refuse dispatch before pending or round consumption. Temporary files belong in a cwd subdirectory
 or `/project/tmp`; the positive wording below also satisfies lint. Use
 `--skip-lint '<reason>'` only for a deliberate recorded exception. Use comma-separated paths on
@@ -130,6 +132,8 @@ each fence line; keep prose and exceptions on other lines.
 [执行者] pane=<executor_pane_id>
 [状态位置] PAIRCTL=/abs/path/pairctl.py；cwd=/abs/project；state=default 或 --state-dir=/abs/state
 [目标] One measurable outcome.
+[总目标锚点] plan.md#goal
+[本轮服务的交付物/缺口] 交付物 1/3：本轮报告
 [工作目录] /abs/project；所有命令在这里运行。
 [可以改] docs/a.md
 [只读输入] inputs/source.tsv
@@ -153,6 +157,18 @@ each fence line; keep prose and exceptions on other lines.
 Replace placeholders and fence paths with actual inputs, outputs and permitted task scratch paths.
 For precise data keys, checksums, publication, report size, job ledger and measurement requirements,
 read [handoff.md](references/handoff.md) before dispatch.
+
+## 防偏移（R1–R7）
+
+多轮任务会漂移：以落盘目标和交付物为准，不以对话摘要或状态为准。
+
+- R1 总目标锚点：plan 写原始目标、交付物与变更面上限；每份工单必填 `[总目标锚点]` 和 `[本轮服务的交付物/缺口]`，填不出先问用户，不派发（[handoff.md](references/handoff.md#goal-anchors-r1-r3-r4)）。
+- R2 业务进度：每次验收写“交付物 当前/目标”（[verification.md](references/verification.md#drift-checks-r2-r5-r7)）。
+- R3 范围变更单：写触发原因、多出的文件、最小替代与成本，等用户明确选择；业务口径的回答不等于批准扩范围。细节同 R1 链接。
+- R4 上限与升级：findings 分“阻断原契约 / 阻断正确性 / 可后置”，仅前两类加轮次；最多 1 次 review + 1 次复审；同一问题连续 2 轮 BLOCK 让用户三选一并附成本。细节同 R1 链接。
+- R5 偏移检查：每 3 轮及每次换 plan 列出总目标、已交付/目标、已花轮次与口径变化；变化须用户逐项确认。细节同 R2 链接。
+- R6 单一 active plan：子问题 plan 写父 task_id 与父 Goal，新 plan 生效时旧 plan 记 `superseded-by`（[recovery.md](references/recovery.md#project-goal-and-drift-guards)）。
+- R7 变更面与检查点：超过 plan 上限即暂停报告；验收全绿后立即快照；协调产物放在不会被门禁扫描的路径。细节同 R2 链接。
 
 ## 4. Send
 

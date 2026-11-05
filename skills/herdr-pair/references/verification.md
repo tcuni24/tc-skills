@@ -52,6 +52,20 @@ Reject and re-drive when the diff contains:
 > said `alignment/off_target.py`, and two gate IDs (G6/G7) were swapped. Both read fluently. Both
 > would have shipped without a line-by-line read.
 
+### Drift checks (R2, R5, R7)
+
+R2 — every acceptance report states the business progress line `交付物 当前/目标` (for example
+`交付物 20/28`) next to the verification evidence. A status word or a green test run is not
+progress; the ratio is what shows a 20/28-shaped gap before it turns into "done".
+
+R5 — every three rounds, and on every plan switch, list the overall goal, delivered/target counts,
+rounds spent, and every wording change since the last check. Each wording change needs the user's
+confirmation and a sync back to the authoritative file (plan, project.toml, design doc).
+
+R7 — stop and report when the change surface exceeds the plan's cap; snapshot a green acceptance as
+a checkpoint before continuing; keep coordination artifacts (contracts, reports, STATUS) out of
+gated paths so they cannot trip the project's own checks.
+
 ### No git? Verify the artifacts directly
 
 The header says *artifact*, not *commit*, on purpose. In an unversioned directory the principle is

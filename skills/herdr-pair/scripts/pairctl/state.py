@@ -194,6 +194,10 @@ def load(path: Path, cwd: str) -> dict[str, Any]:
     data.setdefault("notices", [])
     # Issue #12: executor notices withheld during compaction queue up here.
     data.setdefault("deferred_notices", [])
+    # R1 drift guard: the goal a pairing was initialized with is the read-only
+    # project goal. Older states only have `goal`; adopt it once, never overwrite.
+    data.setdefault("project_goal", data.get("goal", ""))
+    data.setdefault("goal_history", [])
     ver = data.get("version")
     if ver == 1:
         data["version"] = 2

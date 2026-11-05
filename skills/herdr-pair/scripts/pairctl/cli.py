@@ -7,7 +7,14 @@ import json
 import os
 import sys
 
-from .commands import cmd_compact_self, cmd_init, cmd_job_add, cmd_job_update, cmd_status
+from .commands import (
+    cmd_compact_self,
+    cmd_init,
+    cmd_job_add,
+    cmd_job_update,
+    cmd_set_goal,
+    cmd_status,
+)
 from .constants import JOB_STATES, LOCK_TIMEOUT_PAYLOAD, ROUND_STATES
 from .context import cmd_checkpoint, cmd_context_usage, cmd_note, cmd_note_session
 from .dispatch import cmd_resolve_pending, cmd_resume_deliver, cmd_wake, cmd_watch_compact_continue
@@ -42,6 +49,11 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--context-budget", type=int)
     p.add_argument("--no-context-check", action="store_true")
     p.set_defaults(func=cmd_init)
+
+    p = sub.add_parser("set-goal", parents=[common])
+    p.add_argument("--goal", required=True, help="new project goal")
+    p.add_argument("--reason", required=True, help="why the project goal changed")
+    p.set_defaults(func=cmd_set_goal)
 
     p = sub.add_parser("note-session", parents=[common])
     p.add_argument("--session-id", required=True)
