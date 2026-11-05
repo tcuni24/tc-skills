@@ -51,6 +51,7 @@ Acceptance：<逐条可判定结果>；Check：<命令、cwd、预期退出码�
 停止：完成或阻塞后停止写入并确认；不提交、不推送，除非用户另行授权。
 后台 job ledger：无，或逐项记 command、job ID、queue、log、artifacts、completion、cancel owner。
 回报：先落盘 report 和 STATUS，再按 notify 执行；notify=<on|off>（默认 on）；列改动、命令/cwd/退出码、原始证据路径、未完成项和限制。
+上下文：约 85% 以上时把进度写进 report 草稿，STATUS 写 blocked（原因：上下文不足）后停止。
 环境：重活按本机 slot 规则，临时文件仅限项目允许子目录或 /project/tmp，禁止使用 /tmp 本身及其子目录。
 ```
 
@@ -71,7 +72,7 @@ rex send -s "$SID" -b "$TARGET" '请阅读并按 /project/example/.handoff/round
 
 发送成功只表示输入送达，不代表 agent 接受或开始。工单要求 Executor 核对身份、版本、范围后落盘 ACK，并在 STATUS 标记 `assigned`、`running`、`ready` 或 `blocked`，随时记录证据；Planner 独立确认后才记 `accepted`。`ready` 不等于 `accepted`。用 capture 和落盘 ACK/STATUS 一起确认，无法确认时先 inspect/capture，不重复发送。`Out of credits` 等 banner 仅是线索，须以实际响应和产物判断，不能直接断言离线或完成。
 
-忙 pane 的新增消息可能排队、污染上下文；不自动 new/clear，也不在 Planner 忙碌时发通知。通知只按工单的 `notify=<on|off>`（默认 on）执行。notify=on：前提是 Planner 派发后处于空闲等待；Executor 落盘 report 和 STATUS（`ready` 或 `blocked`）后，向工单里的 Planner 返回 pane 发一条短通知，每轮每个终态只发一次，内容只有 task-id/轮次/版本、状态和 report 路径，例如 `rex send -s "$SID" -b "$PLANNER" '<task-id>/r001/1 ready，见 <report 路径>' && rex send-key -s "$SID" -b "$PLANNER" enter`；若 Planner 预计派发后还会忙别的事，就写 notify=off。notify=off：Planner 派发后启动后台等待作业，每 30–60 秒检查一次 STATUS，变成 ready 或 blocked 即退出，并设总超时，依靠 harness 在作业结束时唤醒自己（如 Droid Execute 的 fireAndForget），不在前台 busy poll；notify=on 时也可挂该作业作兜底。通知只是唤醒信号，不是证据，仍须按 §4 独立验收。超时后有限次检查进度，不 busy poll 或长期空等；确认问题后收窄下一轮或询问用户，不盲目续派。
+忙 pane 的新增消息可能排队、污染上下文；不在对方忙碌时清空或新开会话，清空 Executor 只按 §5 的条件执行，也不在 Planner 忙碌时发通知。通知只按工单的 `notify=<on|off>`（默认 on）执行。notify=on：前提是 Planner 派发后处于空闲等待；Executor 落盘 report 和 STATUS（`ready` 或 `blocked`）后，向工单里的 Planner 返回 pane 发一条短通知，每轮每个终态只发一次，内容只有 task-id/轮次/版本、状态和 report 路径，例如 `rex send -s "$SID" -b "$PLANNER" '<task-id>/r001/1 ready，见 <report 路径>' && rex send-key -s "$SID" -b "$PLANNER" enter`；若 Planner 预计派发后还会忙别的事，就写 notify=off。notify=off：Planner 派发后启动后台等待作业，每 30–60 秒检查一次 STATUS，变成 ready 或 blocked 即退出，并设总超时，依靠 harness 在作业结束时唤醒自己（如 Droid Execute 的 fireAndForget），不在前台 busy poll；notify=on 时也可挂该作业作兜底。通知只是唤醒信号，不是证据，仍须按 §4 独立验收。超时后有限次检查进度，不 busy poll 或长期空等；确认问题后收窄下一轮或询问用户，不盲目续派。
 
 ## 4. 冻结、独立验收、交接
 
@@ -83,5 +84,30 @@ Executor 声明停止写入后 Planner 冻结评审状态：Git 记录 HEAD、st
 
 - 每 3 轮以及每次换 plan 时做偏移检查：列出总目标、已交付数/目标数、已花轮次和口径变化清单；口径变化须用户逐项确认，并同步回项目的权威文件（如 project.toml、设计文档）。
 - 变更面超过 plan 上限就暂停并报告；原验收全绿后立即提交或快照作为检查点；协调产物（工单、报告、STATUS）放在不会被门禁扫描的路径。
+
+## 5. 上下文管理
+
+以 agent 界面显示的上下文占比为准；读不到的占比不能当作还有余量。
+
+### Planner
+
+- 约 70% 时，在下一轮派发前先换会话或压缩；约 85% 时不再派新一轮。读不到占比时按轮数：每 3 轮更新 plan.md 作检查点，第 5 轮验收后换会话再继续；会话超过 12 小时也换。
+- 只在两轮之间做（验收完、下一轮未派）。非做不可时若仍有 active 轮次，先在 plan.md 记下 active 轮次和 report 路径；恢复后先看 STATUS 和 report。
+- 优先开新会话从 plan.md 接手，少用压缩。必须压缩时，压缩说明保留 plan.md 绝对路径、task_id、当前轮次和版本、contract 与 report 路径、Executor 完整 ID。恢复步骤按 §2 “压缩或换会话前 Planner 先更新 Next step” 一条执行，不重复。
+- 清空 Executor 会话前，以下条件须全部满足：STATUS 为 ready 或 blocked；本轮已验收或已冻结；Executor 没有在跑的后台作业；已知该 agent 的清空命令和标志文字。任一条件不满足就问用户；不清空 Planner 自己或用户的其他 pane。
+- 清空操作：先只输入命令文本，capture 确认补全菜单里有这条命令，再回车；回车后 capture 确认标志文字出现、上下文占比归零。
+
+已验证的清空命令：
+
+| agent | 命令 | 标志文字 | 来源与日期 |
+|---|---|---|---|
+| qodercli 1.1.83 | `/clear` | `Qoder CLI v`，上下文占比显示 0% | Planner 实测，2026-11-05 |
+| Droid | `/clear` | 尚未实测，首次使用时 capture 确认并记录 | 官方 CLI 参考：清空对话上下文，保留模型和自主级别；不用 `/new`，它会把模型和自主级别重置为默认 |
+| 其他 agent | 未验证 | 未验证 | 标志文字未知即不满足清空条件，先问用户 |
+
+### Executor
+
+- 新任务开始前清空；同一轮返工可保留；上下文约 70% 以上或换做别的任务时清空。
+- 上下文约 85% 以上时，把进度写进 report 草稿，STATUS 写 blocked（原因：上下文不足）后停止，不依赖自动压缩后的记忆。
 
 偏移案例与根因见 docs/reviews/2026-11-05-drift-postmortem.md。
