@@ -21,9 +21,16 @@ description: Use only when the user explicitly requests two agents in Rex to col
 
 - 每个任务一个目录：`<handoff 根>/<task-id>/plan.md`，task-id 为 `YYYYMMDD-HHMM-<slug>`，各轮放 `<task-id>/<轮次>/contract.md`，建目录前确认不存在。不设全局“当前任务”指针或共享索引；列出进行中任务时扫描各 plan.md 的状态字段。
 - 文件头写 task_id、Owner（Planner 完整 session/pane ID）、cwd 与分支（或“非 Git”）、状态（active/done/abandoned）、方案版本、Scope（声明占用的 edit/create 路径）；目录名必须等于 task_id。必含 Goal（用户原始诉求，附日期）、Non-goals、Decided（每条带时间和来源，如“用户回答”）、Acceptance（任务级）、Rounds（轮次 / 目标 / 状态 / 证据路径）、Open questions、Next step。
+- 文件头另写原始目标（用户原话）、交付物与数量、验收契约、预计改动文件数（变更面上限）、Non-goals；这些字段只读，修改规则与 Goal、Decided 相同。
+- 为子问题新建 plan 必须写明父 task_id 和父 Goal；新 plan 生效时旧 plan 写 `superseded-by: <task-id>`；入口文件只写当前状态。
 - 只有 Owner 能写；换 Owner 须经用户同意并记录“旧 → 新”。写入前比对哈希等于自己上次记录的值，不等就停下；写入先写临时文件再 mv。Goal 和 Decided 只能由用户的决定修改，保留“旧 → 新”记录并递增方案版本；Planner 在每次用户决策后、每轮验收后更新 Rounds 和 Next step。
 - 每份 contract 写明 task_id、plan 绝对路径、方案版本和 plan SHA256；Executor 逐项核对，任一项不符就把 STATUS 写成 blocked 并报告。开工前对照 plan.md，发现工单与 Goal、Non-goals 或 Decided 冲突时停下，在 report 里报告，不自行取舍。
 - 压缩或换会话前 Planner 先更新 Next step；压缩或新会话后，用自己的 pane ID 匹配 Owner 并结合 task_id 找回 plan，不按最近修改时间选，找到多份或一份都没有时问用户。先重读 plan.md 和最新一轮的 STATUS、report，再采取任何行动；以 plan.md 和落盘产物为准，不以对话摘要为准。
+
+### 范围变更单与上限（R3、R4）
+
+- 范围变更单：改业务口径或扩大范围前，向用户出一页变更单，写触发原因、相对原计划多出的文件或模块、最小替代方案、成本，等用户明确选择；用户只回答业务口径不等于批准扩大范围；旧的宽泛授权不能覆盖新的范围扩展。
+- findings 分“阻断原契约 / 阻断正确性 / 可后置”三类，只有前两类可追加轮次；同一成果最多 1 次 review 加 1 次复审；同一子问题连续 2 轮 BLOCK，给用户“继续 / 改走更便宜的方案 / 回主线”三选一，并附成本估计。
 
 Planner 在项目明确允许的目录写每轮独立的绝对路径 `contract.md`；先确认工单、报告、状态、日志和暂存路径均获授权。若无法落盘而不越界，停止并询问。清楚区分可以修改、可以新建、只读和禁止路径，包含目录前缀在内互不交叉；未授权路径不得写。每轮给 Executor 足够上下文，不依赖其继承本会话。
 
@@ -32,7 +39,9 @@ Planner 在项目明确允许的目录写每轮独立的绝对路径 `contract.m
 ```text
 task_id：<task-id>；轮次/版本：<id/revision>；Planner 返回 pane：<完整 ID>；Executor：<完整 ID>
 方案：<plan.md 绝对路径>；方案版本：<vN>；plan SHA256：<值或文件>
-核对：开工前核对目录名、plan 文件头 task_id 与本行 task_id 三处一致；方案版本与 plan SHA256 也须一致，任一项不符写 blocked。
+核对：开工前核对目录名、plan 文件头 task_id 与本行 task_id 三处一致；方案版本与 plan SHA256 也须一致，任一项不符写 blocked；总目标锚点或交付物/缺口填不出来时，先问用户，不派发。
+总目标锚点：<plan 中 Goal / 交付物条目的引用>
+本轮服务的交付物/缺口：<哪一项；本轮后 当前/目标>
 Goal：<单一可衡量目标>
 cwd：<绝对路径>；输入身份：<路径、版本或摘要>
 Scope：edit=<路径>；create=<路径，含ACK/报告/状态/日志/暂存>；readonly=<路径>；forbidden=<路径>；readonly 基线=<派发前记录的 SHA256 文件路径>
@@ -70,4 +79,9 @@ rex send -s "$SID" -b "$TARGET" '请阅读并按 /project/example/.handoff/round
 
 派发前 Planner 对照同一 cwd 下所有 active plan 的 Scope，有重叠就排队或隔离。Git 项目：并行任务使用独立 worktree。非 Git 项目（如数据分析）遵守三条规则：(1) 每个任务只写自己的输出目录 `<输出区>/<task-id>/`，原始数据、参考数据和其他任务的产出一律只读；(2) 多个任务都要改的共享文件（汇总表、共享配置、交付目录）在 plan.md 的 Scope 中声明占用，同一时间只有一个 active 任务持有，其他任务排队，前一个任务 accepted 后再重建基线；(3) 必须并行修改的小文件，在本任务目录下复制一份修改并记录原文件 SHA256，验收后回写共享路径前比对当前哈希是否等于记录值，相等才回写，不等就停下手工合并；大数据文件不复制，只读，只新增输出。
 
-Executor 声明停止写入后 Planner 冻结评审状态：Git 记录 HEAD、status 和 staged/unstaged diff，连同未跟踪文件对比轮前基线；非 Git 对比文件清单和摘要。独立阅读产物及报告、核对 scope、重跑实际验收命令并复算关键统计，审查原始红绿灯证据索引；验收期间发生漂移则重新冻结和验收。报告应列出每项通过、失败或未运行，不把状态或通知当作证据。声称修改却无差异、越界、数据无出处等质量问题要停手并给证据。只有 Planner 完成独立验收才标记 `accepted` 并向用户交付。
+Executor 声明停止写入后 Planner 冻结评审状态：Git 记录 HEAD、status 和 staged/unstaged diff，连同未跟踪文件对比轮前基线；非 Git 对比文件清单和摘要。独立阅读产物及报告、核对 scope、重跑实际验收命令并复算关键统计，审查原始红绿灯证据索引；验收期间发生漂移则重新冻结和验收。报告应列出每项通过、失败或未运行，并写明“交付物 当前/目标”，不把状态或通知当作证据。声称修改却无差异、越界、数据无出处等质量问题要停手并给证据。只有 Planner 完成独立验收才标记 `accepted` 并向用户交付。
+
+- 每 3 轮以及每次换 plan 时做偏移检查：列出总目标、已交付数/目标数、已花轮次和口径变化清单；口径变化须用户逐项确认，并同步回项目的权威文件（如 project.toml、设计文档）。
+- 变更面超过 plan 上限就暂停并报告；原验收全绿后立即提交或快照作为检查点；协调产物（工单、报告、STATUS）放在不会被门禁扫描的路径。
+
+偏移案例与根因见 docs/reviews/2026-11-05-drift-postmortem.md。
