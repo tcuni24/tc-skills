@@ -8,6 +8,7 @@ __pycache__/
 # Local agent tooling & one-off work artifacts
 .agents/
 .claude/
+.handoff/
 skills-lock.json
 issue-snapshot.json
 
