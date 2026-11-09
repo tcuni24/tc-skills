@@ -28,6 +28,7 @@ The skills are organized into focused operational domains:
 | --- | --- | --- |
 | [`customer-delivery`](skills/customer-delivery/SKILL.md) | Package raw analysis results into clean customer deliverables (Excel workbook + standalone HTML report + plot assets), sanitize internal paths/columns, audit for information leaks, and verify Simplified Chinese typography. | *"生成交付结果"*, *"整理客户交付目录"*, *"做交付报告"* |
 | [`customer-report-simplify`](skills/customer-report-simplify/SKILL.md) | Diagnose why technical reports overwhelm non-expert clients, restructure narratives around customer business questions, and run automated audits on readability. | *"报告太复杂"*, *"客户看不懂"*, *"重写成简报"* |
+| [`customer-methods-doc`](skills/customer-methods-doc/SKILL.md) | Write, audit and unify customer-facing methods documents (.docx) that accompany delivered result tables: reconcile every number with the actual delivery, strip internal details, keep multiple deliveries for one customer consistent (sections, layout, wording, column names), with a shared python-docx layout kit and a checker for leaks and table numbering. | *"审核方法说明"*, *"统一两份说明文档"*, *"写分析说明 docx"* |
 | [`html-pdf-print`](skills/html-pdf-print/SKILL.md) | Optimize HTML reports for browser print-to-PDF: prevent clipped graphs/tables, avoid orphan lines, enforce accurate pagination, and position bottom footers. | *"报告打印被切断"*, *"页脚不在页底"*, *"PDF 分页优化"* |
 
 ### 🤖 Multi-Agent & Workflow

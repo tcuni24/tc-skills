@@ -38,6 +38,7 @@
 | fleet task (herdr-fleet) | 并行任务 | 主 agent 用 `fleet new` 开出的一个独立任务：`worktrees/<slug>/` 下每个仓库一个 git worktree（分支 `<type>/<slug>`）、一份 `TASK.md`、一个以 slug 命名并运行任务 agent 的 herdr tab；`coordinator_pane` 是主 agent 的 pane，收件箱保存待投递、已投递与被新轮次取代（superseded）的任务事件，每条事件带产生它的轮次基线；仓库布局由项目根的 `.herdr-fleet.toml` 声明。 | `skills/herdr-fleet/SKILL.md`；`skills/herdr-fleet/references/workflow.md` §命令 |
 | delivery package (customer-delivery) | 交付包 | 交给客户的目录产物：只含一个 Excel 工作簿、一个离线 HTML 报告和一个 `plot/` 目录，内部列名、路径、文件名、日志与流程细节必须剥离。 | `skills/customer-delivery/SKILL.md` §客户交付包生成 |
 | report simplification layer (customer-report-simplify) | 报告精简层 | 在不改交付原件的前提下，另开一份围绕客户问题重排的内容层：正文只回答问题，其余进折叠附录。 | `skills/customer-report-simplify/SKILL.md` §第二步；`skills/customer-report-simplify/scripts/audit_report.py` |
+| methods document (customer-methods-doc) | 方法说明文档 | 随结果表交付的 Word 说明（方法、参数、结果汇总、字段说明、本次更新内容），由生成脚本产出；数字以实际交付为准，同一客户多份说明共用章节骨架、版式代码与列说明。 | `skills/customer-methods-doc/SKILL.md` §原则；`skills/customer-methods-doc/references/doc-skeleton.md` |
 | print contract (html-pdf-print) | 打印契约 | 打印前先定下的目标浏览器/打印引擎、纸张、缩放，以及页脚是每页重复还是仅末页底部；验收对象是实际生成的 PDF。 | `skills/html-pdf-print/SKILL.md` §先明确打印契约 |
 | stack analysis (nextflow-workflow-skills) | 流程编排 | 用 Nextflow DSL2 自建流程：`main.nf` + `workflows/` + `subworkflows/` + `modules/` 布局与 `nextflow.config` 资源分层。 | `skills/nextflow-workflow-skills/SKILL.md` §Quick start |
 | PR convention (gitee-pr) | PR 规范 | 在 Gitee 提 PR 前强制执行的团队规则：分支名、commit 前缀、工作区干净、中文标题与正文模板。 | `skills/gitee-pr/SKILL.md` §Workflow |

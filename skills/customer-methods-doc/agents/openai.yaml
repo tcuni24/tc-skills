@@ -1,0 +1,4 @@
+interface:
+  display_name: "Customer Methods Doc"
+  short_description: "Write, audit and unify customer-facing methods .docx files that accompany delivered result tables"
+  default_prompt: "Use $customer-methods-doc to review this methods document against the delivered results, strip internal details, and keep it consistent with the customer's other deliveries."
