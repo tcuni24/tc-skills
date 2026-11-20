@@ -22,7 +22,7 @@ description: Use only when the user explicitly requests two agents in Rex to col
 
 - 每个任务一个目录：`<handoff 根>/<task-id>/plan.md`，task-id 为 `YYYYMMDD-HHMM-<slug>`，各轮放 `<task-id>/<轮次>/contract.md`，建目录前确认不存在。不设全局“当前任务”指针或共享索引；列出进行中任务时扫描各 plan.md 的状态字段。
 - 文件头写 task_id、Owner（Planner 完整 session/pane ID）、cwd 与分支（或“非 Git”）、状态（active/done/abandoned）、方案版本、Scope（声明占用的 edit/create 路径）；目录名必须等于 task_id。必含 Goal（用户原始诉求，附日期）、Non-goals、Decided（每条带时间和来源，如“用户回答”）、Acceptance（任务级）、Rounds（轮次 / 目标 / 状态 / 证据路径）、Open questions、Next step。
-- 文件头另写原始目标（用户原话）、交付物与数量、验收契约、预计改动文件数（变更面上限）、Non-goals；这些字段只读，修改规则与 Goal、Decided 相同。
+- 文件头另写原始目标（用户原话）、交付物与数量、验收契约、预计改动文件数（变更面上限）、**威胁模型（运行假设与不防的边界）**与 Non-goals；这些字段只读，修改规则与 Goal、Decided 相同。切轮次优先安排最薄端到端纵切（先打通用户可见主链路，再补边界与加固）。
 - 为子问题新建 plan 必须写明父 task_id 和父 Goal；新 plan 生效时旧 plan 写 `superseded-by: <task-id>`；入口文件只写当前状态。
 - 只有 Owner 能写；换 Owner 须经用户同意并记录“旧 → 新”。写入前比对哈希等于自己上次记录的值，不等就停下；写入先写临时文件再 mv。Goal 和 Decided 只能由用户的决定修改，保留“旧 → 新”记录并递增方案版本；Planner 在每次用户决策后、每轮验收后更新 Rounds 和 Next step。
 - 每份 contract 写明 task_id、plan 绝对路径、方案版本和 plan SHA256；Executor 逐项核对，任一项不符就把 STATUS 写成 blocked 并报告。开工前对照 plan.md，发现工单与 Goal、Non-goals 或 Decided 冲突时停下，在 report 里报告，不自行取舍。
@@ -30,8 +30,8 @@ description: Use only when the user explicitly requests two agents in Rex to col
 
 ### 范围变更单与上限（R3、R4）
 
-- 范围变更单：改业务口径或扩大范围前，向用户出一页变更单，写触发原因、相对原计划多出的文件或模块、最小替代方案、成本，等用户明确选择；用户只回答业务口径不等于批准扩大范围；旧的宽泛授权不能覆盖新的范围扩展。
-- findings 分“阻断原契约 / 阻断正确性 / 可后置”三类，只有前两类可追加轮次；同一成果最多 1 次 review 加 1 次复审；同一子问题连续 2 轮 BLOCK，给用户“继续 / 改走更便宜的方案 / 回主线”三选一，并附成本估计。
+- 范围变更单：改业务口径、扩大范围，或**新增原计划未授权的持久化产物/schema/codec/发布或锁协议**前，向用户出一页变更单，写触发原因、相对原计划多出的文件或模块、最小替代方案（含 Fail-Fast 断言选项）、成本，等用户明确选择；用户只回答业务口径不等于批准扩大范围或技术协议升级；旧的宽泛授权不能覆盖新的范围扩展。
+- findings 分“阻断原契约 / 阻断正确性 / 可后置”三类，只有前两类可追加轮次；**超出威胁模型的防御建议归入“可后置”，禁止 BLOCK**；对未证实可达的罕见或理论反例，先做最小可达性实证，不可达或罕见优先用 Fail-Fast 断言保底线，不新建持久化恢复协议。同一成果最多 1 次 review 加 1 次复审；同一子问题连续 2 轮 BLOCK，给用户“继续 / 改走更便宜的方案 / 回主线”三选一，并附成本估计。
 
 Planner 在项目明确允许的目录写每轮独立的绝对路径 `contract.md`；先确认工单、报告、状态、日志和暂存路径均获授权。若无法落盘而不越界，停止并询问。清楚区分可以修改、可以新建、只读和禁止路径，包含目录前缀在内互不交叉；未授权路径不得写。每轮给 Executor 足够上下文，不依赖其继承本会话。
 
