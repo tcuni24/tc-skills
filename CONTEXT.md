@@ -13,7 +13,9 @@
 | Planner | 规划者 | 持有用户任务、负责范围、验收与最终交付的座位；对 Executor 写下的每一行负责。 | `skills/herdr-pair/SKILL.md` §"The one rule that matters" |
 | Executor | 执行者 | 只做编辑与命令执行的座位，在契约给定的 fence 内工作并按契约回报。 | `skills/herdr-pair/references/handoff.md` §Executor responsibilities |
 | Verifier | 验证者 | 可选座位；只读地独立复核某一轮，只能在写入停止、review epoch 冻结之后进行。 | `skills/herdr-pair/references/verification.md#stable-review-epochs` |
-| pair | 配对 | 两个及以上 `pane_id` 不同的实时 agent 共担一个任务，角色是座位而非 agent 类型。 | `skills/herdr-pair/SKILL.md` §"Which seat are you in" |
+| pair | 配对 | 两个及以上不同的实时 agent 终端（Herdr 的 `pane_id`、hc 的终端地址）共担一个任务，角色是座位而非 agent 类型。 | `skills/herdr-pair/SKILL.md` §"Which seat are you in"；`skills/hc-pair/SKILL.md` §"与 rex-pair 的关键差别" |
+| hc terminal | hc 终端 | hc 里一个持久运行的终端，地址是 `t7` 或 live 唯一的名字，跨机器写作 `vps/t7`；agent 自己的地址在 `$HC_TERMINAL_ID`。 | `skills/hc-pair/SKILL.md` §1；`hc --help` |
+| note (hc) | 子终端回报 | hc 把子终端的回报键入父终端的输入流，形如 `<hc from="t9 exec">…</hc>`；它只是通知，不是验收证据。 | `skills/hc-pair/SKILL.md` §4；`hc --skill` |
 | round (round_id / revision) | 轮次 / 版本 | 一次派发的最小工作单元，有一个 scope fence、一条字面验收结果和一个可独立签署的 diff；轮内每次契约修改递增 `revision`。 | `skills/herdr-pair/SKILL.md` §2；`skills/herdr-pair/scripts/pairctl.py`（`check-round --revision`） |
 | handoff | 工单 | 派发时给出的自包含契约，假定 Executor 零继承规则，写清身份、范围 fence、只读输入、停在哪、字面验收与回报地址。 | `skills/herdr-pair/SKILL.md` §3 |
 | handoff fence (`[可以改]` / `[可以新建]` / `[不许动]` / `[只读输入]` / `[报告]`) | 范围围栏 | 工单里的五条范围行：可改、可新建、禁改、只读输入、报告落盘路径；派发前 lint 用它们做 fail-closed 检查。 | `skills/herdr-pair/SKILL.md` §3；`skills/herdr-pair/scripts/pairctl.py`（`FENCE_RE`） |
