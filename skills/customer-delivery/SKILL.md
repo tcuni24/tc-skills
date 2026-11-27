@@ -1,9 +1,11 @@
 ---
 name: customer-delivery
-description: Use when an analysis is finished and the user asks to 生成交付结果 / 交付给客户 / 整理交付目录 / 做客户报告 / 出交付表格, or wants to turn work/ results into what the customer receives. Builds a delivery directory containing only an Excel workbook, an offline HTML report, and a plot/ directory; renames internal columns to customer terms; strips internal paths, file names, logs and pipeline details; renders the report in the tc-design-md whitepaper style (external skill; install it separately); and audits the result for leaks and readability. Not for internal QC reports or methods docs.
+description: 用于没有既定报告与结果模板的个性化分析项目，将已完成的分析整理成客户 Excel、离线 HTML 报告和图表，并检查信息泄漏。客户交付、结果表或报告等措辞本身不足以触发本技能。探针/芯片设计及已有报告或结果模板的项目沿用原生交付流程。
 ---
 
 # 客户交付包生成
+
+仅在个性化分析已完成，且项目既无固定报告模板，也无固定结果模板时使用。探针或芯片设计交付按该项目的结果模板与原生报告工具生成。
 
 分析跑完后，`work/` 里有几十个中间文件、日志、内部 TSV。客户只需要三样东西：
 **一份 Excel、一份能离线打开的 HTML 报告、一个放统计图的 `plot/` 目录**。
