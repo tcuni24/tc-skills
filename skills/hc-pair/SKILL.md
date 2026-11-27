@@ -130,7 +130,15 @@ hc read "$TARGET" --lines 80          # 回来先看屏幕
 
 - 上下文以 agent 界面显示的占比为准；hc 没有 context-usage 命令，读不到的占比不算余量。约 70% 换会话或压缩，约 85% 不再派新一轮；读不到就按轮数：每 3 轮更新 plan 作检查点，第 5 轮验收后换会话，会话超 12 小时也换。
 - 换会话优先从 plan.md 接手少用压缩；必须压缩时说明里保留 plan 绝对路径、task_id、轮次/版本、contract 与 report 路径、Executor 地址。恢复后先看 STATUS 和 report —— 执行者可能在压缩期间已经做完。
-- 清空 Executor 会话前四条全满足：`status` 不是 `working`、本轮已验收或已冻结、没有在跑的后台作业、知道该 agent 的清空命令与标志文字。任一条不满足先问用户；不清空 Planner 自己或用户的其它终端。hc 本身没有清空语义，清空用该 agent TUI 的命令（如 `/clear`），自己起的终端也可 `hc kill` + `hc rm` 后按同一 cwd 重开（不重跑任务）。
+- **允许 Planner 直接清空已指定的 Executor（worker）会话**（无需再向用户逐次确认），但须同时满足三条安全前提：`status` 不是 `working`（`idle`/`done`）、本轮已验收或已冻结、没有在跑的后台作业；任一条不满足时先冻结或问用户。仍严禁清空 Planner 自己或用户的其它非本任务终端。
+- 清空方式：hc 本身没有清空语义。**不要用 `hc send <t> '/clear'`**——`hc send` 会自动包裹 `<hc from="…">/clear</hc>`，agent TUI 会把它当成普通消息而非斜杠命令，导致会话未清空。应使用 `hc keys` 发送裸按键序列（如 `hc keys <t> / c l e a r enter`），再 `hc read <t> --lines 25` 与 `hc get <t> --json` 核对新会话标志出现且 `status` 回到 `idle`/`done`（若首次 `enter` 仅完成菜单补全停留在输入框，再补一次 `hc keys <t> enter` 并复核；若清空无效或该 CLI 不支持 `/clear` 再问用户）。自己 `hc run` 起的终端也可 `hc kill` + `hc rm` 后按同一 `cwd` 重开（不重跑任务）。
+
+  已实测的 worker 清空方式：
+
+  | agent | 清空按键 | 标志文字 / 状态 | 备注 |
+  |---|---|---|---|
+  | Devin CLI（`devin`） | `hc keys <t> / c l e a r enter` | `✓ New session`，回到启动页且 `status=idle` | 2026-11-27 实测 |
+  | 其他支持 `/clear` 的 agent TUI | `hc keys <t> / c l e a r enter` | 屏幕历史清空 / 新会话提示 / 上下文归零 | 首次执行后须 `hc read` 复核，未生效再问用户 |
 - 收尾只清理自己起的：`hc kill <t>` → `hc rm <t>`（live 终端 `rm` 会被拒并提示先 kill）。`hc ls` 含用户其它 live 终端，别误删。保留 plan、report、原始日志；报告实际改动、验收、未完成项和谁做了什么。
 
 ## 7. 防偏移（R1–R7）
