@@ -19,12 +19,14 @@ wait forever on a task that is already done. Every handoff you send must carry i
 unworthy; only its track record on this task does (§7).
 
 `agent_status` is a **routing hint, not an availability verdict**. A visible model/quota banner is
-also not a verdict. In particular, Antigravity/Agy's `AI: Out of credits` means the supplemental
-quota is exhausted; subscription capacity may still be available. Never replace, reject or declare
-an executor unavailable from that banner. A definitive prompt execution failure, an explicit report
-from the executor, or the user's statement can establish unavailability; decorative or summary UI
-text cannot. If `agent_status` says `idle` while the visible screen says `generating`/`running`, the
-state is **unknown**: do not clear, resend, declare completion, or switch executors.
+also not a verdict. In particular, Antigravity/Agy's `AI: Out of credits` and Devin CLI's
+`Pro · 0% remaining` reflect supplemental or tier display counters while subscription or
+organization capacity may still execute prompts normally. Dispatch normally when status allows, and
+only refuse dispatch or replace the executor after an actual prompt attempt fails with a
+quota/rate-limit rejection, an explicit report from the executor, or the user's statement — never
+from static or summary UI text alone. If `agent_status` says `idle` while the visible screen says
+`generating`/`running`, the state is **unknown**: do not clear, resend, declare completion, or
+switch executors.
 
 Prefer, in order: same tab → same workspace + same `cwd` → same `cwd` anywhere. Use a level only
 when it yields **exactly one** match; never fall through past an ambiguous level. Always address

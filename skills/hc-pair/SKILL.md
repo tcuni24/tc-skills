@@ -94,7 +94,7 @@ hc send "$TARGET" '读 /abs/task/.handoff/r001/contract.md 执行；先落盘 AC
 
 - 发之前认清对端：`hc get` 的 `foreground.argv` 应当是 agent TUI。发给裸 shell 的文字会被立刻当命令执行，可能直接删改文件；目标 `foreground` 是 shell 时不要派发任务。
 - `hc send` 粘贴文本并**自己按 Enter**。不要再用 `hc keys <t> enter`（多按一次可能空提交或打断对方），也不要用文本末尾 `\r`/`\n` 代替提交。它还会等人类草稿最多 60 秒（`draft_wait`），返回 `{started,status,turn}`。
-- 闸门看 `hc get` 的 `status`：`idle`、`done`（回合已结束）通常可发；`working` 不发，先 `hc wait` 或读进度，排队消息会污染对方上下文；`blocked` 表示等人（权限或问题），`send` 会 exit 9，读屏幕后问用户，禁止 `--force` 绕过；`error` 先 `hc read` 找原因。`hc send --if idle` 只对「恰好 idle」成立，对 `done` 会判 `status_mismatch`（exit 10），不要拿它当通用闸门。
+- 闸门看 `hc get` 的 `status`：`idle`、`done`（回合已结束）即可按正常流程 `hc send`，以实际执行结果为准；`working` 不发，先 `hc wait` 或读进度，排队消息会污染对方上下文；`blocked` 表示等人（权限或问题），`send` 会 exit 9，读屏幕后问用户，禁止 `--force` 绕过；`error` 先 `hc read` 找原因。`hc send --if idle` 只对「恰好 idle」成立，对 `done` 会判 `status_mismatch`（exit 10），不要拿它当通用闸门。TUI 启动页或状态栏的静态额度横幅（如 Devin 的 `Pro · 0% remaining`、`AI: Out of credits`）可能只反映附加/档位余量而订阅或组织额度仍可运行，不作为不可用判据；只要 `status` 允许就先正常派发，仅当实际派发后遭遇限流/额度拒绝报错、回合异常退出或 Executor 明确回报无法运行时，才判定不可用。
 - 发送成功只表示文本提交过，**不等于**对方接受或开工；`accepted` 仍要等对方落盘 ACK/STATUS 后由 Planner 独立确认。`ready != accepted`。
 - 目标不存在或没起：`hc run --bg --name <exec> --cwd <cwd> <agent> "<首任务>"`。`--bg` 必须，否则整屏流进你的输出；首任务放 `run` 里，避免发给启动中的 agent 被丢。`hc get` 里 `first_message.sent=false` 表示首任务没发出去：先 `hc read` 解决就绪（信任弹窗用 `hc keys <t> down enter`），再补发，不盲目重发。模板用 `hc templates`（文件在 `~/.config/herdr-core/templates/<name>.md`）。
 - 起的终端默认随父终端结束；要跨轮保留加 `--outlive-parent`。名字用 `<task>-r<NNN>` 这类有意义的串，别用地址当名字。
@@ -123,7 +123,7 @@ hc read "$TARGET" --lines 80          # 回来先看屏幕
 - 要中断一个还在跑的回合用 `hc interrupt <t>`（停回合不杀进程），然后才冻结；kill 会丢屏幕和状态，不要拿它当冻结手段。
 - 独立读产物与报告，核对 scope、重跑字面验收、复算关键统计，审原始红绿灯证据索引。报告列每项通过/失败/未运行并写「交付物 当前/目标」；状态和通知不是证据。声称改了却无差异、越界、数字无出处要停手给证据。
 - 只有 Planner 完成独立验收才标 `accepted` 并向用户交付。
-- 交接换人：原执行者不可用（限流、额度、崩溃）时先报告用户等授权；获授权后 `hc run --bg --name <new> --cwd <cwd> <agent> "<读交接文件>"` 起新终端（权限模式不放宽 fence，先看额度提示）。落盘交接文件写新终端完整身份、授权来源、沿用 task-id 的轮次、必读清单、隔离约束、待办、停止条件、回报方式，并声明原执行者停写、恢复后也不得再写。旧 STATUS 追加新轮次段、不覆盖，产物（含未提交改动）保留不 reset。
+- 交接换人：原 Executor 经实际派发/运行确认不可用（实测触发限流或额度拒绝、进程崩溃、明确回报无法执行；静态 `0% remaining` 等横幅不算）时，先报告用户等授权；获授权后 `hc run --bg --name <new> --cwd <cwd> <agent> "<读交接文件>"` 起新终端（权限模式不放宽 fence；新终端同样通过首任务实际运行验证可用性，不凭静态额度横幅预判弃用）。落盘交接文件写新终端完整身份、授权来源、沿用 task-id 的轮次、必读清单、隔离约束、待办、停止条件、回报方式，并声明原 Executor 停写、恢复后也不得再写。旧 STATUS 追加新轮次段、不覆盖，产物（含未提交改动）保留不 reset。
 - `hc keep` 只把丢失的程序换成 shell，**从不重跑原任务**；恢复出的 shell 不能当成可以重试的许可，真重跑要用户授权。
 
 ## 6. 上下文与清理
